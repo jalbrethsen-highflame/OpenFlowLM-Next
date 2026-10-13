@@ -8,6 +8,7 @@ block, `ex.py`, whose main cores hold:
 
     ex_px   xm (bf16, one 4 KB x element per 2048 values) -> the K=HID table at tab + 0
     ex_ph   the expert hidden h (f32, H_ELEMS x elements) -> the K=FF table at tab + H_TAB_OFF
+    ex_gy   a 64-row band (K = HID) into a y element (lm.py's mixer stages)
     ex_gu   a 64-row up / gate band (K = HID) into ms + dst (u at MS_U, g at MS_G)
     ex_gd   down band j (K = FF) into ms + MS_YD + 64 j
     ex_hdr  the w-stream header: mode 0 = the routing record, 1 = this core's residual rows
@@ -45,6 +46,14 @@ extern "C" {{
 void ex_gu(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict ms,
            int32_t group, int32_t dst) {{
   gemv_q4_pool_group_rt(t, tab, (unsigned)group, ms + dst, {M.PB_H}u, 2u);
+}}
+}}
+''',
+        "ex_gy.cc": hdr + f'''// A 64-row projection band (K = {M.HID}, {M.PB_H} chunks, rs 2) into its y element: the mixer
+// stages of the merged layer image (lm.py), whose every projection is K = hidden.
+extern "C" {{
+void ex_gy(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict y, int32_t group) {{
+  gemv_q4_pool_group_rt(t, tab, (unsigned)group, y, {M.PB_H}u, 2u);
 }}
 }}
 ''',
