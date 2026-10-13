@@ -46,4 +46,14 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
     <description>Build and validate the synthetic 48-head AB, conv/record and recurrent-state chain for the WideDeltaNet A7 gate, including default32-head regression and known precision limits.</description>
     <location>.opencode/skill/open-wide-deltanet-chain/SKILL.md</location>
   </skill>
+  <skill>
+    <name>npu-model-porting</name>
+    <description>Playbook for porting a NEW model architecture to the open XDNA2 engine (open_kernels recipes + IRON designs + src/open_qwen36) -- environment setup on a fresh Linux box, the reference-first workflow, slice testing, how the manifest/engine fit together, IRON design rules that hang or corrupt silently (drain ordering, shim/L1/program-memory budgets), GGUF-direct gotchas, profiling, and the one-context merge. Use before adding a family, when a new design hangs with ERT state 8, when NPU logits disagree with a reference, or when decode is slower than the kernels' own timings suggest.</description>
+    <location>.opencode/skill/npu-model-porting/SKILL.md</location>
+  </skill>
+  <skill>
+    <name>open-lfm2moe-kernels</name>
+    <description>Build, verify and run the open XDNA2 kernels for LiquidAI LFM2-MoE (LFM2.5-24B-A2B, LFM2.5-8B-A1B; model_type lfm2_moe) from a Q4_0 GGUF -- the lfm2moe recipe, the merged one-context layer image (lm.py), the separate-image fallback (cx/dx *_MIX + ex.py), the host sigmoid router and the q8 head. Use when rebuilding these sets, adding another LFM2-MoE size, or debugging a wrong token / ERT timeout on this family.</description>
+    <location>.opencode/skill/open-lfm2moe-kernels/SKILL.md</location>
+  </skill>
 </available_skills>
