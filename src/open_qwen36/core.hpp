@@ -564,6 +564,20 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// A program's non-run step: moeroute2 -> route(), hostroute -> host_route().
     void route_op(const Step& s, int layer);
     std::vector<std::vector<float>> router_w_, router_b_;   ///< per layer: [experts][hidden], [experts]
+    /// The host router's arithmetic for one token: xm (f32) -> top-k idx and weights.
+    void route_math(int layer, const float* xm, uint32_t idx[8], float wt[8]) const;
+    /// LFM2-MoE's routed experts over n tokens on the token-batched kernel (layout.expert_batch):
+    /// out = res + sum_k w * expert(xm), per token.
+    void experts_batch(int layer, const float* xm, const float* res, const int32_t* idx, const float* w, size_t n,
+                       float* out);
+public:
+    /// LFM2-MoE's prompt route: the whole prompt through each layer before the next -- the
+    /// mixers one token at a time (decode kernels, positions patched), the router on the host,
+    /// the experts token-batched (eb.py). Bit-for-bit the same arithmetic per token as step(),
+    /// up to the batched kernel's accumulation order.
+    bool prompt_route_ok() const;
+    void step_prompt_lfm2(const std::vector<int>& ids, bool want_logits);
+private:
     void log(const std::string& s) const;
 
     // ---- the block route's helpers (core.cpp)

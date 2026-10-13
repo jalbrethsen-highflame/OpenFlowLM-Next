@@ -267,7 +267,21 @@ std::vector<int> request(Core& core, const Args& a) {
     // B(2): the whole prompt through each layer before the next, so a layer's MoE streams
     // each expert once for every token of the prompt that wants it instead of once per
     // block. Bit-exact against the block-at-a-time loop below, which --block-major forces.
-    if (a.gemm_block && core.layer_major_ok() && !a.block_major) {
+    if (a.gemm_block && core.prompt_route_ok()) {
+        // LFM2-MoE: the whole prompt through each layer, experts token-batched (eb.py)
+        core.set_block_logits_all(a.prefill_logits && !a.dump_prefix.empty());
+        auto tp = std::chrono::steady_clock::now();
+        core.step_prompt_lfm2(a.ids, true);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+        std::fprintf(stderr, "prefill %zu tokens: %.0f ms (%.1f ms/token, %.1f tok/s) [prompt route]\n", a.ids.size(), ms,
+                     ms / a.ids.size(), 1000.0 * a.ids.size() / ms);
+        for (size_t t = 0; t < core.block_logits().size(); ++t)
+            dump_pos(a.dump_prefix, static_cast<int>(t), core.block_logits()[t]);
+        if (!a.dump_prefix.empty() && core.block_logits().empty())
+            dump_pos(a.dump_prefix, static_cast<int>(a.ids.size() - 1), core.logits());
+        if (!a.dump_prefix.empty()) dump(a.dump_prefix, dumped++, core.logits());
+        i = a.ids.size();
+    } else if (a.gemm_block && core.layer_major_ok() && !a.block_major) {
         core.set_block_logits_all(a.prefill_logits && !a.dump_prefix.empty());
         core.step_gemm_prompt(a.ids, true);
         stages("gemm-prompt", 0, a.ids.size(), a.ids.size());

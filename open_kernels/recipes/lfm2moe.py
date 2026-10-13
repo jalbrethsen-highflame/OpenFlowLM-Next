@@ -136,6 +136,26 @@ def moe_geometry(spec: ModelSpec) -> MoeGeometry:
     )
 
 
+# ---- the prefill route's token-batched experts (designs/lfm2moe/eb.py)
+EB_NT = 16                   # token slots per expert visit (moe_batch's NT)
+EB_STREAMS = (64, 16)        # slot counts, one instruction stream each over one image
+
+
+def eb_ok(spec: ModelSpec) -> bool:
+    """eb.py needs the bf16-scale pool and an expert width of whole 128-row band pairs over
+    a column's four rows (1536 is three pairs a row; the 8B's 1792 is not whole)."""
+    return (not F32 and spec.moe_intermediate % 512 == 0 and spec.hidden % 256 == 0
+            and spec.num_experts >= max(EB_STREAMS))
+
+
+def eb_geometry(spec: ModelSpec) -> dict:
+    hid, ff = spec.hidden, spec.moe_intermediate
+    return {"nt": EB_NT,
+            "x_bytes": lambda s: s * hid * EB_NT * 2,
+            "h_bytes": lambda s: s * ff * EB_NT * 2,
+            "y_bytes": lambda s: s * hid * EB_NT * 4}
+
+
 def _check(spec: ModelSpec) -> None:
     if spec.family != "lfm2moe":
         raise OpRangeError(f"lfm2moe recipe on a {spec.family!r} spec")
@@ -347,6 +367,28 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             "buffers": {**bufs, "state": {"kind": "kv", "row": Lm.KV_ROW}},
             "program": [{"op": "run", "kernel": "dxm", "args": ax_args}, route,
                         {"op": "run", "kernel": "ex", "args": ex_args}]}
+    if eb_ok(spec) and one_context(spec):
+        # the merged image runs mixer + experts as one core pass, so the prompt route's
+        # per-token mixers are the standalone images (cx.py / dx.py *_MIX)
+        out["contexts"]["cxm"] = "short_conv_mix/final.xclbin"
+        out["contexts"]["dxm_p"] = "dx_mix/final.xclbin"
+        out["kernels"]["cxm"] = {"context": "cxm", "insts": "short_conv_mix/insts.bin", "build": "short_conv_mix"}
+        out["kernels"]["dxm_p"] = {"context": "dxm_p", "insts": "dx_mix/insts.bin", "patch": "attnpos",
+                                   "build": "dx_mix", "window": 0}
+        if SHORT_CONV in out["layer_types"]:
+            out["layer_types"][SHORT_CONV]["prompt"] = [{"op": "run", "kernel": "cxm", "args": sc_args}]
+        if FULL in out["layer_types"]:
+            out["layer_types"][FULL]["prompt"] = [{"op": "run", "kernel": "dxm_p", "args": ax_args}]
+    if eb_ok(spec):
+        # the prompt route's token-batched experts: every stream on one image (the core
+        # program does not depend on the slot count), x / h / y sized for the widest
+        E = eb_geometry(spec)
+        smax = max(EB_STREAMS)
+        out["contexts"]["eb"] = f"eb{smax}/final.xclbin"
+        for sl in EB_STREAMS:
+            out["kernels"][f"eb{sl}"] = {"context": "eb", "insts": f"eb{sl}/insts.bin", "patch": "moebatch",
+                                         "build": f"eb{sl}"}
+        out["globals"].update({"ebx": E["x_bytes"](smax), "ebh": E["h_bytes"](smax), "eby": E["y_bytes"](smax)})
     if spec.quant != "q4_1_f32":
         # the engine reads `gguf` for a model.gguf: the same kernel set (this family is
         # GGUF-direct only), so the twin is this section again
@@ -373,8 +415,13 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                        "env": {"LM_PART": str(part), "OPEN_LFM2MOE_CORES": str(moe_cores(spec))}}
         b["ln"] = db["ln"]
         b["lm_head_q8"] = head
-        return b
-    return {
+        if eb_ok(spec):      # the prompt route's standalone mixers (programs())
+            b["short_conv_mix"] = {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_mix{SFX}",
+                                   "env": {**sc_env, "CX_MIX": "1"}}
+            b["dx_mix"] = {"design": "dense/dx.py", "build_dir": f"dense/build_lfm2moe_h{h}_mix{SFX}",
+                           "env": {**f32, "DX_MIX": "1"}}
+        return _with_eb(spec, b)
+    return _with_eb(spec, {
         "cx_dense": {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_ff{ff}{SFX}",
                            "env": sc_env},
         "short_conv_mix": {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_mix{SFX}",
@@ -387,7 +434,16 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                "env": {"OPEN_LFM2MOE_CORES": str(moe_cores(spec))}},
         "ln": db["ln"],
         "lm_head_q8": head,
-    }
+    })
+
+
+def _with_eb(spec: ModelSpec, b: dict) -> dict:
+    if eb_ok(spec):
+        for s in EB_STREAMS:
+            b[f"eb{s}"] = {"design": "lfm2moe/eb.py",
+                           "build_dir": f"lfm2moe/build_eb{s}_h{spec.hidden}_ff{spec.moe_intermediate}_nt{EB_NT}",
+                           "env": {"EB_SLOTS": str(s)}}
+    return b
 
 
 def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
@@ -406,7 +462,11 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     # the host router (`hostroute`): what it reads, what it computes, where it writes
     out["router"] = {"weight": "blk.{l}.ffn_gate_inp.weight", "bias": "blk.{l}.exp_probs_b.bias",
                      "gating": "sigmoid", "norm_topk": True, "norm_eps": 1e-6, "scale": 1.0,
-                     "xm_off": Lm.AD_XM, "idx_off": ROUT_IDX_OFF, "weights_off": ROUT_IDX_OFF + 32}
+                     "xm_off": Lm.AD_XM, "res_off": Lm.AD_RES, "idx_off": ROUT_IDX_OFF,
+                     "weights_off": ROUT_IDX_OFF + 32}
+    if eb_ok(spec):
+        out["expert_batch"] = {"nt": EB_NT, "kernels": {str(sl): f"eb{sl}" for sl in EB_STREAMS},
+                               "args": ["pool", "ebx", "ebh", "eby"]}
     return out
 
 

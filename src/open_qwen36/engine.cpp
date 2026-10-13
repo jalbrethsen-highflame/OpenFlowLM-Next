@@ -192,6 +192,10 @@ buffer<bf16> Engine::prefill(std::vector<int>& ids, void* payload) {
                 // whole prompt through each layer before the next, so the layer's expert
                 // pass sees every token that wants an expert instead of one block's worth.
                 // Bit-exact against the block loop below; OFLM_OPEN_LAYER_MAJOR=0 takes it.
+                if (core_->prompt_route_ok()) {   // LFM2-MoE (Core::step_prompt_lfm2)
+                    core_->step_prompt_lfm2(ids, true);
+                    return logits_view();
+                }
                 if (core_->layer_major_ok()) {
                     core_->step_gemm_prompt(ids, true);
                     return logits_view();
