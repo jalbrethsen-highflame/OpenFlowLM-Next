@@ -390,6 +390,10 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
             for (size_t j = 0; j < g.hd; ++j) o[j] += a * vr[j];
         }
         float* out = og + t * qw + h * g.hd;
+        if (!gate) {                                // no output gate (LFM2): the attention itself
+            for (size_t j = 0; j < g.hd; ++j) out[j] = o[j];
+            continue;
+        }
         const float* gt = gate + t * qw + h * g.hd;
         for (size_t j = 0; j < g.hd; ++j) out[j] = o[j] * sigmoid(gt[j]);
     }

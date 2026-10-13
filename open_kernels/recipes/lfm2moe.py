@@ -148,6 +148,46 @@ def eb_ok(spec: ModelSpec) -> bool:
             and spec.num_experts >= max(EB_STREAMS))
 
 
+PROMPT_T = 256              # tokens per prompt GEMM (gemm_q4_prefill's T; one image serves every shape)
+
+
+def prompt_gemm(spec: ModelSpec) -> dict:
+    """The prompt route's batched mixers (Core::prompt_mixers): every projection of a mixer --
+    and of the dense layers' FFN -- as a gemm_q4_prefill dispatch over PROMPT_T tokens, reading
+    its weights straight out of the layer pool (an xrt sub-buffer at the region's offset: the
+    pool's band order IS the GEMM's weight order). The norms, the 3-tap conv, q/k norm + RoPE +
+    attention, silu and the residuals run on the host between them (block_host.cpp)."""
+    Lm, G = layout(spec), geometry(spec)
+    hid, ff, qw, kvw = spec.hidden, spec.intermediate, G.QW, G.KVW
+    regions = {"conv_in": (Lm.POOL_SC_B, 3 * hid, hid), "conv_out": (Lm.POOL_SC_OUT, hid, hid),
+               "qkv": (Lm.POOL_Q, qw + 2 * kvw, hid), "o": (Lm.POOL_O, hid, qw),
+               "ffn_gate": (Lm.POOL_SC_GATE, ff, hid), "ffn_up": (Lm.POOL_SC_UP, ff, hid),
+               "ffn_down": (Lm.POOL_SC_DOWN, hid, ff)}
+    # the regions must be the contiguous band-order matrices the GEMM reads
+    assert Lm.POOL_SC_C == Lm.POOL_SC_B + q4_bytes(hid, hid, QUANT) and Lm.POOL_SC_U == Lm.POOL_SC_C + q4_bytes(hid, hid, QUANT)
+    assert Lm.POOL_K == Lm.POOL_Q + q4_bytes(qw, hid, QUANT) and Lm.POOL_V == Lm.POOL_K + q4_bytes(kvw, hid, QUANT)
+    for name, (off, n, k) in regions.items():
+        if n % 256 or k % 256:
+            raise OpRangeError(f"lfm2moe prompt GEMM {name}: [{n}, {k}] is not a multiple of 256")
+        if off % 4096:
+            raise OpRangeError(f"lfm2moe prompt GEMM {name}: pool offset {off} is not page aligned (sub-buffer)")
+    shapes = sorted({(n, k) for _, n, k in regions.values()})
+    return {
+        "t": PROMPT_T,
+        "regions": {k: list(v) for k, v in regions.items()},
+        "kernels": {f"{n}x{k}": f"gemm_n{n}_k{k}" for n, k in shapes},
+        "x": {str(k): f"gemm_x_k{k}" for k in sorted({k for _, k in shapes})},
+        "y": {str(n): f"gemm_y_n{n}" for n in sorted({n for n, _ in shapes})},
+        "kinds": {DENSE_CONV: "conv_dense", SHORT_CONV: "conv", FULL: "attn"},
+        "tensors": {"attn_norm": "blk.{l}.attn_norm.weight", "ffn_norm": "blk.{l}.ffn_norm.weight",
+                    "conv": "blk.{l}.shortconv.conv.weight", "q_norm": "blk.{l}.attn_q_norm.weight",
+                    "k_norm": "blk.{l}.attn_k_norm.weight"},
+        "hid": hid, "ff": ff, "nh": spec.num_heads, "kvh": spec.num_kv_heads, "hd": spec.head_dim,
+        "rot": spec.rotary_dim, "taps": TAPS, "eps": spec.norm_eps, "kv_row_elems": Lm.KV_ROW // 2,
+        "_shapes": shapes,
+    }
+
+
 def eb_geometry(spec: ModelSpec) -> dict:
     hid, ff = spec.hidden, spec.moe_intermediate
     return {"nt": EB_NT,
@@ -380,6 +420,15 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         if FULL in out["layer_types"]:
             out["layer_types"][FULL]["prompt"] = [{"op": "run", "kernel": "dxm_p", "args": ax_args}]
     if eb_ok(spec):
+        # the prompt route's batched mixers: one image for every GEMM shape
+        P = prompt_gemm(spec)
+        for n, k in P["_shapes"]:
+            name = f"gemm_n{n}_k{k}"
+            out["contexts"].setdefault("gemm", f"{name}/final.xclbin")
+            out["kernels"][name] = {"context": "gemm", "insts": f"{name}/insts.bin", "build": name}
+            out["globals"][f"gemm_x_k{k}"] = k * PROMPT_T * 2
+            out["globals"][f"gemm_y_n{n}"] = n * PROMPT_T * 4
+    if eb_ok(spec):
         # the prompt route's token-batched experts: every stream on one image (the core
         # program does not depend on the slot count), x / h / y sized for the widest
         E = eb_geometry(spec)
@@ -439,6 +488,10 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
 
 def _with_eb(spec: ModelSpec, b: dict) -> dict:
     if eb_ok(spec):
+        for n, k in prompt_gemm(spec)["_shapes"]:
+            b[f"gemm_n{n}_k{k}"] = {"design": "gemm_q4_prefill/gemm_q4_prefill.py",
+                                    "build_dir": f"gemm_q4_prefill/build_n{n}_k{k}_t{PROMPT_T}",
+                                    "env": {"GQP_N": str(n), "GQP_K": str(k), "GQP_T": str(PROMPT_T)}}
         for s in EB_STREAMS:
             b[f"eb{s}"] = {"design": "lfm2moe/eb.py",
                            "build_dir": f"lfm2moe/build_eb{s}_h{spec.hidden}_ff{spec.moe_intermediate}_nt{EB_NT}",
@@ -465,6 +518,7 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
                      "xm_off": Lm.AD_XM, "res_off": Lm.AD_RES, "idx_off": ROUT_IDX_OFF,
                      "weights_off": ROUT_IDX_OFF + 32}
     if eb_ok(spec):
+        out["prompt_gemm"] = {k: v for k, v in prompt_gemm(spec).items() if not k.startswith("_")}
         out["expert_batch"] = {"nt": EB_NT, "kernels": {str(sl): f"eb{sl}" for sl in EB_STREAMS},
                                "args": ["pool", "ebx", "ebh", "eby"]}
     return out
@@ -479,5 +533,6 @@ def hf_config_check(spec: ModelSpec) -> dict:
 
 
 GEN_KERNELS = "designs/lfm2moe/gen_kernels.py"
-KERNEL_SOURCES = list(LF.KERNEL_SOURCES) + ["designs/lfm2moe/*.py", "designs/lm_head_q8/*.py",
+KERNEL_SOURCES = list(LF.KERNEL_SOURCES) + ["designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc",
+                                           "designs/gemm_q4_prefill/*.h","designs/lfm2moe/*.py", "designs/lm_head_q8/*.py",
                                            "designs/lm_head_q8/*.cc", "designs/lm_head_q8/*.h"]

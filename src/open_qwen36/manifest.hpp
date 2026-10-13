@@ -236,6 +236,9 @@ struct Manifest {
     /// Core::step_prompt_lfm2. Same shape as a gemm_block's moe_batch: slots -> stream, the
     /// pool + x / h / y globals, NT tokens per expert visit.
     MoeBatch expert_batch;
+    /// layout.prompt_gemm: the prompt route's batched mixers (Core::prompt_mixers) -- GEMM
+    /// regions of the pool, kernels per shape, x / y globals, the host weights' tensor names.
+    nlohmann::json prompt_gemm;
     stream_patch::AttnGeometry attn;
     // the model and its programs
     std::vector<std::string> layers;         ///< per layer: a key of layer_types

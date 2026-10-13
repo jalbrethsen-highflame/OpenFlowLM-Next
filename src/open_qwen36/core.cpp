@@ -346,6 +346,8 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     }
     for (const auto& s : w_->tail) wanted[s.kernel] = true;
     for (const auto& [slots, k] : w_->expert_batch.kernels) wanted[k] = true;
+    if (!w_->prompt_gemm.is_null())
+        for (const auto& [shape, k] : w_->prompt_gemm["kernels"].items()) wanted[k.get<std::string>()] = true;
     for (const auto& [name, d] : w_->kernels)
         if (wanted.count(name)) load_kernel(name, d);
     logits_host_.assign(w_->vocab, 0.f);
@@ -774,6 +776,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
             }
         }
     }
+    prompt_setup();
     weights_loaded_ = true;
     pos_ = 0;
     log("weights resident: " + std::to_string(nl_) + " pools + lm_head, " +
@@ -3980,6 +3983,176 @@ void Core::experts_batch(int l, const float* xm, const float* res, const int32_t
     }
 }
 
+namespace {
+float bf16_round(float v) { return bf16_to_f32(f32_to_bf16(v)); }
+}  // namespace
+
+void Core::prompt_setup() {
+    prompt_gemm_on_ = false;
+    ph_.clear();
+    const auto& P = w_->prompt_gemm;
+    if (P.is_null() || !prompt_route_ok()) return;
+    if (const char* e = std::getenv("OFLM_OPEN_PROMPT_GEMM"); e && std::string(e) == "0") return;
+    auto at = [](std::string s, int l) {
+        for (size_t p = s.find("{l}"); p != std::string::npos; p = s.find("{l}", p)) s.replace(p, 3, std::to_string(l));
+        return s;
+    };
+    auto rounded = [&](const std::string& name) {
+        std::vector<float> v = file_->f32(name);
+        for (float& x : v) x = bf16_round(x);
+        return v;
+    };
+    const size_t hid = w_->hidden, taps = P["taps"].get<size_t>();
+    const auto& T = P["tensors"];
+    ph_.assign(nl_, {});
+    for (int l = 0; l < nl_; ++l) {
+        PromptHost& h = ph_[l];
+        h.kind = P["kinds"].value(types_[l]->name, std::string());
+        if (h.kind.empty()) throw std::runtime_error("open_qwen36: prompt_gemm has no kind for layer type " + types_[l]->name);
+        h.attn_norm = rounded(at(T["attn_norm"], l));
+        h.ffn_norm = rounded(at(T["ffn_norm"], l));
+        std::vector<std::string> regions;
+        if (h.kind == "attn") {
+            h.qn = rounded(at(T["q_norm"], l));
+            h.kn = rounded(at(T["k_norm"], l));
+            regions = {"qkv", "o"};
+        } else {
+            const std::vector<float> c = file_->f32(at(T["conv"], l));   // [hid][taps]
+            if (c.size() != hid * taps) throw std::runtime_error("open_qwen36: conv weight of layer " + std::to_string(l));
+            h.conv.resize(taps * hid);
+            for (size_t ch = 0; ch < hid; ++ch)
+                for (size_t k = 0; k < taps; ++k) h.conv[k * hid + ch] = bf16_round(c[ch * taps + k]);
+            regions = {"conv_in", "conv_out"};
+            if (h.kind == "conv_dense") regions.insert(regions.end(), {"ffn_gate", "ffn_up", "ffn_down"});
+        }
+        // The GEMM weights are the pool's bytes at the region (band order IS the GEMM's order),
+        // COPIED into their own buffer. An xrt sub-buffer of the pool would cost nothing, but
+        // merely creating one moved the decode kernels' results (8-layer slice, corr 0.99997 ->
+        // 0.9989 with the sub-buffers never dispatched) -- so not that, until it is understood.
+        for (const std::string& r : regions) {
+            const auto& g = P["regions"][r];
+            const size_t off = g[0].get<size_t>(), n = g[1].get<size_t>(), k = g[2].get<size_t>();
+            const size_t bytes = n * k / 8192 * w_->chunk_bytes;
+            auto& v = gemm_w_["pg_" + r];
+            if (v.size() != static_cast<size_t>(nl_)) v.resize(nl_);
+            v[l] = xrt::ext::bo(*dev_, padup(bytes));
+            std::memcpy(v[l].map<uint8_t*>(), pools_[l].map<uint8_t*>() + off, bytes);
+            v[l].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+    }
+    prompt_gemm_on_ = true;
+    log("prompt route: batched mixers on the GEMM (T = " + std::to_string(P["t"].get<size_t>()) + ")");
+}
+
+void Core::prompt_gemm_run(int l, const std::string& region, const float* x, float* y) {
+    const auto& P = w_->prompt_gemm;
+    const size_t T = P["t"].get<size_t>();
+    const auto& g = P["regions"][region];
+    const size_t n = g[1].get<size_t>(), k = g[2].get<size_t>();
+    const std::string kn = P["kernels"][std::to_string(n) + "x" + std::to_string(k)].get<std::string>();
+    const std::string xn = P["x"][std::to_string(k)].get<std::string>(), yn = P["y"][std::to_string(n)].get<std::string>();
+    xrt::bo& xb = buffer(xn, 0);
+    host::tile_x(x, T, k, xb.map<uint16_t*>());
+    xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, k * T * 2, 0);
+    run(kerns_.at(kn), {"pg_" + region, xn, yn}, l);
+    xrt::bo& yb = buffer(yn, 0);
+    read_back(yb, n * T * 4, 0);
+    host::transpose(yb.map<float*>(), n, T, y);
+}
+
+bool Core::prompt_mixers(int l, float* x, size_t N, float* res, float* xm) {
+    if (!prompt_gemm_on_) return false;
+    const PromptHost& h = ph_[l];
+    // debug: OFLM_OPEN_PROMPT_GEMM_SKIP=<kind>[,<kind>] keeps those layers on the per-token mixers
+    if (const char* sk = std::getenv("OFLM_OPEN_PROMPT_GEMM_SKIP"); sk && ("," + std::string(sk) + ",").find("," + h.kind + ",") != std::string::npos)
+        return false;
+    const auto& P = w_->prompt_gemm;
+    const size_t T = P["t"].get<size_t>(), hid = w_->hidden;
+    const double eps = P["eps"].get<double>();
+    const bool conv = h.kind != "attn", dense = h.kind == "conv_dense";
+    const size_t ff = P["ff"].get<size_t>(), kv_elems = P["kv_row_elems"].get<size_t>();
+    std::vector<float> xb(T * hid), xn(T * hid), out(T * hid), rb(T * hid), mb(T * hid);
+    // the recurrent state the decode kernels keep on the device: read it, carry it, write it back
+    std::vector<float> s0(hid), s1(hid);
+    xrt::bo& st = state_[l];
+    if (conv) {
+        read_back(st, 2 * hid * 4, 0);
+        std::memcpy(s0.data(), st.map<uint8_t*>(), hid * 4);
+        std::memcpy(s1.data(), st.map<uint8_t*>() + hid * 4, hid * 4);
+    } else if (pos_ > 0) {
+        read_back(st, static_cast<size_t>(pos_) * kv_elems * 2, 0);
+    }
+    for (size_t r0 = 0; r0 < N; r0 += T) {
+        const size_t tr = std::min(T, N - r0);
+        std::fill(xb.begin(), xb.end(), 0.f);
+        std::memcpy(xb.data(), x + r0 * hid, tr * hid * 4);
+        host::rmsnorm_rows(xb.data(), T, hid, h.attn_norm.data(), eps, xn.data());
+        if (conv) {
+            std::vector<float> yin(T * 3 * hid), yc(T * hid, 0.f);
+            prompt_gemm_run(l, "conv_in", xn.data(), yin.data());
+            const float *w0 = h.conv.data(), *w1 = w0 + hid, *w2 = w1 + hid;
+            for (size_t t = 0; t < tr; ++t) {
+                const float *B = yin.data() + t * 3 * hid, *C = B + hid, *u = C + hid;
+                float* yo = yc.data() + t * hid;
+                for (size_t c = 0; c < hid; ++c) {
+                    const float bx = B[c] * u[c];
+                    const float cv = s0[c] * w0[c] + s1[c] * w1[c] + bx * w2[c];
+                    yo[c] = C[c] * cv;
+                    s0[c] = s1[c];
+                    s1[c] = bx;
+                }
+            }
+            prompt_gemm_run(l, "conv_out", yc.data(), out.data());
+        } else {
+            const size_t nh = P["nh"].get<size_t>(), kvh = P["kvh"].get<size_t>(), hd = P["hd"].get<size_t>();
+            const size_t qw = nh * hd, kvw = kvh * hd;
+            std::vector<float> qkv(T * (qw + 2 * kvw)), q(T * qw), k(T * kvw), v(T * kvw), og(T * qw);
+            prompt_gemm_run(l, "qkv", xn.data(), qkv.data());
+            for (size_t t = 0; t < T; ++t) {
+                const float* row = qkv.data() + t * (qw + 2 * kvw);
+                std::memcpy(q.data() + t * qw, row, qw * 4);
+                std::memcpy(k.data() + t * kvw, row + qw, kvw * 4);
+                std::memcpy(v.data() + t * kvw, row + qw + kvw, kvw * 4);
+            }
+            host::AttnGeom g;
+            g.T = T;
+            g.t_real = tr;
+            g.nh = nh;
+            g.kvh = kvh;
+            g.hd = hd;
+            g.rot = P["rot"].get<size_t>();
+            g.pos0 = static_cast<size_t>(pos_) + r0;
+            g.eps = eps;
+            host::attention_block(g, q.data(), k.data(), v.data(), nullptr, h.qn.data(), h.kn.data(),
+                                  w_->rope_inv_freq.data(), st.map<uint16_t*>(), kv_elems, og.data());
+            prompt_gemm_run(l, "o", og.data(), out.data());
+        }
+        std::fill(rb.begin(), rb.end(), 0.f);
+        for (size_t i = 0; i < tr * hid; ++i) rb[i] = xb[i] + out[i];
+        host::rmsnorm_rows(rb.data(), T, hid, h.ffn_norm.data(), eps, mb.data());
+        for (float& f : mb) f = bf16_round(f);       // the device hands the router / experts bf16 xm
+        if (dense) {
+            std::vector<float> gg(T * ff), uu(T * ff), dn(T * hid);
+            prompt_gemm_run(l, "ffn_gate", mb.data(), gg.data());
+            prompt_gemm_run(l, "ffn_up", mb.data(), uu.data());
+            for (size_t i = 0; i < T * ff; ++i) gg[i] = gg[i] / (1.f + std::exp(-gg[i])) * uu[i];
+            prompt_gemm_run(l, "ffn_down", gg.data(), dn.data());
+            for (size_t i = 0; i < tr * hid; ++i) x[r0 * hid + i] = rb[i] + dn[i];
+        } else {
+            std::memcpy(res + r0 * hid, rb.data(), tr * hid * 4);
+            std::memcpy(xm + r0 * hid, mb.data(), tr * hid * 4);
+        }
+    }
+    if (conv) {
+        std::memcpy(st.map<uint8_t*>(), s0.data(), hid * 4);
+        std::memcpy(st.map<uint8_t*>() + hid * 4, s1.data(), hid * 4);
+        st.sync(XCL_BO_SYNC_BO_TO_DEVICE, 2 * hid * 4, 0);
+    } else {
+        st.sync(XCL_BO_SYNC_BO_TO_DEVICE, N * kv_elems * 2, static_cast<size_t>(pos_) * kv_elems * 2);
+    }
+    return true;
+}
+
 void Core::step_prompt_lfm2(const std::vector<int>& ids, bool want_logits) {
     apply_thread_budget();
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: step_prompt_lfm2 before load_weights");
@@ -4007,7 +4180,8 @@ void Core::step_prompt_lfm2(const std::vector<int>& ids, bool want_logits) {
         Kern& mk = kerns_.at(mix.kernel);
         xrt::bo& act = act_[l];
         auto tm = std::chrono::steady_clock::now();
-        for (size_t t = 0; t < N; ++t) {
+        const bool batched = prompt_mixers(l, x.data(), N, res.data(), xm.data());
+        for (size_t t = 0; t < (batched ? 0 : N); ++t) {
             std::memcpy(xb.map<float*>(), x.data() + t * hid, hid * 4);
             xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, hid * 4, 0);
             if (mk.patch == "attnpos") {
@@ -4051,7 +4225,7 @@ void Core::step_prompt_lfm2(const std::vector<int>& ids, bool want_logits) {
             }
         }
         mix_ms += ms_since(tm);
-        if (!moe) continue;
+        if (!moe || (batched && ph_[l].kind == "conv_dense")) continue;
         auto tr = std::chrono::steady_clock::now();
 #pragma omp parallel for
         for (long long t = 0; t < static_cast<long long>(N); ++t) {

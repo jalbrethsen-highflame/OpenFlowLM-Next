@@ -65,7 +65,7 @@ struct AttnGeom {
 /// are the fused projection's outputs; qn / kn [hd]; inv_freq [rot/2]. kv is the layer's
 /// cache: rows of kv_row_elems bf16, [K_t | V_t] each kvh*hd wide, rows [0, pos0) valid on
 /// entry and [pos0, pos0 + t_real) written. og [T, nh*hd] out: the gated attention
-/// output (zero past t_real).
+/// output (zero past t_real); gate == nullptr for a family without the output gate.
 void attention_block(const AttnGeom& g, const float* q, const float* k, const float* v, const float* gate,
                      const float* qn, const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
                      float* og);
