@@ -102,18 +102,20 @@ def eb(pool: In, x: In, h: Out, y: Out, *, slots: CompileTime[int], srchash: Com
     flags = [f"-DMB_NT={NT}"]
     # timing-only ablations (output garbage), moe_batch's: EB_NULL_MM=1 keeps the streams and drops
     # the core arithmetic, EB_NULL_DQ=1 drops the q4_1 scales
-    flags += [f"-D{mb}" for ev, mb in (("EB_NULL_MM", "MB_NULL_MM"), ("EB_NULL_DQ", "MB_NULL_DQ")) if os.environ.get(ev) == "1"]
+    flags += [f"-D{mb}" for ev, mb in (("EB_NULL_MM", "MB_NULL_MM"), ("EB_NULL_DQ", "MB_NULL_DQ"),
+                                        ("EB_SHARE_NG", "MB_SHARE_NG")) if os.environ.get(ev) == "1"]
 
     def ef(sym, args, d=MB):
         return ExternalFunction(sym, source_file=str(d / f"{sym}.cc"), arg_types=args, include_dirs=inc,
                                 compile_flags=flags)
 
-    # mb_step_ug writes band `half` of its buffer: with the [u | g] buffer, half = 2 proj + band
-    step_ug = ef("mb_step_ug", [band_ty, b_ty, ug_ty, np.int32, np.int32])
-    step_dn = ef("mb_step_dn", [band_ty, b_ty, c_ty, np.int32])
+    # ONE band step for up, gate and down (eb_step: part p of the [u | g] accumulator), so the
+    # core carries the tile routine once; the down accumulates in part 0 and eb_out copies it out
+    step = ef("eb_step", [band_ty, b_ty, ug_ty, np.int32, np.int32], HERE)
     zero_ug = ef("eb_zero_ug2", [ug_ty], HERE)
-    zero_y = ef("mb_zero_y", [c_ty])
+    zero1 = ef("eb_zero1", [ug_ty], HERE)
     silu = ef("eb_silu2", [ug_ty, c_ty], HERE)
+    outk = ef("eb_out", [ug_ty, c_ty], HERE)
 
     A_l3l2 = [ObjectFifo(a4_ty, name=f"A{c}", depth=2) for c in range(N_COLS)]
     A_l2l1 = [A_l3l2[c].cons().split([r * BAND for r in range(N_ROWS)], obj_types=[band_ty] * N_ROWS,
@@ -129,7 +131,7 @@ def eb(pool: In, x: In, h: Out, y: Out, *, slots: CompileTime[int], srchash: Com
 
     # Every loop is a hardware loop (range_): unrolled in Python, the fifo bookkeeping around
     # each call is emitted once per copy, and the core program overflowed its 16 KB by 512 B.
-    def core_fn(in_a, in_b, out_c, k_ug, k_dn, k_zero_ug, k_zero_y, k_silu, ug):
+    def core_fn(in_a, in_b, out_c, k_step, k_zero_ug, k_zero1, k_silu, k_out, ug):
         for _ in range_(HB2):                        # this core's band pairs
             k_zero_ug(ug)
             for pb in range_(4):                     # (up, band 0) (up, 1) (gate, 0) (gate, 1)
@@ -137,26 +139,27 @@ def eb(pool: In, x: In, h: Out, y: Out, *, slots: CompileTime[int], srchash: Com
                     band = in_a.acquire(1)
                     for ky in range_(4):
                         xe = in_b.acquire(1)
-                        k_ug(band, xe, ug, ky, pb)
+                        k_step(band, xe, ug, ky, pb)
                         in_b.release(1)
                     in_a.release(1)
             he = out_c.acquire(1)
             k_silu(ug, he)                           # 128 h rows, bf16, natural order
             out_c.release(1)
         for _ in range_(NRB_DN):                     # this core's output bands
-            ye = out_c.acquire(1)
-            k_zero_y(ye)
+            k_zero1(ug)
             for _ in range_(NKG_DN):
                 band = in_a.acquire(1)
                 for ky in range_(4):
                     hb = in_b.acquire(1)
-                    k_dn(band, hb, ye, ky)
+                    k_step(band, hb, ug, ky, 0)
                     in_b.release(1)
                 in_a.release(1)
+            ye = out_c.acquire(1)
+            k_out(ug, ye)
             out_c.release(1)
 
     workers = [Worker(core_fn,
-                      [A_l2l1[c][r].cons(), B[c].cons(), C_l1l2[c][r].prod(), step_ug, step_dn, zero_ug, zero_y, silu,
+                      [A_l2l1[c][r].cons(), B[c].cons(), C_l1l2[c][r].prod(), step, zero_ug, zero1, silu, outk,
                        ugbuf[r][c]],
                       tile=Tile(c, 2 + r), stack_size=0x1000)
                for c in range(N_COLS) for r in range(N_ROWS)]
@@ -209,9 +212,9 @@ def eb(pool: In, x: In, h: Out, y: Out, *, slots: CompileTime[int], srchash: Com
 
 
 DESIGN = eb
-_src = b"".join([(HERE / "eb.py").read_bytes(), (HERE / "eb_zero_ug2.cc").read_bytes(), (HERE / "eb_silu2.cc").read_bytes()]
+_src = b"".join([(HERE / "eb.py").read_bytes()] + sorted(f.read_bytes() for f in HERE.glob("eb_*.cc"))
                 + sorted(f.read_bytes() for f in MB.glob("*.cc"))
                 + [(MB / "moe_batch.h").read_bytes(), (HERE.parent.parent / "include" / "vecmath.h").read_bytes(),
                    f"NT={NT}".encode(), SPEC.spec_hash().encode()]
-                + [f"{v}=1".encode() for v in ("EB_NULL_MM", "EB_NULL_DQ") if os.environ.get(v) == "1"])
+                + [f"{v}=1".encode() for v in ("EB_NULL_MM", "EB_NULL_DQ", "EB_SHARE_NG") if os.environ.get(v) == "1"])
 SPECIALIZE = {"slots": SLOTS, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}
