@@ -75,9 +75,10 @@ HB2 = FF // 128 // N_ROWS    # band pairs per core (3 at 1536)
 NRB_DN = HID // 64 // N_ROWS # down bands per core (8 at 2048)
 NKG_UP, NKG_DN = HID // 256, FF // 256
 X_BYTES, H_BYTES, Y_BYTES = E["x_bytes"](SLOTS), E["h_bytes"](SLOTS), E["y_bytes"](SLOTS)
-B_DEPTH = 4
+BFP = os.environ.get("EB_BFP") == "1"
+B_DEPTH = 2 if BFP else 4      # the bfp step's 5.8 KB of L1 scratch comes out of the x fifo
 C_DEPTH = 1
-L1 = 0x1000 + 2 * BAND + (256 * NT * 4) + C_DEPTH * (64 * NT * 4) + (B_DEPTH + 1) * (K_TILE * NT * 2)
+L1 = (64 + 8 * NT // 8) * 72 * BFP + 0x1000 + 2 * BAND + (256 * NT * 4) + C_DEPTH * (64 * NT * 4) + (B_DEPTH + 1) * (K_TILE * NT * 2)
 
 assert FF % (128 * N_ROWS) == 0, f"eb.py: the expert width {FF} is not whole band pairs over {N_ROWS} rows"
 assert HID % (64 * N_ROWS) == 0
@@ -111,7 +112,9 @@ def eb(pool: In, x: In, h: Out, y: Out, *, slots: CompileTime[int], srchash: Com
 
     # ONE band step for up, gate and down (eb_step: part p of the [u | g] accumulator), so the
     # core carries the tile routine once; the down accumulates in part 0 and eb_out copies it out
-    step = ef("eb_step", [band_ty, b_ty, ug_ty, np.int32, np.int32], HERE)
+    # EB_BFP=1: the bfp16 MAC-array step (eb_step_bfp.cc); same signature, same C layout
+    step = (ef("eb_step_bfp", [band_ty, b_ty, ug_ty, np.int32, np.int32], HERE) if BFP
+            else ef("eb_step", [band_ty, b_ty, ug_ty, np.int32, np.int32], HERE))
     zero_ug = ef("eb_zero_ug2", [ug_ty], HERE)
     zero1 = ef("eb_zero1", [ug_ty], HERE)
     silu = ef("eb_silu2", [ug_ty, c_ty], HERE)
@@ -216,5 +219,5 @@ _src = b"".join([(HERE / "eb.py").read_bytes()] + sorted(f.read_bytes() for f in
                 + sorted(f.read_bytes() for f in MB.glob("*.cc"))
                 + [(MB / "moe_batch.h").read_bytes(), (HERE.parent.parent / "include" / "vecmath.h").read_bytes(),
                    f"NT={NT}".encode(), SPEC.spec_hash().encode()]
-                + [f"{v}=1".encode() for v in ("EB_NULL_MM", "EB_NULL_DQ", "EB_SHARE_NG") if os.environ.get(v) == "1"])
+                + [f"{v}=1".encode() for v in ("EB_NULL_MM", "EB_NULL_DQ", "EB_SHARE_NG", "EB_BFP") if os.environ.get(v) == "1"])
 SPECIALIZE = {"slots": SLOTS, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

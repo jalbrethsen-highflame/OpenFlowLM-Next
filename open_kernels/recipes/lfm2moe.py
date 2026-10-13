@@ -493,9 +493,10 @@ def _with_eb(spec: ModelSpec, b: dict) -> dict:
                                     "build_dir": f"gemm_q4_prefill/build_n{n}_k{k}_t{PROMPT_T}",
                                     "env": {"GQP_N": str(n), "GQP_K": str(k), "GQP_T": str(PROMPT_T)}}
         for s in EB_STREAMS:
+            # EB_BFP: the expert products on the bfp16 MAC array (eb_step_bfp.cc), 2x the bf16 path
             b[f"eb{s}"] = {"design": "lfm2moe/eb.py",
-                           "build_dir": f"lfm2moe/build_eb{s}_h{spec.hidden}_ff{spec.moe_intermediate}_nt{EB_NT}",
-                           "env": {"EB_SLOTS": str(s)}}
+                           "build_dir": f"lfm2moe/build_eb{s}_h{spec.hidden}_ff{spec.moe_intermediate}_nt{EB_NT}_bfp",
+                           "env": {"EB_SLOTS": str(s), "EB_BFP": "1"}}
     return b
 
 
