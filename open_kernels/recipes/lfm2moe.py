@@ -21,10 +21,12 @@ whole number of 64-row bands per core (OPEN-MOE-WIDE-FF): each expert is stored 
 std_perm bands, [up | gate] per expert from POOL_EXP and the down slices from
 POOL_DOWN_EXP, so the stream_patch moeroute2 geometry (with its `base`) re-points it.
 
-GGUF-direct only (f32-scale pool chunks, q4_1_f32): this family has no q4nx converter.
-The spec may say q4_1 (config.json does not know the container); every layout here is
-computed at q4_1_f32 whatever it says, and the manifest's top level and its `gguf` twin
-are the same kernel set.
+GGUF-direct only: the engine packs the GGUF's Q4_0 blocks straight into the pool. The pool
+uses the q4nx chunk layout (bf16 scales, 5120 B) by default: the GEMV narrows f32 scale
+planes to bf16 on load anyway, so the f32 layout (6144 B, OPEN_LFM2MOE_QUANT=q4_1_f32 at
+export) computes the same bits from 20 % more bytes -- and the prefill GEMMs read only the
+bf16 one. Every layout here is computed at QUANT whatever the spec says, and the manifest's
+top level and its `gguf` twin are the same kernel set.
 """
 from __future__ import annotations
 
@@ -35,10 +37,16 @@ from . import lfm2 as LF
 from .attnknobs import probe_env  # noqa: F401  (cache.py / dx.py read it off the family module)
 from .catalogue import OpRangeError, check_buffer_args
 from .qwen36moe import BAND_ROWS, ELEM, MB, ROUT_IDX_OFF, q4_bytes, q4_chunks, roundup, tab_bytes
-from .qwen36moe import Q8_CHUNK_F32
+from .qwen36moe import Q8_CHUNK, Q8_CHUNK_F32
 from .spec import FULL, SHORT_CONV, ModelSpec
 
-QUANT = "q4_1_f32"
+import os as _os
+QUANT = _os.environ.get("OPEN_LFM2MOE_QUANT", "q4_1")      # the pool's scale layout (see above)
+if QUANT not in ("q4_1", "q4_1_f32"):
+    raise OpRangeError(f"OPEN_LFM2MOE_QUANT={QUANT!r} (q4_1 | q4_1_f32)")
+F32 = QUANT == "q4_1_f32"
+Q8_CH = Q8_CHUNK_F32 if F32 else Q8_CHUNK
+SFX = "_f32" if F32 else ""
 band_bytes = D.band_bytes    # noqa: F401  (dx.py / cx.py: band_bytes(K, quant))
 chunk_bytes = D.chunk_bytes  # noqa: F401  (dx.py / cx.py: chunk_bytes(quant))
 TAPS = LF.TAPS
@@ -59,7 +67,7 @@ def lm_q8(spec: ModelSpec) -> dict:
     rows = D.lm_rows(lfm2_view(spec))
     if rows % LM_BAND_ROWS:
         raise OpRangeError(f"lfm2moe: {rows} head rows are not whole 128-row bands")
-    band = 4 * (spec.hidden // 256) * Q8_CHUNK_F32
+    band = 4 * (spec.hidden // 256) * Q8_CH
     bands = rows // LM_BAND_ROWS
     return {"rows": rows, "band": band, "bands": bands,
             "pool": roundup(roundup(bands, 8) * band, MB)}
@@ -234,6 +242,12 @@ def pack_plan(spec: ModelSpec) -> dict:
     attn = base["layer_types"][FULL]
     ffn_tensors = ("mlp.up_proj.weight", "mlp.gate_proj.weight", "mlp.down_proj.weight")
 
+    def gguf_ops(entry):
+        return {"pool": [dict(op, op="std_perm_gguf") if op["op"] == "std_perm" else op for op in entry["pool"]],
+                "consts": entry["consts"]}
+
+    sc_dense, attn = gguf_ops(sc_dense), gguf_ops(attn)
+
     def no_ffn(entry):
         return {"pool": [op for op in entry["pool"] if not op["tensor"].endswith(ffn_tensors)],
                 "consts": entry["consts"]}
@@ -260,7 +274,7 @@ def pack_plan(spec: ModelSpec) -> dict:
         "layer_types": {lt: types[lt] for lt in sorted(set(manifest_layers(spec)))},
         "lm_head": {"pool_bytes": lm_q8(spec)["pool"],
                     "ops": [{"op": "lmhead_q8_gguf", "tensor": "lm_head.weight", "dst": 0,
-                             "chunk_bytes": Q8_CHUNK_F32, "in_dim": spec.hidden, "rows": lm_q8(spec)["rows"]}]},
+                             "chunk_bytes": Q8_CH, "in_dim": spec.hidden, "rows": lm_q8(spec)["rows"]}]},
         "embed": {"tensor": "model.embed_tokens.weight", "dim": spec.hidden},
         "norm": {"tensor": "token_embd_norm.weight", "bytes": spec.hidden * 2},
     }
@@ -287,11 +301,11 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     V = lfm2_view(spec)
     Lm = layout(spec, max_ctx)
     base = D.programs(V, max_ctx)            # f32: the tail, the globals, ln / lm, the ptab
-    out = {"contexts": {"ln": base["contexts"]["ln"], "lm": "lm_head_q8_f32/final.xclbin",
-                        "cx": "short_conv_f32/final.xclbin", "cxm": "short_conv_mix/final.xclbin",
+    out = {"contexts": {"ln": base["contexts"]["ln"], "lm": "lm_head_q8/final.xclbin",
+                        "cx": "cx_dense/final.xclbin", "cxm": "short_conv_mix/final.xclbin",
                         "dxm": "dx_mix/final.xclbin", "ex": "ex/final.xclbin"},
            "kernels": {"ln": base["kernels"]["ln"],
-                       "lm": {"context": "lm", "insts": "lm_head_q8_f32/insts.bin", "build": "lm_head_q8_f32"}},
+                       "lm": {"context": "lm", "insts": "lm_head_q8/insts.bin", "build": "lm_head_q8"}},
            "layer_types": {}, "tail": base["tail"], "globals": dict(base["globals"])}
     out["globals"]["lmpool"] = lm_q8(spec)["pool"]
     sc_args = ["pool", "xres", "consts", "state", "act"]
@@ -299,7 +313,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     ex_args = ["pool", "xres", "act"]
     for kn, args in (("cx", sc_args), ("cxm", sc_args), ("dxm", ax_args), ("ex", ex_args)):
         check_buffer_args(kn, args)
-    out["kernels"]["cx"] = {"context": "cx", "insts": "short_conv_f32/insts.bin", "build": "short_conv_f32"}
+    out["kernels"]["cx"] = {"context": "cx", "insts": "cx_dense/insts.bin", "build": "cx_dense"}
     out["kernels"]["cxm"] = {"context": "cxm", "insts": "short_conv_mix/insts.bin", "build": "short_conv_mix"}
     out["kernels"]["dxm"] = {"context": "dxm", "insts": "dx_mix/insts.bin", "patch": "attnpos",
                              "build": "dx_mix", "window": 0}
@@ -333,7 +347,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             "buffers": {**bufs, "state": {"kind": "kv", "row": Lm.KV_ROW}},
             "program": [{"op": "run", "kernel": "dxm", "args": ax_args}, route,
                         {"op": "run", "kernel": "ex", "args": ex_args}]}
-    if spec.quant != QUANT:
+    if spec.quant != "q4_1_f32":
         # the engine reads `gguf` for a model.gguf: the same kernel set (this family is
         # GGUF-direct only), so the twin is this section again
         out["gguf"] = {k: out[k] for k in ("contexts", "kernels", "layer_types", "tail", "globals")}
@@ -344,36 +358,35 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     V = lfm2_view(spec)
     db = D.builds(V)
     h, ff = spec.hidden, spec.intermediate
-    sc_env = {"GEMV_SCALES_F32": "1", "SC_HID": str(h), "SC_TAPS": str(TAPS)}
+    f32 = {"GEMV_SCALES_F32": "1"} if F32 else {}
+    sc_env = {**f32, "SC_HID": str(h), "SC_TAPS": str(TAPS)}
+    head = {"design": "lm_head_q8/lm_head_q8.py",
+            "build_dir": f"lm_head_q8/build_{lm_q8(spec)['rows']}_k{h}{SFX}",
+            "env": {"LMHEAD_N": str(lm_q8(spec)["rows"]), "LMHEAD_K": str(h), "LMHEAD_CORES": "8",
+                    **({"LMHEAD_SCALES_F32": "1"} if F32 else {})}}
     if one_context(spec):
         tag = f"h{h}_ff{spec.moe_intermediate}_e{spec.num_experts}_k{spec.experts_per_tok}_c{moe_cores(spec)}"
-        b = {"short_conv_f32": {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_ff{ff}_f32",
+        b = {"cx_dense": {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_ff{ff}{SFX}",
                                 "env": sc_env}}
         for name, part in (("lm_cm", 0), ("lm_am", 1), ("lm_ex", 2)):
-            b[name] = {"design": "lfm2moe/lm.py", "build_dir": f"lfm2moe/build_lm{part}_{tag}",
+            b[name] = {"design": "lfm2moe/lm.py", "build_dir": f"lfm2moe/build_lm{part}_{tag}{SFX}",
                        "env": {"LM_PART": str(part), "OPEN_LFM2MOE_CORES": str(moe_cores(spec))}}
         b["ln"] = db["ln"]
-        b["lm_head_q8_f32"] = {"design": "lm_head_q8/lm_head_q8.py",
-                               "build_dir": f"lm_head_q8/build_{lm_q8(spec)['rows']}_k{h}_f32",
-                               "env": {"LMHEAD_N": str(lm_q8(spec)["rows"]), "LMHEAD_K": str(h),
-                                       "LMHEAD_CORES": "8", "LMHEAD_SCALES_F32": "1"}}
+        b["lm_head_q8"] = head
         return b
     return {
-        "short_conv_f32": {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_ff{ff}_f32",
+        "cx_dense": {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_ff{ff}{SFX}",
                            "env": sc_env},
-        "short_conv_mix": {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_mix_f32",
+        "short_conv_mix": {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_mix{SFX}",
                            "env": {**sc_env, "CX_MIX": "1"}},
-        "dx_mix": {"design": "dense/dx.py", "build_dir": f"dense/build_lfm2moe_h{h}_mix_f32",
-                   "env": {"GEMV_SCALES_F32": "1", "DX_MIX": "1"}},
+        "dx_mix": {"design": "dense/dx.py", "build_dir": f"dense/build_lfm2moe_h{h}_mix{SFX}",
+                   "env": {**f32, "DX_MIX": "1"}},
         "ex": {"design": "lfm2moe/ex.py",
                "build_dir": f"lfm2moe/build_h{h}_ff{spec.moe_intermediate}_e{spec.num_experts}_k{spec.experts_per_tok}"
-                            f"_c{moe_cores(spec)}",
+                            f"_c{moe_cores(spec)}{SFX}",
                "env": {"OPEN_LFM2MOE_CORES": str(moe_cores(spec))}},
         "ln": db["ln"],
-        "lm_head_q8_f32": {"design": "lm_head_q8/lm_head_q8.py",
-                           "build_dir": f"lm_head_q8/build_{lm_q8(spec)['rows']}_k{h}_f32",
-                           "env": {"LMHEAD_N": str(lm_q8(spec)["rows"]), "LMHEAD_K": str(h),
-                                   "LMHEAD_CORES": "8", "LMHEAD_SCALES_F32": "1"}},
+        "lm_head_q8": head,
     }
 
 
@@ -384,7 +397,7 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     out["pool_bytes"] = Lm.POOL_BYTES
     out["chunk_bytes"] = D.chunk_bytes(QUANT)
     out["lmhead_pool_bytes"] = lm_q8(spec)["pool"]
-    out["lmhead_chunk_bytes"] = Q8_CHUNK_F32
+    out["lmhead_chunk_bytes"] = Q8_CH
     # moeroute2's geometry (stream_patch::MoeGeometry): routed [up | gate] per expert from
     # `base`, the down slices from pool_down; nothing shared, so share_* mark the pool end
     out["moe"] = {"experts": G.E, "topk": G.NE, "stripe": G.BB_H, "up_bytes": G.UP_BYTES,

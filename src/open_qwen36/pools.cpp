@@ -551,6 +551,24 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
             fail("std_perm_gguf " + name + ": chunk0 " + std::to_string(op.chunk0) +
                  " is not a whole number of row blocks");
         const uint64_t row_base = 32 * (op.chunk0 / (op.in_dim / 256));
+        // The pool's scale planes: f32 (6144 B chunks, GGUF-direct) or bf16 (5120 B, the
+        // q4nx layout every prefill GEMM reads). The GEMV narrows f32 planes to bf16 with RNE
+        // on load (gemv_q4.h load_scale), so narrowing here with the same RNE is bit-identical.
+        if (ch != 6144 && ch != Q4_CHUNK)
+            fail("std_perm_gguf " + name + ": a " + std::to_string(ch) + " B pool chunk (6144 f32 or " +
+                 std::to_string(Q4_CHUNK) + " bf16 scales)");
+        const bool s32 = ch == 6144;
+        const size_t code0 = s32 ? 2048 : 1024;
+        auto put_dm = [&](uint8_t* d, size_t j, float df, float mf) {
+            if (s32) {
+                std::memcpy(d + 4 * j, &df, 4);
+                std::memcpy(d + 1024 + 4 * j, &mf, 4);
+            } else {
+                const uint16_t bd = f32_to_bf16(df), bm = f32_to_bf16(mf);
+                std::memcpy(d + 2 * j, &bd, 2);
+                std::memcpy(d + 512 + 2 * j, &bm, 2);
+            }
+        };
         if (!kq && n < static_cast<size_t>(row_base + out_dim) * nb * blk)
             fail(name + " is " + std::to_string(n) + " B, the plan needs " +
                  std::to_string(static_cast<uint64_t>(row_base + out_dim) * nb * blk));
@@ -586,8 +604,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
                         um = f32_to_fp16(mraw);
                         const float df = fp16_to_f32(ud), mf = fp16_to_f32(um);
                         const float inv = df > 0.f ? 1.f / df : 0.f;
-                        std::memcpy(d + 4 * (kb * 32 + r), &df, 4);
-                        std::memcpy(d + 1024 + 4 * (kb * 32 + r), &mf, 4);
+                        put_dm(d, kb * 32 + r, df, mf);
                         // codes: value i at nibble (kb*32+i, r), i+16 at (p0+256)
                         uint8_t nib[16];
                         for (size_t i = 0; i < 16; ++i) {
@@ -598,10 +615,10 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
                         }
                         for (size_t i = 0; i < 16; ++i) {
                             const size_t p0 = rb * 4096 + (kb * 32 + i) * 16 + rl;
-                            d[2048 + (p0 >> 1)] |= (p0 & 1) ? static_cast<uint8_t>(nib[i] << 4)
+                            d[code0 + (p0 >> 1)] |= (p0 & 1) ? static_cast<uint8_t>(nib[i] << 4)
                                                             : (nib[i] & 0xF);
                             const size_t p1 = p0 + 256;              // i + 16: the block's high half
-                            d[2048 + (p1 >> 1)] |= (p1 & 1) ? (nib[i] & 0xF0) : (nib[i] >> 4);
+                            d[code0 + (p1 >> 1)] |= (p1 & 1) ? (nib[i] & 0xF0) : (nib[i] >> 4);
                         }
                         continue;
                     }
@@ -609,16 +626,15 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
                     if (has_min) std::memcpy(&um, b + 2, 2);
                     const float df = fp16_to_f32(ud);
                     const float mf = has_min ? fp16_to_f32(um) : -8.f * df;
-                    std::memcpy(d + 4 * (kb * 32 + r), &df, 4);
-                    std::memcpy(d + 1024 + 4 * (kb * 32 + r), &mf, 4);
+                    put_dm(d, kb * 32 + r, df, mf);
                     // codes: block nibbles (two K per byte) -> two rows per byte at one K
                     for (size_t i = 0; i < 16; ++i) {
                         const uint8_t byte = b[(has_min ? 4 : 2) + i];
                         const uint8_t lo = byte & 0xF, hi = byte >> 4;   // GGUF: value i | value i+16
                         const size_t p0 = rb * 4096 + (kb * 32 + i) * 16 + rl;
-                        d[2048 + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;   // value j = lo
+                        d[code0 + (p0 >> 1)] |= (p0 & 1) ? lo << 4 : lo;   // value j = lo
                         const size_t p1 = p0 + 256;              // i + 16: the block's high half
-                        d[2048 + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;   // value j + 16 = hi
+                        d[code0 + (p1 >> 1)] |= (p1 & 1) ? hi << 4 : hi;   // value j + 16 = hi
                     }
                 }
             }
@@ -750,7 +766,11 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
         const auto* g = dynamic_cast<const GgufFile*>(&m);
         if (!g) fail("lmhead_q8_gguf " + name + " is not in a GGUF");
         const size_t CH8 = op.chunk_bytes, K = op.in_dim, rows = op.rows;
-        if (CH8 != 9216) fail("lmhead_q8_gguf " + name + ": chunk_bytes " + std::to_string(CH8) + " (the f32-scale q8 chunk is 9216)");
+        if (CH8 != 9216 && CH8 != Q8_CHUNK)
+            fail("lmhead_q8_gguf " + name + ": chunk_bytes " + std::to_string(CH8) + " (9216 f32 or " +
+                 std::to_string(Q8_CHUNK) + " bf16 scales)");
+        const bool q8s32 = CH8 == 9216;
+        const size_t q8code0 = q8s32 ? 1024 : 512;
         if (!K || K % 256 || !rows || rows % 128)
             fail("lmhead_q8_gguf " + name + ": in_dim " + std::to_string(K) + " / rows " + std::to_string(rows) +
                  " are not whole k-tiles / 128-row bands");
@@ -769,7 +789,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
             const size_t s = rb / 4, q = rb % 4;
             for (size_t kt = 0; kt < nk; ++kt) {
                 uint8_t* d = dst + op.dst + (s * per_band + kt * 4 + q) * CH8;
-                int8_t* code = reinterpret_cast<int8_t*>(d + 1024);
+                int8_t* code = reinterpret_cast<int8_t*>(d + q8code0);
                 for (size_t kb = 0; kb < 8; ++kb)
                     for (size_t r = 0; r < 32; ++r) {
                         const float* v = rd.data() + r * K + kt * 256 + kb * 32;
@@ -777,7 +797,12 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
                         for (size_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(v[i]));
                         const float sc = amax > 0.f ? bf16_to_f32(bf16_ceil(amax / 127.f)) : 0.f;
                         const float inv = sc > 0.f ? 1.f / sc : 0.f;
-                        std::memcpy(d + 4 * (kb * 32 + r), &sc, 4);
+                        if (q8s32) {
+                            std::memcpy(d + 4 * (kb * 32 + r), &sc, 4);
+                        } else {
+                            const uint16_t bs = f32_to_bf16(sc);       // exact: sc is a bf16 value
+                            std::memcpy(d + 2 * (kb * 32 + r), &bs, 2);
+                        }
                         for (size_t i = 0; i < 32; ++i) {
                             const long c = std::lround(v[i] * inv);
                             code[(r / 16) * 4096 + (kb * 32 + i) * 16 + (r % 16)] =
