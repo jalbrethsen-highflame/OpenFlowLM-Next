@@ -3919,49 +3919,61 @@ void Core::experts_batch(int l, const float* xm, const float* res, const int32_t
     std::vector<std::pair<uint32_t, size_t>> visits;
     for (size_t e = 0; e < E; ++e)
         for (size_t off = 0; off < owed[e].size(); off += NT) visits.push_back({static_cast<uint32_t>(e), off});
-    xrt::bo& xb = buffer(mb.args[1], 0);
-    xrt::bo& yb = buffer(mb.args[3], 0);
-    std::vector<std::vector<std::pair<size_t, float>>> per_token(n);
+    // The passes up front: each the shortest stream that holds the visits still pending, else
+    // the longest. Then the host work around them overlaps the NPU: while pass i runs, the host
+    // gathers pass i + 1's tokens into the other x buffer and scatters pass i - 1 out of the
+    // other y buffer. Only the instruction stream is shared between passes, and it is patched
+    // after the previous run has completed.
+    struct Pass {
+        const std::string* k = nullptr;
+        size_t slots = 0, first = 0, cnt = 0;
+    };
+    std::vector<Pass> passes;
     for (size_t done = 0; done < visits.size();) {
-        const size_t left = visits.size() - done;
-        size_t slots = 0;
-        const std::string* kname = nullptr;
+        Pass p;
+        p.first = done;
         for (const auto& [sl, k] : mb.kernels) {
-            slots = sl;
-            kname = &k;
-            if (sl >= left) break;
+            p.slots = sl;
+            p.k = &k;
+            if (sl >= visits.size() - done) break;
         }
-        const size_t cnt = std::min(left, slots);
+        p.cnt = std::min(visits.size() - done, p.slots);
+        passes.push_back(p);
+        done += p.cnt;
+    }
+    const std::string xn[2] = {mb.args[1], mb.args[1] + "_b"}, yn[2] = {mb.args[3], mb.args[3] + "_b"};
+    const size_t NG = NT / 8;
+    auto prep = [&](const Pass& p, int b) {
         auto t0 = std::chrono::steady_clock::now();
+        xrt::bo& xb = buffer(xn[b], 0);
         uint16_t* xh = xb.map<uint16_t*>();
-        std::vector<uint32_t> ex(slots, 0);   // unused slots stream expert 0: a valid read, ignored
-        for (auto& v : per_token) v.clear();
-        for (size_t i = 0; i < cnt; ++i) {
-            const auto& [e, off] = visits[done + i];
-            ex[i] = e;
-            for (size_t j = 0; j < std::min(NT, owed[e].size() - off); ++j)
-                per_token[owed[e][off + j].first].push_back({i * NT + j, owed[e][off + j].second});
-        }
 #pragma omp parallel for
-        for (long long i = 0; i < static_cast<long long>(cnt); ++i) {
-            const auto& [e, off] = visits[done + i];
+        for (long long i = 0; i < static_cast<long long>(p.cnt); ++i) {
+            const auto& [e, off] = visits[p.first + i];
             uint16_t* xs = xh + i * hid * NT;
+            // a visit with fewer than NT tokens leaves stale columns: the mmul's token lanes are
+            // independent, so they are never read back (Core::moe_block's note)
             for (size_t j = 0; j < std::min(NT, owed[e].size() - off); ++j) {
                 const float* row = xm + owed[e][off + j].first * hid;
                 for (size_t kb = 0; kb < hid / 8; ++kb)
                     for (size_t kl = 0; kl < 8; ++kl) xs[(kb * NT + j) * 8 + kl] = f32_to_bf16(row[kb * 8 + kl]);
             }
         }
-        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, cnt * hid * NT * 2, 0);
+        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, p.cnt * hid * NT * 2, 0);
         timing_.moe_prep_ms += ms_since(t0);
-        Kern& mk = kerns_.at(*kname);
-        stream_patch::moe2_apply(mk.iw(), mk.moe2, ex.data(), w_->moe);
-        mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        timing_.moe_run_ms += run(mk, mb.args, l);
+    };
+    std::vector<std::vector<std::pair<size_t, float>>> per_token(n);
+    auto scatter = [&](const Pass& p, int b) {
         auto t2 = std::chrono::steady_clock::now();
-        read_back(yb, cnt * hid * NT * 4, 0);
+        for (auto& v : per_token) v.clear();
+        for (size_t i = 0; i < p.cnt; ++i) {
+            const auto& [e, off] = visits[p.first + i];
+            for (size_t j = 0; j < std::min(NT, owed[e].size() - off); ++j)
+                per_token[owed[e][off + j].first].push_back({i * NT + j, owed[e][off + j].second});
+        }
+        xrt::bo& yb = buffer(yn[b], 0);
+        read_back(yb, p.cnt * hid * NT * 4, 0);
         const float* yh = yb.map<float*>();
-        const size_t NG = NT / 8;
 #pragma omp parallel for
         for (long long t = 0; t < static_cast<long long>(n); ++t) {
             float* o = out + t * hid;
@@ -3981,8 +3993,25 @@ void Core::experts_batch(int l, const float* xm, const float* res, const int32_t
             }
         }
         timing_.moe_read_ms += ms_since(t2);
-        done += cnt;
+    };
+    if (passes.empty()) return;
+    prep(passes[0], 0);
+    for (size_t pi = 0; pi < passes.size(); ++pi) {
+        const int b = static_cast<int>(pi & 1);
+        const Pass& p = passes[pi];
+        Kern& mk = kerns_.at(*p.k);
+        std::vector<uint32_t> ex(p.slots, 0);   // unused slots stream expert 0: a valid read, ignored
+        for (size_t i = 0; i < p.cnt; ++i) ex[i] = visits[p.first + i].first;
+        stream_patch::moe2_apply(mk.iw(), mk.moe2, ex.data(), w_->moe);
+        mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto tr = std::chrono::steady_clock::now();
+        Inflight f = start_run(mk, {mb.args[0], xn[b], mb.args[2], yn[b]}, l);
+        if (pi + 1 < passes.size()) prep(passes[pi + 1], b ^ 1);
+        if (pi > 0) scatter(passes[pi - 1], b ^ 1);
+        wait_run(f);
+        timing_.moe_run_ms += ms_since(tr);
     }
+    scatter(passes.back(), static_cast<int>((passes.size() - 1) & 1));
 }
 
 namespace {
@@ -3994,6 +4023,12 @@ struct PromptClock { double tile = 0, gemm = 0, read = 0, conv = 0, attn = 0, no
 void Core::prompt_setup() {
     prompt_gemm_on_ = false;
     ph_.clear();
+    // the expert batch's second x / y buffers (experts_batch double-buffers its passes)
+    if (prompt_route_ok())
+        for (size_t i : {size_t{1}, size_t{3}}) {
+            const std::string& nm = w_->expert_batch.args[i];
+            if (!globals_.count(nm + "_b")) globals_[nm + "_b"] = alloc(globals_.at(nm).size());
+        }
     const auto& P = w_->prompt_gemm;
     if (P.is_null() || !prompt_route_ok()) return;
     if (const char* e = std::getenv("OFLM_OPEN_PROMPT_GEMM"); e && std::string(e) == "0") return;
