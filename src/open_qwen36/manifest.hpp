@@ -173,6 +173,10 @@ struct LayerType {
     std::string state_kind;                  ///< "linear" (a fixed-size state BO) | "kv" (max_ctx x state_row)
     uint64_t state_bytes = 0, state_row = 0;
     std::vector<Step> program;
+    /// The prompt route's per-token mixer (Core::step_prompt_lfm2), when it is not program's
+    /// first step: LFM2-MoE's merged image runs mixer + experts as ONE core pass, so a prompt
+    /// (mixers for every token, then the experts batched) needs the standalone mixer images.
+    std::vector<Step> prompt;
     GemmBlockProgram gemm_block;
     std::map<std::string, GemmBlockProgram> gemm_block_variants;   ///< OPEN-PREFILL-MODE: routes loadable in its place
     std::vector<PackOp> pool, consts;
@@ -225,7 +229,13 @@ struct Manifest {
         bool norm_topk = true;
         double norm_eps = 1e-6, scale = 1.0;
         uint64_t xm_off = 0, idx_off = 1024, weights_off = 1056;
+        uint64_t res_off = 0;                ///< the residual (f32) the mixer leaves beside xm (prompt route)
+        bool has_res = false;
     } router;
+    /// layout.expert_batch: the routed experts over a block of tokens (LFM2-MoE's eb.py), driven by
+    /// Core::step_prompt_lfm2. Same shape as a gemm_block's moe_batch: slots -> stream, the
+    /// pool + x / h / y globals, NT tokens per expert visit.
+    MoeBatch expert_batch;
     stream_patch::AttnGeometry attn;
     // the model and its programs
     std::vector<std::string> layers;         ///< per layer: a key of layer_types

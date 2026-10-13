@@ -203,7 +203,21 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         m.router.xm_off = get<uint64_t>(r, "xm_off", rw);
         m.router.idx_off = r.value("idx_off", 1024ull);
         m.router.weights_off = r.value("weights_off", 1056ull);
+        m.router.has_res = r.contains("res_off");
+        m.router.res_off = r.value("res_off", 0ull);
         if (!m.has_moe) fail(rw, "a host router without layout.moe");
+    }
+    if (lay.contains("expert_batch")) {
+        const json& b = lay["expert_batch"];
+        const std::string bw = lw + ".expert_batch";
+        for (const auto& [k, v] : need(b, "kernels", bw).items())
+            m.expert_batch.kernels[static_cast<size_t>(std::stoul(k))] = v.get<std::string>();
+        m.expert_batch.args = get<std::vector<std::string>>(b, "args", bw);
+        m.expert_batch.nt = get<size_t>(b, "nt", bw);
+        if (m.expert_batch.args.size() != 4 || m.expert_batch.args[0] != "pool")
+            fail(bw, "args must be pool, x, h, y");
+        if (!m.has_moe || !m.router.present || !m.router.has_res)
+            fail(bw, "the expert batch needs layout.moe and a host router with res_off");
     }
     m.attn.kv_row = m.kv_row;
     m.attn.ptab_row = m.ptab_row;
@@ -244,7 +258,9 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         else if (t.state_kind == "kv") t.state_row = get<uint64_t>(st, "row", tw);
         else fail(tw, "unknown state kind " + t.state_kind);
         t.program = parse_program(need(v, "program", tw), tw);
+        if (v.contains("prompt")) t.prompt = parse_program(v["prompt"], tw + ".prompt");
         for (const auto& s : t.program) check_step(m, s, tw, "program");
+        for (const auto& s : t.prompt) check_step(m, s, tw, "prompt");
         // the block prefill route, independent of the sequential `program`
         // above (manifest.hpp's GemmBlockProgram): a per-kind fixed step list
         auto parse_gemm_block = [&](const json& gj, const std::string& gw, GemmBlockProgram& g) {

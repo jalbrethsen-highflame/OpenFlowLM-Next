@@ -328,6 +328,7 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     std::map<std::string, bool> wanted;
     for (int l = 0; l < nl_; ++l) {
         for (const auto& s : types_[l]->program) wanted[s.kernel] = true;
+        for (const auto& s : types_[l]->prompt) wanted[s.kernel] = true;
         // 0167/#32: the GEMM-route block's 5 GEMM kernels, plus its attn_kernel
         // (the attention half, driven directly by Core rather than via a
         // Step -- see manifest.hpp's GemmBlockProgram; a layer type with its
@@ -344,6 +345,7 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
         for (const auto& [rows, k] : types_[l]->gemm_block.attn_block.kernels_pv) wanted[k] = true;
     }
     for (const auto& s : w_->tail) wanted[s.kernel] = true;
+    for (const auto& [slots, k] : w_->expert_batch.kernels) wanted[k] = true;
     for (const auto& [name, d] : w_->kernels)
         if (wanted.count(name)) load_kernel(name, d);
     logits_host_.assign(w_->vocab, 0.f);
@@ -1766,6 +1768,51 @@ void Core::route_op(const Step& s, int layer) {
     else route(kerns_.at(s.kernel), layer, s.act_off);
 }
 
+void Core::route_math(int layer, const float* xm, uint32_t idx[8], float wt[8]) const {
+    const auto& R = w_->router;
+    const size_t hid = w_->hidden, E = w_->moe.experts, K = w_->moe.topk;
+    // logits = Wr @ xm, then the gate
+    const float* W = router_w_[layer].data();
+    std::vector<double> p(E), sel(E);
+    // f32 with 16 independent partial sums, so the loop vectorizes without -ffast-math
+    // (one double accumulator was 0.11 ms a layer, 4 ms of a 40-layer step)
+    for (size_t e = 0; e < E; ++e) {
+        const float* r = W + e * hid;
+        float acc[16] = {};
+        size_t i = 0;
+        for (; i + 16 <= hid; i += 16)
+            for (size_t j = 0; j < 16; ++j) acc[j] += r[i + j] * xm[i + j];
+        double sum = 0;
+        for (; i < hid; ++i) sum += static_cast<double>(r[i]) * xm[i];
+        for (size_t j = 0; j < 16; ++j) sum += acc[j];
+        p[e] = sum;
+    }
+    if (R.gating == "sigmoid") {
+        for (size_t e = 0; e < E; ++e) p[e] = 1.0 / (1.0 + std::exp(-p[e]));
+    } else {
+        double mx = p[0], sum = 0;
+        for (size_t e = 1; e < E; ++e) mx = std::max(mx, p[e]);
+        for (size_t e = 0; e < E; ++e) sum += (p[e] = std::exp(p[e] - mx));
+        for (size_t e = 0; e < E; ++e) p[e] /= sum;
+    }
+    // the bias steers the choice only; the weights are the unbiased gate values
+    const std::vector<float>& b = router_b_[layer];
+    for (size_t e = 0; e < E; ++e) sel[e] = p[e] + (b.empty() ? 0.0 : b[e]);
+    for (int i = 0; i < 8; ++i) idx[i] = 0, wt[i] = 0.f;
+    std::vector<bool> used(E, false);
+    for (size_t s = 0; s < K; ++s) {
+        size_t best = E;
+        for (size_t e = 0; e < E; ++e)
+            if (!used[e] && (best == E || sel[e] > sel[best])) best = e;   // lowest index on a tie
+        used[best] = true;
+        idx[s] = static_cast<uint32_t>(best);
+    }
+    double sum = 0;
+    for (size_t s = 0; s < K; ++s) sum += p[idx[s]];
+    for (size_t s = 0; s < K; ++s)
+        wt[s] = static_cast<float>((R.norm_topk ? p[idx[s]] / (sum + R.norm_eps) : p[idx[s]]) * R.scale);
+}
+
 void Core::host_route(Kern& k, int layer, uint64_t act_off) {
     auto t0 = std::chrono::steady_clock::now();
     const auto& R = w_->router;
@@ -1801,47 +1848,9 @@ void Core::host_route(Kern& k, int layer, uint64_t act_off) {
         const uint32_t u = static_cast<uint32_t>(xb[i]) << 16;
         std::memcpy(&xm[i], &u, 4);
     }
-    // logits = Wr @ xm, then the gate
-    const float* W = router_w_[layer].data();
-    std::vector<double> p(E), sel(E);
-    // f32 with 16 independent partial sums, so the loop vectorizes without -ffast-math
-    // (one double accumulator was 0.11 ms a layer, 4 ms of a 40-layer step)
-    for (size_t e = 0; e < E; ++e) {
-        const float* r = W + e * hid;
-        float acc[16] = {};
-        size_t i = 0;
-        for (; i + 16 <= hid; i += 16)
-            for (size_t j = 0; j < 16; ++j) acc[j] += r[i + j] * xm[i + j];
-        double sum = 0;
-        for (; i < hid; ++i) sum += static_cast<double>(r[i]) * xm[i];
-        for (size_t j = 0; j < 16; ++j) sum += acc[j];
-        p[e] = sum;
-    }
-    if (R.gating == "sigmoid") {
-        for (size_t e = 0; e < E; ++e) p[e] = 1.0 / (1.0 + std::exp(-p[e]));
-    } else {
-        double mx = p[0], sum = 0;
-        for (size_t e = 1; e < E; ++e) mx = std::max(mx, p[e]);
-        for (size_t e = 0; e < E; ++e) sum += (p[e] = std::exp(p[e] - mx));
-        for (size_t e = 0; e < E; ++e) p[e] /= sum;
-    }
-    // the bias steers the choice only; the weights are the unbiased gate values
-    const std::vector<float>& b = router_b_[layer];
-    for (size_t e = 0; e < E; ++e) sel[e] = p[e] + (b.empty() ? 0.0 : b[e]);
     uint32_t idx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    std::vector<bool> used(E, false);
-    for (size_t s = 0; s < K; ++s) {
-        size_t best = E;
-        for (size_t e = 0; e < E; ++e)
-            if (!used[e] && (best == E || sel[e] > sel[best])) best = e;   // lowest index on a tie
-        used[best] = true;
-        idx[s] = static_cast<uint32_t>(best);
-    }
-    double sum = 0;
     float wt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    for (size_t s = 0; s < K; ++s) sum += p[idx[s]];
-    for (size_t s = 0; s < K; ++s)
-        wt[s] = static_cast<float>((R.norm_topk ? p[idx[s]] / (sum + R.norm_eps) : p[idx[s]]) * R.scale);
+    route_math(layer, xm.data(), idx, wt);
     uint8_t* rec = act.map<uint8_t*>() + act_off;
     std::memcpy(rec + R.idx_off, idx, sizeof idx);
     std::memcpy(rec + R.weights_off, wt, 4 * K);
@@ -3872,6 +3881,207 @@ void Core::moe_block(int l, const float* xm, const float* res, const int32_t* id
         done += n;
     }
     timing_.route_ms += ms_since(tp);
+}
+
+// ---- LFM2-MoE's prompt route (layout.expert_batch, designs/lfm2moe/eb.py) ----------------
+
+bool Core::prompt_route_ok() const {
+    if (!w_->expert_batch.present() || !w_->router.present || !w_->router.has_res) return false;
+    for (int l = 0; l < nl_; ++l) {
+        const auto& prog = types_[l]->program;
+        if (prog.empty() || prog.front().op != "run") return false;
+    }
+    return true;
+}
+
+// The routed experts of one layer over n tokens. Every expert's tokens are cut into visits of
+// NT; a pass fills the shortest stream that holds the visits still pending (else the longest),
+// gathers their tokens into x[slot] (moe_batch's A tiles), patches each slot's fills to its
+// expert, runs, and scatters y[slot] back with the router weights. Core::moe_block's law.
+void Core::experts_batch(int l, const float* xm, const float* res, const int32_t* idx, const float* w, size_t n,
+                         float* out) {
+    const MoeBatch& mb = w_->expert_batch;
+    const size_t hid = w_->hidden, E = w_->moe.experts, topk = w_->moe.topk, NT = mb.nt;
+    std::memcpy(out, res, n * hid * 4);
+    std::vector<std::vector<std::pair<int, float>>> owed(E);
+    for (size_t t = 0; t < n; ++t)
+        for (size_t s = 0; s < topk; ++s) {
+            const int32_t e = idx[t * topk + s];
+            if (e < 0 || static_cast<size_t>(e) >= E)
+                throw std::runtime_error("open_qwen36: router produced expert index " + std::to_string(e));
+            owed[e].push_back({static_cast<int>(t), w[t * topk + s]});
+        }
+    std::vector<std::pair<uint32_t, size_t>> visits;
+    for (size_t e = 0; e < E; ++e)
+        for (size_t off = 0; off < owed[e].size(); off += NT) visits.push_back({static_cast<uint32_t>(e), off});
+    xrt::bo& xb = buffer(mb.args[1], 0);
+    xrt::bo& yb = buffer(mb.args[3], 0);
+    std::vector<std::vector<std::pair<size_t, float>>> per_token(n);
+    for (size_t done = 0; done < visits.size();) {
+        const size_t left = visits.size() - done;
+        size_t slots = 0;
+        const std::string* kname = nullptr;
+        for (const auto& [sl, k] : mb.kernels) {
+            slots = sl;
+            kname = &k;
+            if (sl >= left) break;
+        }
+        const size_t cnt = std::min(left, slots);
+        auto t0 = std::chrono::steady_clock::now();
+        uint16_t* xh = xb.map<uint16_t*>();
+        std::vector<uint32_t> ex(slots, 0);   // unused slots stream expert 0: a valid read, ignored
+        for (auto& v : per_token) v.clear();
+        for (size_t i = 0; i < cnt; ++i) {
+            const auto& [e, off] = visits[done + i];
+            ex[i] = e;
+            for (size_t j = 0; j < std::min(NT, owed[e].size() - off); ++j)
+                per_token[owed[e][off + j].first].push_back({i * NT + j, owed[e][off + j].second});
+        }
+#pragma omp parallel for
+        for (long long i = 0; i < static_cast<long long>(cnt); ++i) {
+            const auto& [e, off] = visits[done + i];
+            uint16_t* xs = xh + i * hid * NT;
+            for (size_t j = 0; j < std::min(NT, owed[e].size() - off); ++j) {
+                const float* row = xm + owed[e][off + j].first * hid;
+                for (size_t kb = 0; kb < hid / 8; ++kb)
+                    for (size_t kl = 0; kl < 8; ++kl) xs[(kb * NT + j) * 8 + kl] = f32_to_bf16(row[kb * 8 + kl]);
+            }
+        }
+        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, cnt * hid * NT * 2, 0);
+        timing_.moe_prep_ms += ms_since(t0);
+        Kern& mk = kerns_.at(*kname);
+        stream_patch::moe2_apply(mk.iw(), mk.moe2, ex.data(), w_->moe);
+        mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        timing_.moe_run_ms += run(mk, mb.args, l);
+        auto t2 = std::chrono::steady_clock::now();
+        read_back(yb, cnt * hid * NT * 4, 0);
+        const float* yh = yb.map<float*>();
+        const size_t NG = NT / 8;
+#pragma omp parallel for
+        for (long long t = 0; t < static_cast<long long>(n); ++t) {
+            float* o = out + t * hid;
+            for (const auto& [col, wt] : per_token[t]) {
+                const size_t tt = col % NT;
+                const float* base = yh + (col / NT) * hid * NT + (tt / 8) * 64 + (tt % 8) * 8;
+                for (size_t band = 0; band < hid / 64; ++band)
+                    for (size_t g = 0; g < 4; ++g) {
+                        const float* even = base + ((band * 4 + g) * 2 * NG) * 64;
+                        const float* odd = even + NG * 64;
+                        float* d = o + band * 64 + g * 16;
+                        for (size_t jj = 0; jj < 8; ++jj) {
+                            d[2 * jj] += wt * even[jj];
+                            d[2 * jj + 1] += wt * odd[jj];
+                        }
+                    }
+            }
+        }
+        timing_.moe_read_ms += ms_since(t2);
+        done += cnt;
+    }
+}
+
+void Core::step_prompt_lfm2(const std::vector<int>& ids, bool want_logits) {
+    apply_thread_budget();
+    if (!weights_loaded_) throw std::runtime_error("open_qwen36: step_prompt_lfm2 before load_weights");
+    if (!prompt_route_ok()) throw std::runtime_error("open_qwen36: this kernel set has no LFM2-MoE prompt route");
+    const size_t N = ids.size(), hid = w_->hidden, K = w_->moe.topk;
+    if (N == 0) return;
+    if (static_cast<size_t>(pos_) + N > cfg_.max_ctx)
+        throw std::runtime_error("open_qwen36: a " + std::to_string(N) + "-token prompt at position " +
+                                 std::to_string(pos_) + " passes the context capacity " + std::to_string(cfg_.max_ctx));
+    for (int tok : ids)
+        if (tok < 0 || static_cast<size_t>(tok) >= w_->vocab) throw std::runtime_error("open_qwen36: token id out of range");
+    auto t0 = std::chrono::steady_clock::now();
+    timing_ = StepTiming{};
+    const auto& R = w_->router;
+    std::vector<float> x(N * hid), res(N * hid), xm(N * hid), wt(N * K);
+    std::vector<int32_t> idx(N * K);
+    for (size_t t = 0; t < N; ++t) embedding_row(static_cast<size_t>(ids[t]), x.data() + t * hid);
+    xrt::bo& xb = buffer("xres", 0);
+    double mix_ms = 0, route_ms = 0, ex_ms = 0;
+    for (int l = 0; l < nl_; ++l) {
+        const auto& prog = types_[l]->program;
+        bool moe = false;
+        for (const Step& s : prog) moe = moe || s.op == "hostroute";
+        const Step& mix = types_[l]->prompt.empty() ? prog.front() : types_[l]->prompt.front();
+        Kern& mk = kerns_.at(mix.kernel);
+        xrt::bo& act = act_[l];
+        auto tm = std::chrono::steady_clock::now();
+        for (size_t t = 0; t < N; ++t) {
+            std::memcpy(xb.map<float*>(), x.data() + t * hid, hid * 4);
+            xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, hid * 4, 0);
+            if (mk.patch == "attnpos") {
+                stream_patch::attn_apply(mk.iw(), mk.attn, static_cast<uint64_t>(pos_) + t, mk.geom);
+                mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
+            uint16_t* xmb = reinterpret_cast<uint16_t*>(act.map<uint8_t*>() + R.xm_off);
+            if (moe && route_sentinel_) {
+                for (size_t i = 0; i < hid; ++i) xmb[i] = 0xFFFF;
+                act.sync(XCL_BO_SYNC_BO_TO_DEVICE, hid * 2, R.xm_off);
+            }
+            if (!moe) {
+                // a dense layer is the whole layer: run every step (one run on LFM2-MoE)
+                for (const Step& s : prog) run(kerns_.at(s.kernel), s.args, l);
+                read_back(xb, hid * 4, 0);
+                std::memcpy(x.data() + t * hid, xb.map<float*>(), hid * 4);
+                continue;
+            }
+            run(mk, mix.args, l);
+            read_back(act, hid * 2, R.xm_off);
+            if (route_sentinel_) {
+                auto armed = [&] {
+                    for (size_t i = 0; i < hid; ++i)
+                        if (xmb[i] == 0xFFFF) return true;
+                    return false;
+                };
+                const auto tw = std::chrono::steady_clock::now();
+                while (armed()) {
+                    if (ms_since(tw) > 1000.0)
+                        throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + " token " + std::to_string(t) +
+                                                 ": xm never landed (1 s after the mixer completed)");
+                    read_back(act, hid * 2, R.xm_off);
+                }
+            }
+            read_back(act, hid * 4, R.res_off);
+            std::memcpy(res.data() + t * hid, act.map<uint8_t*>() + R.res_off, hid * 4);
+            float* xo = xm.data() + t * hid;
+            for (size_t i = 0; i < hid; ++i) {
+                const uint32_t u = static_cast<uint32_t>(xmb[i]) << 16;
+                std::memcpy(xo + i, &u, 4);
+            }
+        }
+        mix_ms += ms_since(tm);
+        if (!moe) continue;
+        auto tr = std::chrono::steady_clock::now();
+#pragma omp parallel for
+        for (long long t = 0; t < static_cast<long long>(N); ++t) {
+            uint32_t ti[8];
+            float tw[8];
+            route_math(l, xm.data() + t * hid, ti, tw);
+            for (size_t s = 0; s < K; ++s) {
+                idx[t * K + s] = static_cast<int32_t>(ti[s]);
+                wt[t * K + s] = tw[s];
+            }
+        }
+        route_ms += ms_since(tr);
+        auto te = std::chrono::steady_clock::now();
+        experts_batch(l, xm.data(), res.data(), idx.data(), wt.data(), N, x.data());
+        ex_ms += ms_since(te);
+    }
+    pos_ += static_cast<int>(N);
+    block_logits_.clear();
+    if (block_logits_all_)
+        for (size_t t = 0; t < N; ++t) {
+            tail_logits(x.data() + t * hid);
+            block_logits_.push_back(logits_host_);
+        }
+    else if (want_logits)
+        tail_logits(x.data() + (N - 1) * hid);
+    timing_.total_ms = ms_since(t0);
+    if (cfg_.verbose)
+        std::fprintf(stderr, "open_qwen36: prompt %zu tokens: %.0f ms (mixers %.0f, router %.0f, experts %.0f; "
+                     "expert prep %.0f run %.0f read %.0f)\n", N, timing_.total_ms, mix_ms, route_ms, ex_ms,
+                     timing_.moe_prep_ms, timing_.moe_run_ms, timing_.moe_read_ms);
 }
 
 void Core::seek(int pos) {
