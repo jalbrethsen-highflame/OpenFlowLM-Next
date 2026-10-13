@@ -25,6 +25,19 @@ Read `npu-model-porting` first for the general rules. Source: `open_kernels/reci
 - When the expert core count differs from the mixers' (8B: 4 vs 8) the recipe falls back to
   three images (`cxm`, `dxm`, `ex`). `OPEN_LFM2MOE_ONE_CTX=0` forces that for an A/B.
 
+## Prompt route (prefill)
+
+Engine `step_prompt_lfm2` (core.cpp), selected by `--gemm-block` on the CLI and by default in
+the engine's prefill. Layer-major over the whole prompt:
+- Mixers (`prompt_mixers`): projections on `gemm_n{N}_k{K}` (gemm_q4_prefill, T = 256,
+  bfp16, pipelined and double-buffered); short conv and attention on the host
+  (`attention_tiles`, block_host.cpp); standalone `short_conv_mix` / `dx_mix` images.
+- Router: host, same math as decode.
+- Experts (`experts_batch`): `eb64` / `eb16` (designs/lfm2moe/eb.py, `EB_BFP=1`), 16 token
+  slots per expert visit, x/y double-buffered so host gather/scatter overlaps the NPU.
+- 4009-token prompt, 12.9 s: mixers 6.5 s (gemm 3.2, attention 2.35, tile 1.2,
+  read+transpose 1.1), experts 6.15 s (NPU run 5.9; prep and read overlap it).
+
 ## Model directory
 
 ```
@@ -41,8 +54,8 @@ export PATH=/opt/xilinx/xrt/bin:$PATH
 OPEN_KERNELS_UNVALIDATED=1 ironvenv/bin/python open_kernels/export_qwen36_kernels.py \
     --model-dir ~/models/LFM2.5-24B-A2B-GGUF -j 3          # -> src/xclbins/LFM2.5-24B-A2B-GGUF/open_kernels
 ```
-Sets: `cx_dense` (dense layers), `lm_cm lm_am lm_ex` (one image), `ln`, `lm_head_q8`;
-~4 min. `UNVALIDATED` is for gemv K = 11776 (the dense FFN) and the expert points. The three
+Sets: `cx_dense` (dense layers), `lm_cm lm_am lm_ex` (one image), `ln`, `lm_head_q8`, and
+the prompt sets `short_conv_mix dx_mix eb64 eb16 gemm_n*_k*`; ~6 min. `UNVALIDATED` is for gemv K = 11776 (the dense FFN) and the expert points. The three
 `lm_*` xclbins must be equivalent apart from stamps (`xclbin_equivalent`); the export's
 manifest points the context at `lm_cm/final.xclbin`.
 
@@ -65,6 +78,12 @@ manifest points the context at `lm_cm/final.xclbin`.
 | 24B, one context, f32 scales | 49 ms/token (20.3 tok/s) | 19 GB |
 | 24B, three images | 106 ms/token | 19 GB |
 | 8B, three images, bf16 scales | 57 ms/token (17.6 tok/s) | ~6.5 GB |
+| 24B prompt, 4009 tokens | 311 tok/s (12.9 s) | |
+| 24B decode after a 4K prompt | 63 ms/token (15.8 tok/s) | |
+
+
+Prompt history: 19.5 (token by token) -> 35 (batched experts) -> 130 (batched mixers) ->
+186 (overlap, pipelining) -> 209 (persistent scratch) -> 273 (bfp16 experts) -> 311 (bfp16 GEMMs).
 
 24B step (one context): ex 38 x 0.64 ms, mixers ~0.95 ms (includes the queued ex wait),
 cx 2 x 2.1, head 5.9, router 0.8.
@@ -74,5 +93,6 @@ cx 2 x 2.1, head 5.9, router 0.8.
 - Not wired into the `oflm` app (`model_list.json`, an AutoModel adapter); the CLI + chat.py
   drive it. The LFM2 adapter selects the open engine when a kernel set exists, so a
   `model_list` entry with family `lfm2` is the likely path.
-- Prefill runs token by token (no gemm_block route for f32-scale pools).
+- The prompt route needs the bf16-scale pool (q4_1, the default).
+- The 8B has no prompt route: `eb` needs ff a multiple of 512 (8B ff = 1792).
 - The 8B has no merged image (expert core count 4 vs mixer 8).

@@ -130,9 +130,45 @@ real time once. Read the whole thing before writing a design.
 - Host work shows up too: a double-precision host GEMV was 4 ms/step; 16 f32 partial sums
   vectorize without -ffast-math.
 
-## 6. Hygiene
+## 6. Prompt processing (prefill)
+
+Token-by-token prefill is decode speed (LFM2-MoE: 19 tok/s). The fix is layer-major: run
+each layer over the whole prompt before the next layer. LFM2-MoE 24B went 19 -> 311 tok/s.
+
+- **Only 8-bit operands are fast on XDNA2.** The bf16 mmul runs on the vector unit
+  (~1 TFLOP/s). The MAC array takes int8 or bfp16ebs8. Two ways in:
+  - IRON's `kernels.mm(..., emulate_bf16_mmul_with_bfp16=True)`: mac_dims become (8,8,8),
+    so any A-tile writer must write 8-row blocks (`gemm_q4_prefill` `GQP_BFP=1`, `-DGQD_R8`).
+  - A hand kernel: convert with `aie::to_vector<bfp16ebs8>`, multiply with
+    `mac_8x8_8x8T` (C += A * B^T, so store each 8x8 weight block as `[row][k]`), and set
+    `conv_even` rounding inside the call. `designs/lfm2moe/eb_step_bfp.cc` is the template.
+  - Cost: logits corr drops ~1e-3 where routing is near a tie; argmax held on every check.
+    Experts 17.3 -> 8.4 ms per call; mixer GEMMs 4.9 -> 3.2 s on a 4K prompt.
+- **Mixers:** batch every projection through a prompt GEMM (T = 256 tokens). Keep the
+  sequence-dependent parts (short conv, attention) on the host if they are small; tile them.
+- **MoE experts:** group tokens by expert into fixed slots (16 tokens per slot), one stream
+  per slot count (64, 16), and double-buffer x/y so the host gather/scatter of pass n+1
+  overlaps the NPU run of pass n.
+- **A merged decode image cannot serve prompts:** its cores run mixer + experts as one
+  program per layer. Use the standalone mixer images for the prompt route (ERT hang otherwise).
+- Give each GEMM weight region its own BO (copied once at setup). The prompt route worked
+  with copies; sub-buffers of the pool were never proved safe.
+- Keep scratch buffers persistent across layers (allocation was 10 % of the prompt).
+- Timers: the CLI prints the prompt split (mixers: gemm / tile / read+transpose / conv /
+  attention / norms; experts: prep / run / read). Ablations for attribution only, output is
+  garbage: `OFLM_OPEN_PROMPT_GEMM_SKIP`, `EB_NULL_MM`, `EB_NULL_DQ`. `OFLM_OPEN_PROMPT_GEMM=0`
+  turns the route off for an A/B.
+- Verify a prompt change two ways: the 6-token slice against the reference, and the
+  greedy continuation of a long (4K) prompt against the previous build (same tokens).
+- **Power mode:** the CLI prints it. `xrt-smi configure --pmode turbo` needs root. The APU
+  shares power between CPU and NPU, so host stages vary +-20 % run to run; compare A/B runs
+  back to back.
+
+## 7. Hygiene
 
 - Generated kernel TUs (`designs/<x>/*.cc` written by gen_kernels.py) must be gitignored AND
   listed in `specs/open-engine/tests/test_generated_tus_untracked.py`.
+- Edit by exact text only after a grep shows the text is unique: two families share
+  function bodies (Qwen's `moe_block` vs `experts_batch`).
 - Never commit xclbins. Write a family skill (`open-<family>-kernels`) with the build and
   verify ladder, and add it to AGENTS.md.
