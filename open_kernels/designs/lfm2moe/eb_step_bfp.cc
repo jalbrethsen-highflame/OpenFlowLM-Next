@@ -49,6 +49,9 @@ static inline void eb_dequant(const uint8_t *__restrict nibp, const bfloat16 *__
 extern "C" {
 void eb_step_bfp(const uint8_t *__restrict band, const bfloat16 *__restrict xa, float *__restrict acc, int ky,
                  int part) {
+#ifdef MB_NULL_MM
+  return;                     // timing ablation: the streams only
+#endif
   aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
   float *__restrict c = acc + part * 64 * MB_NT;
   // W: the band's 64 rows x 64 k, once

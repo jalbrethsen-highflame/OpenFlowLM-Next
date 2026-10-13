@@ -137,7 +137,9 @@ def moe_geometry(spec: ModelSpec) -> MoeGeometry:
 
 
 # ---- the prefill route's token-batched experts (designs/lfm2moe/eb.py)
-EB_NT = 16                   # token slots per expert visit (moe_batch's NT)
+EB_NT = int(_os.environ.get("OPEN_LFM2MOE_EB_NT", 32))   # token slots per expert visit (moe_batch's NT).
+# eb streams a whole expert's weights per visit and is bound by that stream (the arithmetic
+# removed, 8.33 of 8.47 ms), so tokens per visit is the lever: 16 -> 32 halves it per token
 EB_STREAMS = (64, 16)        # slot counts, one instruction stream each over one image
 
 
