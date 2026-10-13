@@ -208,6 +208,7 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         m.router.res_off = r.value("res_off", 0ull);
         if (!m.has_moe) fail(rw, "a host router without layout.moe");
     }
+    if (lay.contains("prompt_gemm")) m.prompt_gemm = lay["prompt_gemm"];
     if (lay.contains("expert_batch")) {
         const json& b = lay["expert_batch"];
         const std::string bw = lw + ".expert_batch";

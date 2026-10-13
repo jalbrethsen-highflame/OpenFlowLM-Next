@@ -570,6 +570,20 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// out = res + sum_k w * expert(xm), per token.
     void experts_batch(int layer, const float* xm, const float* res, const int32_t* idx, const float* w, size_t n,
                        float* out);
+    /// The prompt route's batched mixers (manifest layout.prompt_gemm): per layer its kind and
+    /// the host-side weights its stages read (bf16-rounded, as the device holds them).
+    struct PromptHost {
+        std::string kind;                       ///< conv | conv_dense | attn
+        std::vector<float> attn_norm, ffn_norm, conv, qn, kn;   ///< conv tap-major [taps][hid]
+    };
+    std::vector<PromptHost> ph_;
+    bool prompt_gemm_on_ = false;
+    void prompt_setup();
+    /// y [T, N] = W(region) x [T, K] on the prompt GEMM, T = layout.prompt_gemm.t
+    void prompt_gemm_run(int layer, const std::string& region, const float* x, float* y);
+    /// The layer's mixer (and, for conv_dense, its FFN) over n tokens: res / xm rows out, or
+    /// for conv_dense x updated in place. Returns false when the layer has no batched kind.
+    bool prompt_mixers(int layer, float* x, size_t n, float* res, float* xm);
 public:
     /// LFM2-MoE's prompt route: the whole prompt through each layer before the next -- the
     /// mixers one token at a time (decode kernels, positions patched), the router on the host,
