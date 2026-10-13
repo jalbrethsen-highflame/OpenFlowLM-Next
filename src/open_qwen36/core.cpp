@@ -1269,6 +1269,8 @@ void Core::bench_kernel(const std::string& name, int reps, int layer, int warm_t
     if (!args)
         for (const auto& [slots, kn] : gb.moe_batch.kernels)
             if (kn == name) args = &gb.moe_batch.args;
+        for (const auto& [slots, kn] : w_->expert_batch.kernels)
+            if (kn == name) args = &w_->expert_batch.args;
     if (!args)
         for (int l = 0; l < nl_ && !args; ++l) {
             const AttnBlock& ab = types_[l]->gemm_block.attn_block;
@@ -3985,6 +3987,8 @@ void Core::experts_batch(int l, const float* xm, const float* res, const int32_t
 
 namespace {
 float bf16_round(float v) { return bf16_to_f32(f32_to_bf16(v)); }
+// the prompt route's stage clock (ms), printed and cleared by step_prompt_lfm2
+struct PromptClock { double tile = 0, gemm = 0, read = 0, conv = 0, attn = 0, norm = 0, ffn = 0; } g_pc;
 }  // namespace
 
 void Core::prompt_setup() {
@@ -4051,13 +4055,17 @@ void Core::prompt_gemm_run(int l, const std::string& region, const float* x, flo
     const size_t n = g[1].get<size_t>(), k = g[2].get<size_t>();
     const std::string kn = P["kernels"][std::to_string(n) + "x" + std::to_string(k)].get<std::string>();
     const std::string xn = P["x"][std::to_string(k)].get<std::string>(), yn = P["y"][std::to_string(n)].get<std::string>();
+    auto t0 = std::chrono::steady_clock::now();
     xrt::bo& xb = buffer(xn, 0);
     host::tile_x(x, T, k, xb.map<uint16_t*>());
     xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, k * T * 2, 0);
-    run(kerns_.at(kn), {"pg_" + region, xn, yn}, l);
+    g_pc.tile += ms_since(t0);
+    g_pc.gemm += run(kerns_.at(kn), {"pg_" + region, xn, yn}, l);
+    auto t1 = std::chrono::steady_clock::now();
     xrt::bo& yb = buffer(yn, 0);
     read_back(yb, n * T * 4, 0);
     host::transpose(yb.map<float*>(), n, T, y);
+    g_pc.read += ms_since(t1);
 }
 
 bool Core::prompt_mixers(int l, float* x, size_t N, float* res, float* xm) {
@@ -4091,17 +4099,22 @@ bool Core::prompt_mixers(int l, float* x, size_t N, float* res, float* xm) {
             std::vector<float> yin(T * 3 * hid), yc(T * hid, 0.f);
             prompt_gemm_run(l, "conv_in", xn.data(), yin.data());
             const float *w0 = h.conv.data(), *w1 = w0 + hid, *w2 = w1 + hid;
-            for (size_t t = 0; t < tr; ++t) {
-                const float *B = yin.data() + t * 3 * hid, *C = B + hid, *u = C + hid;
-                float* yo = yc.data() + t * hid;
-                for (size_t c = 0; c < hid; ++c) {
-                    const float bx = B[c] * u[c];
-                    const float cv = s0[c] * w0[c] + s1[c] * w1[c] + bx * w2[c];
-                    yo[c] = C[c] * cv;
-                    s0[c] = s1[c];
-                    s1[c] = bx;
+            auto tc = std::chrono::steady_clock::now();
+            // every channel is its own recurrence over the tokens: parallel over channel blocks
+#pragma omp parallel for
+            for (long long cb = 0; cb < static_cast<long long>(hid / 64); ++cb)
+                for (size_t t = 0; t < tr; ++t) {
+                    const float *B = yin.data() + t * 3 * hid, *C = B + hid, *u = C + hid;
+                    float* yo = yc.data() + t * hid;
+                    for (size_t c = static_cast<size_t>(cb) * 64; c < static_cast<size_t>(cb + 1) * 64; ++c) {
+                        const float bx = B[c] * u[c];
+                        const float cv = s0[c] * w0[c] + s1[c] * w1[c] + bx * w2[c];
+                        yo[c] = C[c] * cv;
+                        s0[c] = s1[c];
+                        s1[c] = bx;
+                    }
                 }
-            }
+            g_pc.conv += ms_since(tc);
             prompt_gemm_run(l, "conv_out", yc.data(), out.data());
         } else {
             const size_t nh = P["nh"].get<size_t>(), kvh = P["kvh"].get<size_t>(), hd = P["hd"].get<size_t>();
@@ -4123,19 +4136,27 @@ bool Core::prompt_mixers(int l, float* x, size_t N, float* res, float* xm) {
             g.rot = P["rot"].get<size_t>();
             g.pos0 = static_cast<size_t>(pos_) + r0;
             g.eps = eps;
+            auto ta = std::chrono::steady_clock::now();
             host::attention_block(g, q.data(), k.data(), v.data(), nullptr, h.qn.data(), h.kn.data(),
                                   w_->rope_inv_freq.data(), st.map<uint16_t*>(), kv_elems, og.data());
+            g_pc.attn += ms_since(ta);
             prompt_gemm_run(l, "o", og.data(), out.data());
         }
+        auto tn = std::chrono::steady_clock::now();
         std::fill(rb.begin(), rb.end(), 0.f);
-        for (size_t i = 0; i < tr * hid; ++i) rb[i] = xb[i] + out[i];
+#pragma omp parallel for
+        for (long long i = 0; i < static_cast<long long>(tr * hid); ++i) rb[i] = xb[i] + out[i];
         host::rmsnorm_rows(rb.data(), T, hid, h.ffn_norm.data(), eps, mb.data());
-        for (float& f : mb) f = bf16_round(f);       // the device hands the router / experts bf16 xm
+#pragma omp parallel for
+        for (long long i = 0; i < static_cast<long long>(T * hid); ++i)
+            mb[i] = bf16_round(mb[i]);                // the device hands the router / experts bf16 xm
+        g_pc.norm += ms_since(tn);
         if (dense) {
             std::vector<float> gg(T * ff), uu(T * ff), dn(T * hid);
             prompt_gemm_run(l, "ffn_gate", mb.data(), gg.data());
             prompt_gemm_run(l, "ffn_up", mb.data(), uu.data());
-            for (size_t i = 0; i < T * ff; ++i) gg[i] = gg[i] / (1.f + std::exp(-gg[i])) * uu[i];
+#pragma omp parallel for
+            for (long long i = 0; i < static_cast<long long>(T * ff); ++i) gg[i] = gg[i] / (1.f + std::exp(-gg[i])) * uu[i];
             prompt_gemm_run(l, "ffn_down", gg.data(), dn.data());
             for (size_t i = 0; i < tr * hid; ++i) x[r0 * hid + i] = rb[i] + dn[i];
         } else {
@@ -4252,10 +4273,15 @@ void Core::step_prompt_lfm2(const std::vector<int>& ids, bool want_logits) {
     else if (want_logits)
         tail_logits(x.data() + (N - 1) * hid);
     timing_.total_ms = ms_since(t0);
-    if (cfg_.verbose)
+    if (cfg_.verbose) {
         std::fprintf(stderr, "open_qwen36: prompt %zu tokens: %.0f ms (mixers %.0f, router %.0f, experts %.0f; "
                      "expert prep %.0f run %.0f read %.0f)\n", N, timing_.total_ms, mix_ms, route_ms, ex_ms,
                      timing_.moe_prep_ms, timing_.moe_run_ms, timing_.moe_read_ms);
+        if (prompt_gemm_on_)
+            std::fprintf(stderr, "open_qwen36:   mixers: gemm %.0f, tile %.0f, read+transpose %.0f, conv %.0f, "
+                         "attention %.0f, norms %.0f ms\n", g_pc.gemm, g_pc.tile, g_pc.read, g_pc.conv, g_pc.attn, g_pc.norm);
+    }
+    g_pc = PromptClock{};
 }
 
 void Core::seek(int pos) {

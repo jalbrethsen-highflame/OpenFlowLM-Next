@@ -322,6 +322,86 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
     }
 }
 
+namespace {
+// The tiled attention behind attention_block (OFLM: LFM2-MoE's prompt route spends most of
+// its host time here). Loops are laid out so the innermost one runs over contiguous floats
+// with no reduction, which vectorises without -ffast-math: S over the chunk's key rows (K
+// transposed into the chunk scratch), acc over the head dims. Two clones picked at load by the
+// CPU: x86-64-v4 (AVX-512; Zen 5 Strix parts) and x86-64-v3 (AVX2 + FMA; every Ryzen AI part).
+constexpr size_t kQT = 16;     // query tokens per work item
+constexpr size_t kKC = 64;     // key rows per chunk
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
+void attention_tile(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
+                    const uint16_t* kv, size_t kv_row_elems, float* og, size_t g, size_t t0) {
+    const size_t grp = nh / kvh, qw = nh * hd, kvw = kvh * hd;
+    const size_t nt = std::min(kQT, R - t0), M = grp * nt;
+    const size_t last = pos0 + t0 + nt - 1;               // the highest key row any query here sees
+    std::vector<float> q(M * hd), kt(hd * kKC), vc(kKC * hd), s(M * kKC), acc(M * hd, 0.f), m(M, -1e30f), l(M, 0.f);
+    std::vector<size_t> qpos(M);
+    for (size_t i = 0; i < M; ++i) {                      // row i = (head gi, token ti)
+        const size_t gi = i / nt, ti = i % nt, h = g * grp + gi;
+        qpos[i] = pos0 + t0 + ti;
+        const float* src = Q + (t0 + ti) * qw + h * hd;
+        for (size_t d = 0; d < hd; ++d) q[i * hd + d] = src[d] * scale;
+    }
+    for (size_t c0 = 0; c0 <= last; c0 += kKC) {
+        const size_t kc = std::min(kKC, last + 1 - c0);
+        for (size_t j = 0; j < kc; ++j) {
+            const uint16_t* row = kv + (c0 + j) * kv_row_elems + g * hd;
+            for (size_t d = 0; d < hd; ++d) {
+                kt[d * kKC + j] = bf16_to_f32(row[d]);
+                vc[j * hd + d] = bf16_to_f32(row[kvw + d]);
+            }
+        }
+        for (size_t i = 0; i < M; ++i) {
+            float* si = s.data() + i * kKC;
+            for (size_t j = 0; j < kKC; ++j) si[j] = 0.f;
+            const float* qi = q.data() + i * hd;
+            for (size_t d = 0; d < hd; ++d) {
+                const float a = qi[d];
+                const float* kd = kt.data() + d * kKC;
+                for (size_t j = 0; j < kKC; ++j) si[j] += a * kd[j];
+            }
+            // causal mask, then the online softmax update for this row
+            const size_t valid = qpos[i] < c0 ? 0 : std::min(kc, qpos[i] - c0 + 1);
+            if (!valid) continue;
+            float mx = m[i];
+            for (size_t j = 0; j < valid; ++j) mx = std::max(mx, si[j]);
+            const float corr = std::exp(m[i] - mx);
+            float sum = 0.f;
+            for (size_t j = 0; j < valid; ++j) sum += (si[j] = std::exp(si[j] - mx));
+            for (size_t j = valid; j < kKC; ++j) si[j] = 0.f;
+            l[i] = l[i] * corr + sum;
+            m[i] = mx;
+            float* ai = acc.data() + i * hd;
+            for (size_t d = 0; d < hd; ++d) ai[d] *= corr;
+            for (size_t j = 0; j < valid; ++j) {
+                const float p = si[j];
+                const float* vj = vc.data() + j * hd;
+                for (size_t d = 0; d < hd; ++d) ai[d] += p * vj[d];
+            }
+        }
+    }
+    for (size_t i = 0; i < M; ++i) {
+        const size_t gi = i / nt, ti = i % nt, h = g * grp + gi;
+        float* out = og + (t0 + ti) * qw + h * hd;
+        const float inv = 1.f / l[i];
+        for (size_t d = 0; d < hd; ++d) out[d] = acc[i * hd + d] * inv;
+    }
+}
+
+void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
+                     const uint16_t* kv, size_t kv_row_elems, float* og) {
+    const size_t chunks = (R + kQT - 1) / kQT;
+    const long long items = static_cast<long long>(kvh * chunks);
+    // the later chunks see longer windows: hand them out first
+#pragma omp parallel for schedule(dynamic, 1)
+    for (long long it = items - 1; it >= 0; --it)
+        attention_tile(hd, nh, kvh, R, pos0, scale, Q, kv, kv_row_elems, og,
+                       static_cast<size_t>(it) % kvh, (static_cast<size_t>(it) / kvh) * kQT);
+}
+}  // namespace
+
 void attention_block(const AttnGeom& g, const float* q, const float* k, const float* v, const float* gate,
                      const float* qn, const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
                      float* og) {
@@ -332,14 +412,11 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
     const float scale = 1.0f / std::sqrt(static_cast<float>(g.hd));
     std::fill(og, og + g.T * qw, 0.f);
 
-    // ---- phase 1: the cache window as floats (old rows from the cache, the block's rows
-    // normed, roped, written to the cache in bf16), the block's queries normed and roped
-    std::vector<float> K(rows * kvw), V(rows * kvw), Q(R * qw);
-    for (size_t r = 0; r < g.pos0; ++r)
-        for (size_t j = 0; j < kvw; ++j) {
-            K[r * kvw + j] = bf16_to_f32(kv[r * kv_row_elems + j]);
-            V[r * kvw + j] = bf16_to_f32(kv[r * kv_row_elems + kvw + j]);
-        }
+    // ---- phase 1: the block's queries normed and roped; its keys normed, roped and written
+    // to the cache in bf16 with the values. The window is read straight from the bf16 cache in
+    // phase 2, chunk by chunk -- converting the whole cache to floats per block was most of the
+    // cost at a 4K window.
+    std::vector<float> Q(R * qw);
     for (size_t t = 0; t < R; ++t) {
         const size_t p = g.pos0 + t;
         for (size_t h = 0; h < g.nh; ++h) {
@@ -353,50 +430,18 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
             rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(p));
         }
         for (size_t j = 0; j < kvw; ++j) {
-            const uint16_t kb = f32_to_bf16(kh[j]), vb = f32_to_bf16(v[t * kvw + j]);
-            kv[p * kv_row_elems + j] = kb;
-            kv[p * kv_row_elems + kvw + j] = vb;
-            K[p * kvw + j] = bf16_to_f32(kb);
-            V[p * kvw + j] = bf16_to_f32(vb);
+            kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);
+            kv[p * kv_row_elems + kvw + j] = f32_to_bf16(v[t * kvw + j]);
         }
     }
-
-    // ---- phase 2: every (head, token) pair attends over the causal window
-    const long long pairs = static_cast<long long>(g.nh * R);
-#pragma omp parallel for schedule(dynamic, 8)
-    for (long long pr = 0; pr < pairs; ++pr) {
-        const size_t h = static_cast<size_t>(pr) / R, t = static_cast<size_t>(pr) % R, p = g.pos0 + t;
-        const float* qv = Q.data() + t * qw + h * g.hd;
-        const size_t kh_off = (h / grp) * g.hd;
-        std::vector<float> s(p + 1);
-        float mx = -1e30f;
-        for (size_t r = 0; r <= p; ++r) {
-            const float* kr = K.data() + r * kvw + kh_off;
-            float acc = 0;
-            for (size_t j = 0; j < g.hd; ++j) acc += kr[j] * qv[j];
-            s[r] = acc * scale;
-            mx = std::max(mx, s[r]);
-        }
-        double denom = 0;
-        for (size_t r = 0; r <= p; ++r) {
-            s[r] = std::exp(s[r] - mx);
-            denom += s[r];
-        }
-        const float inv = static_cast<float>(1.0 / denom);
-        std::vector<float> o(g.hd, 0.f);
-        for (size_t r = 0; r <= p; ++r) {
-            const float* vr = V.data() + r * kvw + kh_off;
-            const float a = s[r] * inv;
-            for (size_t j = 0; j < g.hd; ++j) o[j] += a * vr[j];
-        }
-        float* out = og + t * qw + h * g.hd;
-        if (!gate) {                                // no output gate (LFM2): the attention itself
-            for (size_t j = 0; j < g.hd; ++j) out[j] = o[j];
-            continue;
-        }
-        const float* gt = gate + t * qw + h * g.hd;
-        for (size_t j = 0; j < g.hd; ++j) out[j] = o[j] * sigmoid(gt[j]);
-    }
+    (void)rows;
+    // ---- phase 2: tiled causal attention, one work item per (kv head, 16-query chunk): its
+    // grp query heads x 16 tokens attend together, so every K / V row is read once for all of
+    // them (GQA), with an online softmax over 64-row key chunks.
+    attention_tiles(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og);
+    if (gate)                                       // Qwen3.6's output gate; LFM2 has none
+        for (size_t i = 0; i < R * qw; ++i) og[i] *= sigmoid(gate[i]);
+    (void)grp;
 }
 
 void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,

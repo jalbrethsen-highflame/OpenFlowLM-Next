@@ -100,6 +100,9 @@ def eb(pool: In, x: In, h: Out, y: Out, *, slots: CompileTime[int], srchash: Com
 
     inc = include_dirs() + [str(MB)]
     flags = [f"-DMB_NT={NT}"]
+    # timing-only ablations (output garbage), moe_batch's: EB_NULL_MM=1 keeps the streams and drops
+    # the core arithmetic, EB_NULL_DQ=1 drops the q4_1 scales
+    flags += [f"-D{mb}" for ev, mb in (("EB_NULL_MM", "MB_NULL_MM"), ("EB_NULL_DQ", "MB_NULL_DQ")) if os.environ.get(ev) == "1"]
 
     def ef(sym, args, d=MB):
         return ExternalFunction(sym, source_file=str(d / f"{sym}.cc"), arg_types=args, include_dirs=inc,
@@ -209,5 +212,6 @@ DESIGN = eb
 _src = b"".join([(HERE / "eb.py").read_bytes(), (HERE / "eb_zero_ug2.cc").read_bytes(), (HERE / "eb_silu2.cc").read_bytes()]
                 + sorted(f.read_bytes() for f in MB.glob("*.cc"))
                 + [(MB / "moe_batch.h").read_bytes(), (HERE.parent.parent / "include" / "vecmath.h").read_bytes(),
-                   f"NT={NT}".encode(), SPEC.spec_hash().encode()])
+                   f"NT={NT}".encode(), SPEC.spec_hash().encode()]
+                + [f"{v}=1".encode() for v in ("EB_NULL_MM", "EB_NULL_DQ") if os.environ.get(v) == "1"])
 SPECIALIZE = {"slots": SLOTS, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}
