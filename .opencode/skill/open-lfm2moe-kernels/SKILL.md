@@ -20,6 +20,8 @@ Read `npu-model-porting` first for the general rules. Source: `open_kernels/reci
 - Experts: std_perm 64-row bands, `[up | gate]` per expert from POOL_EXP, down from
   POOL_DOWN_EXP. 24B: 8 cores x (3 up/gate bands, 4 down bands).
 - Head: q8 from the Q6_K tied embedding (`lmhead_q8_gguf`); final norm is `token_embd_norm`.
+- Pool: q4nx chunk layout (bf16 scales, 5120 B), packed from the GGUF's Q4_0 at load. Bit-identical
+  to the f32-scale layout (`OPEN_LFM2MOE_QUANT=q4_1_f32` at export, kept for A/B) and 1/6 smaller.
 - When the expert core count differs from the mixers' (8B: 4 vs 8) the recipe falls back to
   three images (`cxm`, `dxm`, `ex`). `OPEN_LFM2MOE_ONE_CTX=0` forces that for an A/B.
 
@@ -39,7 +41,7 @@ export PATH=/opt/xilinx/xrt/bin:$PATH
 OPEN_KERNELS_UNVALIDATED=1 ironvenv/bin/python open_kernels/export_qwen36_kernels.py \
     --model-dir ~/models/LFM2.5-24B-A2B-GGUF -j 3          # -> src/xclbins/LFM2.5-24B-A2B-GGUF/open_kernels
 ```
-Sets: `short_conv_f32` (dense layers), `lm_cm lm_am lm_ex` (one image), `ln`, `lm_head_q8_f32`;
+Sets: `cx_dense` (dense layers), `lm_cm lm_am lm_ex` (one image), `ln`, `lm_head_q8`;
 ~4 min. `UNVALIDATED` is for gemv K = 11776 (the dense FFN) and the expert points. The three
 `lm_*` xclbins must be equivalent apart from stamps (`xclbin_equivalent`); the export's
 manifest points the context at `lm_cm/final.xclbin`.
@@ -59,9 +61,10 @@ manifest points the context at `lm_cm/final.xclbin`.
 
 | | decode | resident |
 |---|---|---|
-| 24B, one context | 49 ms/token (20.3 tok/s) | 19 GB |
+| 24B, one context, bf16 scales | 44 ms/token (22.8 tok/s) | ~16 GB |
+| 24B, one context, f32 scales | 49 ms/token (20.3 tok/s) | 19 GB |
 | 24B, three images | 106 ms/token | 19 GB |
-| 8B, three images | 61 ms/token (16.5 tok/s) | 7.3 GB |
+| 8B, three images, bf16 scales | 57 ms/token (17.6 tok/s) | ~6.5 GB |
 
 24B step (one context): ex 38 x 0.64 ms, mixers ~0.95 ms (includes the queued ex wait),
 cx 2 x 2.1, head 5.9, router 0.8.
@@ -73,5 +76,3 @@ cx 2 x 2.1, head 5.9, router 0.8.
   `model_list` entry with family `lfm2` is the likely path.
 - Prefill runs token by token (no gemm_block route for f32-scale pools).
 - The 8B has no merged image (expert core count 4 vs mixer 8).
-- Remaining step cost after the merge: the experts stream 28 MB/layer at f32 scales
-  (~6 bits/weight); a q4nx (bf16-scale) container would cut that by 1/6.

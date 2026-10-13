@@ -69,7 +69,7 @@ N_CORES, HID, NE = M.N_CORES, M.HID, M.NE
 XN_ELEMS = HID * 2 // ELEM
 assert HID * 2 % ELEM == 0, "ex.py: xm is a whole number of 4 KB elements"
 OS = ["-Os"]
-GEMV_DEF = ["-DGEMV_Q4_SCALES_F32=1", "-DGEMV_Q4_PREFIX=gemv_q4s32"]     # GGUF-direct pools only
+GEMV_DEF = ["-DGEMV_Q4_SCALES_F32=1", "-DGEMV_Q4_PREFIX=gemv_q4s32"] if QR.F32 else []   # the pool's scale layout
 
 
 def bt(total: int, off: int, n: int) -> TensorAccessPattern:

@@ -115,7 +115,7 @@ if ACORES != 4:
     sys.exit(f"lm.py: the shim budget is laid out for 4 attention cores, the spec has {ACORES}")
 
 OS = ["-Os"]
-GEMV_DEF = ["-DGEMV_Q4_SCALES_F32=1", "-DGEMV_Q4_PREFIX=gemv_q4s32"]
+GEMV_DEF = ["-DGEMV_Q4_SCALES_F32=1", "-DGEMV_Q4_PREFIX=gemv_q4s32"] if QR.F32 else []   # the pool's scale layout
 LN_FLAGS = [f"-DLN_N={HID}", f"-DLN_EPS={G.EPS:g}f"]
 SC_FLAGS = [f"-DSC_TAPS={TAPS}", f"-DSC_W={SCW}", "-DSC_PASSTHROUGH=0"]
 ATTN_FLAGS = [f"-DATTN_NH={G.NH}", f"-DATTN_KVH={G.KVH}", f"-DATTN_HD={G.HD}", f"-DATTN_ROT={G.ROT}", "-DATTN_GATE=0",

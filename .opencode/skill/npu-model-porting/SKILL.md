@@ -104,8 +104,11 @@ real time once. Read the whole thing before writing a design.
 - Small F32 weights (conv taps) need conversion to bf16; `transpose` does it for GGUF now.
 - Per-layer KV arrays (`head_count_kv` on hybrids) break numeric metadata reads; ship a
   `config.json` in the model dir (it wins over GGUF metadata).
-- f32-scale pool chunks are 6144 B per 8192 values (~6 bits/weight): a GGUF model takes
-  ~1.3x its file size on device.
+- Prefer the bf16-scale pool layout (5120 B chunks) even for a GGUF: the GEMV narrows f32
+  scale planes to bf16 (RNE) on load, so packing them pre-narrowed with the same RNE is
+  bit-identical, 1/6 smaller, ~10 % faster decode, and the only layout the prefill GEMMs
+  (`gemm_q4_prefill`, `moe_batch`) read. `std_perm_gguf` / `lmhead_q8_gguf` write either
+  layout from the pool's chunk size.
 - Model dir layout: `model.gguf` (symlink is fine) + `config.json` + `tokenizer*.json`.
   `chat.py` needs a prompt branch per chat format (LFM2: `<|startoftext|>` + ChatML + `<think>`).
 
