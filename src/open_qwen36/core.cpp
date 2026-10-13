@@ -4131,6 +4131,33 @@ void Core::prompt_gemm_rows(int l, const std::string& region, const float* x, si
         }
         g_pc.read += ms_since(t1);
     };
+    // OFLM_OPEN_PROMPT_GEMM_PROFILE=1: every block alone (tile, run, drain in turn), the run
+    // timed per shape and printed at exit -- the NPU's own time, for attribution only (the host
+    // stages run slower in this mode than overlapped, so read only the run times)
+    static const bool prof = [] { const char* e = std::getenv("OFLM_OPEN_PROMPT_GEMM_PROFILE"); return e && *e == '1'; }();
+    if (prof) {
+        static std::map<std::string, std::pair<double, size_t>> per;
+        static const bool reg = [] {
+            std::atexit([] {
+                for (const auto& [k, v] : per)
+                    std::fprintf(stderr, "open_qwen36: gemm %s: %zu runs, %.3f ms each, %.0f ms total\n", k.c_str(), v.second,
+                                 v.first / static_cast<double>(v.second), v.first);
+            });
+            return true;
+        }();
+        (void)reg;
+        auto& acc = per[std::to_string(n) + "x" + std::to_string(k)];
+        for (size_t b = 0; b < nb; ++b) {
+            tile(b, 0);
+            auto tg = std::chrono::steady_clock::now();
+            Inflight f = start_run(kn, {"pg_" + region, xs[0], ys[0]}, l);
+            wait_run(f);
+            acc.first += ms_since(tg);
+            ++acc.second;
+            drain(b, 0);
+        }
+        return;
+    }
     tile(0, 0);
     for (size_t b = 0; b < nb; ++b) {
         const int buf = static_cast<int>(b & 1);
