@@ -489,9 +489,11 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
 def _with_eb(spec: ModelSpec, b: dict) -> dict:
     if eb_ok(spec):
         for n, k in prompt_gemm(spec)["_shapes"]:
+            # GQP_BFP: mm.cc on the bfp16 MAC array (the bf16 mmul runs on the vector unit)
             b[f"gemm_n{n}_k{k}"] = {"design": "gemm_q4_prefill/gemm_q4_prefill.py",
-                                    "build_dir": f"gemm_q4_prefill/build_n{n}_k{k}_t{PROMPT_T}",
-                                    "env": {"GQP_N": str(n), "GQP_K": str(k), "GQP_T": str(PROMPT_T)}}
+                                    "build_dir": f"gemm_q4_prefill/build_n{n}_k{k}_t{PROMPT_T}_bfp",
+                                    "env": {"GQP_N": str(n), "GQP_K": str(k), "GQP_T": str(PROMPT_T),
+                                            "GQP_BFP": "1"}}
         for s in EB_STREAMS:
             # EB_BFP: the expert products on the bfp16 MAC array (eb_step_bfp.cc), 2x the bf16 path
             b[f"eb{s}"] = {"design": "lfm2moe/eb.py",

@@ -70,6 +70,7 @@ HERE = Path(__file__).parent
 # engine; this file only describes the layout it expects
 N_AIE_ROWS = 4
 N_AIE_COLS = 8
+BFP = os.environ.get("GQP_BFP") == "1"   # see gemm_q4_prefill(): mm.cc on the bfp16 MAC array
 M_TILE = 64        # weight rows per band / per matmul m-tile (= mac_dims-compatible, matches q4 band's 64 rows)
 K_TILE = 64        # matmul k-tile (mac_dims s=8 divides it)
 BAND_K = 256       # q4 pool band k-width (one q4_1_pack.py "chunk pair")
@@ -193,13 +194,16 @@ def gemm_q4_prefill(
     dtype_in = str_to_dtype("bf16")
     dtype_out = str_to_dtype("f32")
 
+    # GQP_BFP=1: mm.cc emulates the bf16 mmul on the bfp16 MAC array (8-bit operands are the
+    # only fast ones on XDNA2; .opencode/skill/dit-gemm), mac_dims (8,8,8), and the dequant writes
+    # 8-row A blocks to match. Opt-in per family: LFM2-MoE's prompt route; the default is unchanged.
     matmul_kernel = kernels.mm(
         dim_m=m, dim_k=k_tile, dim_n=n, input_dtype=dtype_in, output_dtype=dtype_out,
         b_col_maj=False, c_col_maj=False, use_chess=False,
-        emulate_bf16_mmul_with_bfp16=False, vectorized=True)
+        emulate_bf16_mmul_with_bfp16=BFP, vectorized=True)
     zero_kernel = matmul_kernel.zero
     r, s, mt = matmul_kernel.mac_dims
-    assert (r, s, mt) == (4, 8, 8), f"unexpected aie2p bf16 mac_dims {(r, s, mt)}"
+    assert (r, s, mt) == ((8, 8, 8) if BFP else (4, 8, 8)), f"unexpected aie2p bf16 mac_dims {(r, s, mt)}"
     assert m % r == 0 and k_tile % s == 0 and n % mt == 0
 
     nib_ty = np.ndarray[(m * k_tile,), np.dtype[np.uint8]]
@@ -210,6 +214,10 @@ def gemm_q4_prefill(
     # scalar integer gather (gemm_q4_dequant.h's GQD_SCALAR_GATHER branch),
     # for a same-toolchain before/after A-B against the vectorized default.
     _dequant_flags = ["-DGQD_SCALAR_GATHER"] if os.environ.get("GQP_SCALAR_GATHER") == "1" else []
+    if BFP:
+        if _dequant_flags or os.environ.get("GQD_TWO_PASS"):
+            raise SystemExit("GQP_BFP=1 needs the fused dequant (8-row blocks are written there only)")
+        _dequant_flags.append("-DGQD_R8")
     # Timing-only ablation (0167 stage 16): skip Pass 1 and/or Pass 2's
     # compute to attribute cost. Output is garbage with either set -- never
     # combine with a correctness (compare.py) run.
@@ -433,6 +441,9 @@ SPECIALIZE = {
     "n_weight": N_WEIGHT, "k": K, "t": T, "tile_n": TILE_N,
     "b_reuse": recommend_b_reuse(K, T, TILE_N), "fmt": FMT,
 }
+if BFP:
+    # only when set, so a bf16 build specializes (and caches) exactly as before
+    SPECIALIZE["srchash"] = 0xBF916
 
 if __name__ == "__main__":
     b = mem_tile_budget_bytes(K, T, TILE_N)
