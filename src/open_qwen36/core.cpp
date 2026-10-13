@@ -6556,7 +6556,7 @@ void Core::experts_batch(int l, const float* xm, const float* res, const int32_t
 namespace {
 float bf16_round(float v) { return bf16_to_f32(f32_to_bf16(v)); }
 // the prompt route's stage clock (ms), printed and cleared by step_prompt_lfm2
-struct PromptClock { double tile = 0, gemm = 0, read = 0, conv = 0, attn = 0, norm = 0, ffn = 0; } g_pc;
+struct PromptClock { double tile = 0, gemm = 0, read = 0, conv = 0, attn = 0, norm = 0, ffn = 0, wait = 0; } g_pc;
 }  // namespace
 
 void Core::prompt_setup() {
@@ -6677,7 +6677,9 @@ void Core::prompt_gemm_rows(int l, const std::string& region, const float* x, si
         Inflight f = start_run(kn, {"pg_" + region, xs[buf], ys[buf]}, l);
         if (b + 1 < nb) tile(b + 1, buf ^ 1);
         if (b > 0) drain(b - 1, buf ^ 1);
+        auto tw = std::chrono::steady_clock::now();
         wait_run(f);
+        g_pc.wait += ms_since(tw);
         g_pc.gemm += ms_since(tg);
     }
     drain(nb - 1, static_cast<int>((nb - 1) & 1));
@@ -6897,7 +6899,8 @@ void Core::step_prompt_lfm2(const std::vector<int>& ids, bool want_logits) {
                      timing_.moe_prep_ms, timing_.moe_run_ms, timing_.moe_read_ms);
         if (prompt_gemm_on_)
             std::fprintf(stderr, "open_qwen36:   mixers: gemm %.0f, tile %.0f, read+transpose %.0f, conv %.0f, "
-                         "attention %.0f, norms %.0f ms\n", g_pc.gemm, g_pc.tile, g_pc.read, g_pc.conv, g_pc.attn, g_pc.norm);
+                         "attention %.0f, norms %.0f ms (gemm: NPU wait after host work %.0f)\n", g_pc.gemm, g_pc.tile, g_pc.read,
+                         g_pc.conv, g_pc.attn, g_pc.norm, g_pc.wait);
     }
     g_pc = PromptClock{};
 }
