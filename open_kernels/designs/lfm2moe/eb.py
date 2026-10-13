@@ -15,9 +15,10 @@ of a quarter of the hidden (512): one 128-row band pair per core for up / gate, 
 WHOLE expert hidden held in the B fifo for the down. At 1536 that is three pairs per core,
 and h is 48 KB at NT = 16 -- not in a 64 KB core beside everything else. So:
 
-    up / gate   for each of the core's HB2 band pairs (pair p = 4 pg + r of the column's row r):
-                  both projections, both bands, x streamed once per (pg, proj, band);
-                  silu -> 128 h rows (bf16) -> C
+    up / gate   for each of the core's HB2 band pairs (pair p = 4 pg + r of the column's row r),
+                  band by band: up and gate of that band (x streamed once per (pg, band, proj)),
+                  silu -> its 64 h rows (bf16) into the pair's C element, which leaves when
+                  both bands are in. Only [u 64 | g 64] rows are live, so NT = 32 fits L1.
     down        for each of the core's 64-row output bands (band 4 rbg + r):
                   h streamed again, k-tile by k-tile, against the band's 6 k-groups -> C
 
@@ -78,7 +79,7 @@ X_BYTES, H_BYTES, Y_BYTES = E["x_bytes"](SLOTS), E["h_bytes"](SLOTS), E["y_bytes
 BFP = os.environ.get("EB_BFP") == "1"
 B_DEPTH = 2 if BFP else 4      # the bfp step's 5.8 KB of L1 scratch comes out of the x fifo
 C_DEPTH = 1
-L1 = (64 + 8 * NT // 8) * 72 * BFP + 0x1000 + 2 * BAND + (256 * NT * 4) + C_DEPTH * (64 * NT * 4) + (B_DEPTH + 1) * (K_TILE * NT * 2)
+L1 = (64 + 8 * NT // 8) * 72 * BFP + 0x1000 + 2 * BAND + (128 * NT * 4) + C_DEPTH * (64 * NT * 4) + B_DEPTH * (K_TILE * NT * 2)
 
 assert FF % (128 * N_ROWS) == 0, f"eb.py: the expert width {FF} is not whole band pairs over {N_ROWS} rows"
 assert HID % (64 * N_ROWS) == 0
@@ -93,7 +94,7 @@ def eb(pool: In, x: In, h: Out, y: Out, *, slots: CompileTime[int], srchash: Com
     b_ty = np.ndarray[(K_TILE * NT,), np.dtype[bfloat16]]
     c_ty = np.ndarray[(64 * NT,), np.dtype[np.float32]]
     c4_ty = np.ndarray[(N_ROWS * 64 * NT,), np.dtype[np.float32]]
-    ug_ty = np.ndarray[(256 * NT,), np.dtype[np.float32]]      # [u 128 rows | g 128 rows]
+    ug_ty = np.ndarray[(128 * NT,), np.dtype[np.float32]]      # [u 64 rows | g 64 rows] of one band
     pool_ty = np.ndarray[(L.POOL_BYTES,), np.dtype[np.uint8]]
     x_ty = np.ndarray[(X_BYTES,), np.dtype[np.uint8]]
     h_ty = np.ndarray[(H_BYTES,), np.dtype[np.uint8]]
@@ -117,7 +118,7 @@ def eb(pool: In, x: In, h: Out, y: Out, *, slots: CompileTime[int], srchash: Com
             else ef("eb_step", [band_ty, b_ty, ug_ty, np.int32, np.int32], HERE))
     zero_ug = ef("eb_zero_ug2", [ug_ty], HERE)
     zero1 = ef("eb_zero1", [ug_ty], HERE)
-    silu = ef("eb_silu2", [ug_ty, c_ty], HERE)
+    silu = ef("eb_silu2", [ug_ty, c_ty, np.int32], HERE)
     outk = ef("eb_out", [ug_ty, c_ty], HERE)
 
     A_l3l2 = [ObjectFifo(a4_ty, name=f"A{c}", depth=2) for c in range(N_COLS)]
@@ -136,17 +137,18 @@ def eb(pool: In, x: In, h: Out, y: Out, *, slots: CompileTime[int], srchash: Com
     # each call is emitted once per copy, and the core program overflowed its 16 KB by 512 B.
     def core_fn(in_a, in_b, out_c, k_step, k_zero_ug, k_zero1, k_silu, k_out, ug):
         for _ in range_(HB2):                        # this core's band pairs
-            k_zero_ug(ug)
-            for pb in range_(4):                     # (up, band 0) (up, 1) (gate, 0) (gate, 1)
-                for _ in range_(NKG_UP):
-                    band = in_a.acquire(1)
-                    for ky in range_(4):
-                        xe = in_b.acquire(1)
-                        k_step(band, xe, ug, ky, pb)
-                        in_b.release(1)
-                    in_a.release(1)
-            he = out_c.acquire(1)
-            k_silu(ug, he)                           # 128 h rows, bf16, natural order
+            he = out_c.acquire(1)                    # the pair's 128 h rows, bf16, natural order
+            for half in range_(2):                   # band 0, then band 1 of the pair
+                k_zero_ug(ug)
+                for proj in range_(2):               # up, gate
+                    for _ in range_(NKG_UP):
+                        band = in_a.acquire(1)
+                        for ky in range_(4):
+                            xe = in_b.acquire(1)
+                            k_step(band, xe, ug, ky, proj)
+                            in_b.release(1)
+                        in_a.release(1)
+                k_silu(ug, he, half)                 # this band's 64 h rows
             out_c.release(1)
         for _ in range_(NRB_DN):                     # this core's output bands
             k_zero1(ug)
@@ -193,8 +195,8 @@ def eb(pool: In, x: In, h: Out, y: Out, *, slots: CompileTime[int], srchash: Com
             for c in range(N_COLS):
                 py.drain(C_hs[c], a_h, lin(H_BYTES, slot[c] * HS, HS))
             for pg in range(HB2):
-                for proj in range(2):
-                    for half in range(2):
+                for half in range(2):
+                    for proj in range(2):
                         for c in range(N_COLS):
                             pw.fill(A_hs[c], a_pool, up_tap(slot[c], proj, pg, half))
                             px.fill(B_hs[c], a_x, lin(X_BYTES, slot[c] * XS, XS))
