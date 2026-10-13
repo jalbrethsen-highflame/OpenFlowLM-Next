@@ -58,7 +58,13 @@
 
 static constexpr unsigned GQD_M = 64;    // rows per band = m (one AIE row's m-tile)
 static constexpr unsigned GQD_K64 = 64;  // one matmul k-tile (= s * colA)
+// mac_dims r: 4 for aie2p's bf16 mmul (4,8,8); 8 when mm.cc emulates it on the bfp16 MAC array
+// (GQP_BFP=1 -> -DGQD_R8, mac_dims (8,8,8)). Only the fused path (the default) knows the 8.
+#ifdef GQD_R8
+static constexpr unsigned GQD_R = 8;
+#else
 static constexpr unsigned GQD_R = 4;     // mac_dims r (aie2p bf16, non-emulated: (4,8,8))
+#endif
 static constexpr unsigned GQD_S = 8;     // mac_dims s
 static constexpr unsigned GQD_COLA = GQD_K64 / GQD_S;  // 8 col-blocks per k64-tile
 static constexpr unsigned GQD_CHUNK_BYTES = 5120;
@@ -353,10 +359,16 @@ __attribute__((noinline)) inline void gqd_fused_ky(const uint8_t *__restrict ban
         const aie::vector<bfloat16, 64> to = aie::transpose(wo, GQD_S, GQD_S);
         const auto z = aie::interleave_zip(te, to, GQD_S);
         bfloat16 *__restrict dst = scratch + sub * (GQD_R * GQD_S);
-        aie::store_v(dst + (ib0 + 0) * GQD_COLA * (GQD_R * GQD_S), z.first.template extract<32>(0));
-        aie::store_v(dst + (ib0 + 1) * GQD_COLA * (GQD_R * GQD_S), z.first.template extract<32>(1));
-        aie::store_v(dst + (ib0 + 2) * GQD_COLA * (GQD_R * GQD_S), z.second.template extract<32>(0));
-        aie::store_v(dst + (ib0 + 3) * GQD_COLA * (GQD_R * GQD_S), z.second.template extract<32>(1));
+        if constexpr (GQD_R == 8) {                    // two 8-row blocks: rows 0-7, 8-15 of these 16
+          const unsigned rb0 = part * 4 + half * 2;
+          aie::store_v(dst + (rb0 + 0) * GQD_COLA * (GQD_R * GQD_S), z.first);
+          aie::store_v(dst + (rb0 + 1) * GQD_COLA * (GQD_R * GQD_S), z.second);
+        } else {
+          aie::store_v(dst + (ib0 + 0) * GQD_COLA * (GQD_R * GQD_S), z.first.template extract<32>(0));
+          aie::store_v(dst + (ib0 + 1) * GQD_COLA * (GQD_R * GQD_S), z.first.template extract<32>(1));
+          aie::store_v(dst + (ib0 + 2) * GQD_COLA * (GQD_R * GQD_S), z.second.template extract<32>(0));
+          aie::store_v(dst + (ib0 + 3) * GQD_COLA * (GQD_R * GQD_S), z.second.template extract<32>(1));
+        }
       }
     }
   }
