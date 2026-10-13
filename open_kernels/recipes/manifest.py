@@ -68,7 +68,9 @@ def manifest(spec: ModelSpec, max_ctx: int = 4096, key: str | None = None) -> di
         "hf_config_check": check,
         "hf_config_defaults": getattr(F, "hf_config_defaults", lambda s: {})(spec),
         "layout": F.manifest_layout(spec, max_ctx),
-        "layers": list(spec.layer_types),
+        # a family may name its layers more finely than ModelSpec's layer types (LFM2-MoE's
+        # leading dense layers); the engine only needs the name to find the program
+        "layers": list(getattr(F, "manifest_layers", lambda s: s.layer_types)(spec)),
         "contexts": prog["contexts"],
         "kernels": prog["kernels"],
         "layer_types": prog["layer_types"],

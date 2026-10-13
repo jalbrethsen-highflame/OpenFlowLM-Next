@@ -72,6 +72,7 @@ PackOp parse_op(const json& j, const std::string& where) {
     };
     if (p.op == "std_perm" || p.op == "std_perm_gguf" || p.op == "q8_perm" || p.op == "bf16_gemm" ||
         p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
+        p.op == "lmhead_q8_gguf" ||
         p.op == "transpose" || p.op == "transpose_banked") {
         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
     } else if (p.op == "expert_stripes") {
@@ -88,6 +89,7 @@ PackOp parse_op(const json& j, const std::string& where) {
     else if (p.op == "expert_down") need_all({{"expert_bytes", p.expert_bytes}, {"experts", p.experts}});
     else if (p.op == "put") need_all({{"cap", p.cap}});
     else if (p.op == "lmhead_q8") need_all({{"chunk_bytes", p.chunk_bytes}, {"in_dim", p.in_dim}});
+    else if (p.op == "lmhead_q8_gguf") need_all({{"chunk_bytes", p.chunk_bytes}, {"in_dim", p.in_dim}, {"rows", p.rows}});
     else if (p.op == "conv_transpose") need_all({{"taps", p.taps}, {"groups", p.groups}, {"width", p.width}});
     return p;
 }
@@ -103,7 +105,7 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
             st.args = get<std::vector<std::string>>(s, "args", where);
             if (st.args.empty() || st.args.size() > 8) fail(where, "run " + st.kernel + ": " + std::to_string(st.args.size()) + " buffer args (1..8)");
             st.split = s.value("split", false);
-        } else if (st.op == "moeroute2") {
+        } else if (st.op == "moeroute2" || st.op == "hostroute") {
             st.act_off = get<uint64_t>(s, "act_off", where);
         } else {
             fail(where, "unknown program op '" + st.op + "'");
@@ -118,8 +120,8 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
 void check_step(const Manifest& m, const Step& s, const std::string& where, const char* what) {
     auto it = m.kernels.find(s.kernel);
     if (it == m.kernels.end()) fail(where, std::string(what) + " names unknown kernel " + s.kernel);
-    if (s.op == "moeroute2" && it->second.patch != "moeroute2")
-        fail(where, std::string(what) + ": moeroute2 on kernel " + s.kernel + ", whose patch is '" +
+    if ((s.op == "moeroute2" || s.op == "hostroute") && it->second.patch != "moeroute2")
+        fail(where, std::string(what) + ": " + s.op + " on kernel " + s.kernel + ", whose patch is '" +
                         (it->second.patch.empty() ? std::string("none") : it->second.patch) + "'");
 }
 
@@ -182,9 +184,28 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     m.moe.share_up = get<uint64_t>(moe, "share_up", mw);
     m.moe.share_gate = get<uint64_t>(moe, "share_gate", mw);
     m.moe.share_down = get<uint64_t>(moe, "share_down", mw);
+    m.moe.base = moe.value("base", 0ull);
+    if (m.moe.base > m.moe.pool_down) fail(mw, "base past pool_down");
     if (m.moe.topk > 8 || m.moe.topk == 0) fail(mw, "topk " + std::to_string(m.moe.topk) + " (the router record holds 8)");
     }
     if (lay.contains("gemm_dit")) m.gemm_dit = lay["gemm_dit"];
+    if (lay.contains("router")) {
+        const json& r = lay["router"];
+        const std::string rw = lw + ".router";
+        m.router.present = true;
+        m.router.weight = get<std::string>(r, "weight", rw);
+        m.router.bias = r.value("bias", std::string());
+        m.router.gating = get<std::string>(r, "gating", rw);
+        if (m.router.gating != "sigmoid" && m.router.gating != "softmax")
+            fail(rw, "gating '" + m.router.gating + "' (sigmoid | softmax)");
+        m.router.norm_topk = r.value("norm_topk", true);
+        m.router.norm_eps = r.value("norm_eps", 1e-6);
+        m.router.scale = r.value("scale", 1.0);
+        m.router.xm_off = get<uint64_t>(r, "xm_off", rw);
+        m.router.idx_off = r.value("idx_off", 1024ull);
+        m.router.weights_off = r.value("weights_off", 1056ull);
+        if (!m.has_moe) fail(rw, "a host router without layout.moe");
+    }
     m.attn.kv_row = m.kv_row;
     m.attn.ptab_row = m.ptab_row;
 

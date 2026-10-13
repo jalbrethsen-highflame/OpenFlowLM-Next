@@ -40,6 +40,7 @@ struct MoeGeometry {
     uint64_t share_down = 504627200;
     unsigned experts = 256;
     unsigned topk = 8;               ///< routed slots (the placeholder experts 0..topk-1)
+    uint64_t base = 0;               ///< where the routed [up | gate] stripes start (LFM2-MoE: past the mixer's projections)
     uint64_t expert_stripes() const { return 2 * up_bytes; }     ///< one expert's up + gate stripes
     uint64_t expert_bytes() const { return 3 * up_bytes; }       ///< moe_table's host-concatenated [up | gate | down]
 };
@@ -139,9 +140,11 @@ inline std::vector<MoePatch> moe2_table(const std::vector<uint32_t>& w, const st
     for (size_t i = 4; i < w.size(); i += op_len(w[i])) {
         if (w[i] != 0x81 || i + 11 >= w.size() || w[i + 8] != 0) continue;
         uint64_t off = w[i + 10];
-        if (off < g.pool_down) {
-            uint64_t e = off / g.expert_stripes();
-            if (e < g.topk) t.push_back({i + 10, static_cast<size_t>(e), 0, 0, off % g.expert_stripes()});
+        if (off < g.base) {
+            continue;                                   // the mixer's own projections (base > 0 only)
+        } else if (off < g.pool_down) {
+            uint64_t e = (off - g.base) / g.expert_stripes();
+            if (e < g.topk) t.push_back({i + 10, static_cast<size_t>(e), 0, 0, (off - g.base) % g.expert_stripes()});
         } else if (off < g.share_up) {
             uint64_t e = (off - g.pool_down) / g.up_bytes;
             if (e < g.topk)
@@ -256,7 +259,7 @@ inline void moe2_apply(uint32_t* iw, const std::vector<MoePatch>& table, const u
                        const MoeGeometry& g = MoeGeometry{}) {
     for (const auto& p : table) {
         uint64_t e = idx[p.slot & 0xff];
-        iw[p.word] = static_cast<uint32_t>((p.slot & 0x100) == 0 ? e * g.expert_stripes() + p.intra
+        iw[p.word] = static_cast<uint32_t>((p.slot & 0x100) == 0 ? g.base + e * g.expert_stripes() + p.intra
                                                                   : g.pool_down + e * g.up_bytes + p.intra);
     }
 }

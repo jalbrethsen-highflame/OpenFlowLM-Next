@@ -49,11 +49,16 @@ DENSE = HERE.parent / "dense"
 sys.path.insert(0, str(HERE.parent.parent))
 from ironutil import Pipeline, include_dirs  # noqa: E402
 from recipes.load import current_spec  # noqa: E402
-from recipes import lfm2 as QR  # noqa: E402
-from recipes.qwen36moe import BAND_ROWS, ELEM, band_bytes, per_band  # noqa: E402
+from recipes.families import for_spec  # noqa: E402
+from recipes.qwen36moe import BAND_ROWS, ELEM  # noqa: E402
 from aie.helpers.taplib import TensorAccessPattern  # noqa: E402
 
 SPEC = current_spec()
+if int(os.environ.get("GEMV_SCALES_F32", 0)) and SPEC.quant != "q4_1_f32":
+    # the GGUF-direct twin: f32-scale pool chunks (the same switch dx.py reads)
+    from dataclasses import replace
+    SPEC = replace(SPEC, quant="q4_1_f32")
+QR = for_spec(SPEC)      # lfm2, or lfm2moe for its conv layers
 R = QR.recipe(SPEC)
 L, G = R.layout, R.geo
 DL = L.dense
@@ -74,6 +79,26 @@ LN_FLAGS = [f"-DLN_N={HID}", f"-DLN_EPS={G.EPS:g}f"]
 SC_FLAGS = [f"-DSC_TAPS={TAPS}", f"-DSC_W={SCW}",
             f"-DSC_PASSTHROUGH={os.environ.get('SC_PASSTHROUGH', '0')}"]
 STOP = int(os.environ.get("CX_STOP", 99))   # debug: 1 = after B|C|u, 2 = after the out proj, 3 = after up|gate
+# CX_MIX=1: the conv block alone -- B|C|u, conv, out, then res = x + out and xm =
+# ffn_norm(res) into act, and nothing after. LFM2-MoE's conv layers end there; the routed
+# experts run as their own dispatch (designs/lfm2moe/ex.py).
+MIX = int(os.environ.get("CX_MIX", 0))
+
+# GGUF-direct pools (SPEC.quant == "q4_1_f32"): f32-scale chunks, the gemv wrappers
+# compiled with the f32-scale define and the gemv_q4s32 symbol prefix (as dx.py).
+F32 = SPEC.quant == "q4_1_f32"
+CH = QR.chunk_bytes(SPEC.quant)
+GEMV_DEF = ["-DGEMV_Q4_SCALES_F32=1", "-DGEMV_Q4_PREFIX=gemv_q4s32"] if F32 else []
+GYSYM = "gemv_q4s32_gy" if F32 else "gemv_q4_gy"
+GMSYM = "gemv_q4s32_gms" if F32 else "gemv_q4_gms"
+
+
+def band_bytes(K):
+    return QR.band_bytes(K, SPEC.quant)
+
+
+def per_band(K):
+    return band_bytes(K) // CH
 
 
 def bt(total, off, n):
@@ -86,7 +111,7 @@ def n_groups(K):
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def cx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *,
-       stop: CompileTime[int] = 99, srchash: CompileTime[int] = 0):
+       stop: CompileTime[int] = 99, mix: CompileTime[int] = 0, srchash: CompileTime[int] = 0):
     elem = np.ndarray[(G.CALL_BYTES,), np.dtype[np.uint8]]
     x_ty = np.ndarray[(ELEM // 2,), np.dtype[bfloat16]]
     y_ty = np.ndarray[(BAND_ROWS,), np.dtype[np.float32]]
@@ -108,8 +133,8 @@ def cx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *,
     def ef(sym, src, args, flags=OS):
         return ExternalFunction(sym, source_file=str(src), arg_types=args, include_dirs=inc, compile_flags=flags)
 
-    f_gy = ef("gemv_q4_gy", DENSE / "gemv_q4_gy.cc", [elem, tab_ty, y_ty, i32, i32, i32])
-    f_gms = ef("gemv_q4_gms", DENSE / "gemv_q4_gms.cc", [elem, tab_ty, ms_ty, i32, i32, i32])
+    f_gy = ef(GYSYM, DENSE / "gemv_q4_gy.cc", [elem, tab_ty, y_ty, i32, i32, i32], OS + GEMV_DEF)
+    f_gms = ef(GMSYM, DENSE / "gemv_q4_gms.cc", [elem, tab_ty, ms_ty, i32, i32, i32], OS + GEMV_DEF)
     f_act = ef("dense_act", DENSE / "dense_act.cc", [ms_ty, y_ty])
     f_prep = ef("dense_prep", DENSE / "dense_prep.cc", [x_ty, tab_ty, i32, i32])
     f_prepf = ef("dense_prep_f32", DENSE / "dense_prep_f32.cc", [x_ty, tab_ty, i32, i32])
@@ -166,7 +191,7 @@ def cx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *,
             f_prep(oe[i], tab, HID, i)
         gemv_bands(win, yout, tab, SC_PC, NG_H, PB_H)
         xin.release(G.XN_ELEMS)
-        if stop == 2:
+        if stop == 2 or mix:
             return
         # 3. up | gate per band against xm, silu -> h band
         me = acq(xin, G.XM_ELEMS)
@@ -215,7 +240,7 @@ def cx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *,
             ain.release(5)
 
         add_norm()                          # 2. res = x + out; xm = post_attn_norm(res)
-        if stop >= 3:
+        if stop >= 3 and not mix:
             add_norm()                      # 3. xres = res + out2 (the xn is junk)
 
     def sc_body(scin, scw, scy, scst, f_sc):
@@ -238,7 +263,7 @@ def cx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *,
         workers.append(Worker(main_body, fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(),
                                                   Buffer(tab_ty, name=f"tab{c}"), Buffer(ms_ty, name=f"ms{c}"),
                                                   f_gy, f_gms, f_act, f_prep, f_prepf],
-                              tile=Tile(c, 2), stack_size=0x1800))
+                              tile=Tile(c, 2), stack_size=0x1400 if F32 else 0x1800))
     workers.append(Worker(sc_body, fn_args=[of_scin.cons(), of_scw.cons(), of_scy.prod(),
                                             of_scst.prod(), f_sc],
                           tile=Tile(2, 3), stack_size=0x1800))
@@ -309,6 +334,11 @@ def cx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *,
         py.finish()                                           # out is in DDR
         lni.fill(a_act, tap=bt(L.AD_BYTES, DL.AD_OUT, HID * 4), wait=True, group=tg_ln2)
         tg_ln2.finish()
+        if mix:
+            # the conv block alone: res and xm are in DDR, the FFN is another dispatch's
+            pw.finish()
+            tg_x.finish()
+            return
         # 6. up | gate per band, silu -> h
         x_prod.fill(a_act, tap=bt(L.AD_BYTES, DL.AD_XM, G.XM_ELEMS * ELEM), wait=True, group=tg_x)
         for c in range(N_CORES):
@@ -367,3 +397,6 @@ _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.rea
                    (GEMV / "gemv_tab.h").read_bytes(),
                    (HERE.parent.parent / "include" / "vecmath.h").read_bytes(), SPEC.spec_hash().encode()])
 SPECIALIZE = {"stop": STOP, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}
+if MIX:
+    # only when set, so an LFM2 build specializes exactly as it always did
+    SPECIALIZE["mix"] = MIX

@@ -558,6 +558,12 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// honest one to add up once a dispatch has been running while the host did something else.
     std::pair<double, double> wait_run(Inflight& f);
     void route(Kern& k, int layer, uint64_t act_off);
+    /// LFM2-MoE: the router on the host (manifest layout.router) -- reads xm out of act,
+    /// writes the routing record, patches the expert kernel like route() does.
+    void host_route(Kern& k, int layer, uint64_t act_off);
+    /// A program's non-run step: moeroute2 -> route(), hostroute -> host_route().
+    void route_op(const Step& s, int layer);
+    std::vector<std::vector<float>> router_w_, router_b_;   ///< per layer: [experts][hidden], [experts]
     void log(const std::string& s) const;
 
     // ---- the block route's helpers (core.cpp)

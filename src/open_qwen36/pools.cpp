@@ -543,9 +543,17 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
         size_t n = 0;
         const uint8_t* src = raw(m, name, 0, &n);
         const uint64_t out_dim = op.nch / (op.in_dim / 256) * 32;
-        if (!kq && n < static_cast<size_t>(out_dim) * nb * blk)
+        // `chunk0` is a SOURCE chunk offset, as for std_perm: chunks are 32 rows x 256
+        // columns, row-block major, so it starts the plan `chunk0 / ncol` row blocks in.
+        // LFM2's fused in_proj thirds and one expert of a merged [experts, rows, cols]
+        // tensor are both such a row range.
+        if (op.chunk0 % (op.in_dim / 256))
+            fail("std_perm_gguf " + name + ": chunk0 " + std::to_string(op.chunk0) +
+                 " is not a whole number of row blocks");
+        const uint64_t row_base = 32 * (op.chunk0 / (op.in_dim / 256));
+        if (!kq && n < static_cast<size_t>(row_base + out_dim) * nb * blk)
             fail(name + " is " + std::to_string(n) + " B, the plan needs " +
-                 std::to_string(static_cast<uint64_t>(out_dim) * nb * blk));
+                 std::to_string(static_cast<uint64_t>(row_base + out_dim) * nb * blk));
         bounds(op, op.nch * ch, dst_bytes);
         auto perm = std_perm(op.nch, op.in_dim);
         const size_t ncol = op.in_dim / 256;
@@ -557,9 +565,9 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
             for (size_t r = 0; r < 32; ++r) {
                 const uint64_t row = row0 + r;
                 if (row >= out_dim) break;                       // padded rows: zeroed scales/codes
-                const uint8_t* srow = src + row * nb * blk;
+                const uint8_t* srow = src + (row_base + row) * nb * blk;
                 const uint8_t rb = static_cast<uint8_t>(r / 16), rl = static_cast<uint8_t>(r % 16);
-                if (kq) g.embed_row(name, row, op.in_dim, rd.data());   // exact f32 row, once
+                if (kq) g.embed_row(name, row_base + row, op.in_dim, rd.data());   // exact f32 row, once
                 for (size_t kb = 0; kb < 8; ++kb) {
                     if (blk0 + kb >= nb) break;                  // padded columns stay zero
                     const uint8_t* b = srow + (blk0 + kb) * blk;
@@ -730,6 +738,54 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
             size_t fch = (4 * s + r % 4) * nk + r / 4;
             std::memcpy(dst + op.dst + k * CH8, src + fch * CH8, CH8);
         }
+    } else if (op.op == "lmhead_q8_gguf") {
+        // A GGUF tensor (any row type GgufFile::embed_row decodes: the Q6_K tied embedding
+        // LFM2 ships, Q8_0, Q4_x, F16, F32) into the q8 lm head's GGUF-direct pool
+        // (lm_head_q8.h, LMHEAD_SCALES_F32: 9216 B chunks, f32 scales at [kb*32 + r], int8
+        // codes at 1024 + (r/16)*4096 + k*16 + r%16), in lmhead_q8's 128-row supertile pool
+        // order. Each 32-value block is re-quantized symmetric 8-bit. The kernel narrows the
+        // scale to bf16 (RNE), so the scale is CHOSEN in bf16 -- max|v| / 127 rounded up --
+        // and the codes are rounded against exactly that: the narrowing is then lossless.
+        const std::string name = with_layer(op.tensor, layer);
+        const auto* g = dynamic_cast<const GgufFile*>(&m);
+        if (!g) fail("lmhead_q8_gguf " + name + " is not in a GGUF");
+        const size_t CH8 = op.chunk_bytes, K = op.in_dim, rows = op.rows;
+        if (CH8 != 9216) fail("lmhead_q8_gguf " + name + ": chunk_bytes " + std::to_string(CH8) + " (the f32-scale q8 chunk is 9216)");
+        if (!K || K % 256 || !rows || rows % 128)
+            fail("lmhead_q8_gguf " + name + ": in_dim " + std::to_string(K) + " / rows " + std::to_string(rows) +
+                 " are not whole k-tiles / 128-row bands");
+        const TensorMeta& tm = g->meta(name);
+        if (tm.shape.size() != 2 || tm.shape[1] != K)
+            fail("lmhead_q8_gguf " + name + " is not a [rows, " + std::to_string(K) + "] tensor");
+        const size_t src_rows = tm.shape[0], nk = K / 256, per_band = 4 * nk;
+        bounds(op, rows / 32 * nk * CH8, dst_bytes);
+        std::vector<float> rd(32 * K);
+        for (size_t rb = 0; rb < rows / 32; ++rb) {
+            for (size_t r = 0; r < 32; ++r) {
+                const size_t row = rb * 32 + r;
+                if (row < src_rows) g->embed_row(name, row, K, rd.data() + r * K);
+                else std::fill(rd.begin() + r * K, rd.begin() + (r + 1) * K, 0.f);   // padded rows
+            }
+            const size_t s = rb / 4, q = rb % 4;
+            for (size_t kt = 0; kt < nk; ++kt) {
+                uint8_t* d = dst + op.dst + (s * per_band + kt * 4 + q) * CH8;
+                int8_t* code = reinterpret_cast<int8_t*>(d + 1024);
+                for (size_t kb = 0; kb < 8; ++kb)
+                    for (size_t r = 0; r < 32; ++r) {
+                        const float* v = rd.data() + r * K + kt * 256 + kb * 32;
+                        float amax = 0.f;
+                        for (size_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(v[i]));
+                        const float sc = amax > 0.f ? bf16_to_f32(bf16_ceil(amax / 127.f)) : 0.f;
+                        const float inv = sc > 0.f ? 1.f / sc : 0.f;
+                        std::memcpy(d + 4 * (kb * 32 + r), &sc, 4);
+                        for (size_t i = 0; i < 32; ++i) {
+                            const long c = std::lround(v[i] * inv);
+                            code[(r / 16) * 4096 + (kb * 32 + i) * 16 + (r % 16)] =
+                                static_cast<int8_t>(c < -127 ? -127 : c > 127 ? 127 : c);
+                        }
+                    }
+            }
+        }
     } else if (op.op == "transpose_banked") {
         const std::string name = with_layer(op.tensor, layer);
         const uint64_t rows = op.rows, cols = op.cols, elem = op.elem;
@@ -757,7 +813,15 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
         if (dr < rows) fail("transpose " + name + ": dst_rows " + std::to_string(dr) +
                             " is narrower than rows " + std::to_string(rows));
         size_t n = 0;
-        const uint8_t* src = raw(m, name, rows * cols * elem, &n);
+        const uint8_t* src = raw(m, name, 0, &n);
+        std::vector<uint8_t> conv;
+        if (dynamic_cast<const GgufFile*>(&m) && elem == 2 && n != rows * cols * 2) {
+            // a GGUF stores small weights f32 / f16 (LFM2's conv taps): to the bf16 the slot holds
+            conv.resize(rows * cols * 2);
+            pack_norm(m, name, rows * cols * 2, conv.data());
+            src = conv.data();
+            n = conv.size();
+        }
         if (n != rows * cols * elem)
             fail(name + " is " + std::to_string(n) + " B, not a [" + std::to_string(rows) + ", " +
                  std::to_string(cols) + "] tensor of " + std::to_string(elem) + "-byte values");

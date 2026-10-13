@@ -55,7 +55,7 @@ struct Step {
     std::string op;                          ///< run | moeroute2
     std::string kernel;
     std::vector<std::string> args;           ///< run: buffer names (per-layer: pool consts act state; else globals)
-    uint64_t act_off = 0;                    ///< moeroute2: the router record's offset in `act`
+    uint64_t act_off = 0;                    ///< moeroute2 / hostroute: the router record's offset in `act`
     bool split = false;                      ///< run, block route: the weight is a q8 projection's exact q4_1
                                              ///< split, [hi | lo]; the GEMM runs twice the rows and the halves add
 };
@@ -219,6 +219,16 @@ struct Manifest {
     /// layout.gemm_dit: the block route's GEMMs on dit_gemm (bf16 x bfp16, row-major A and C,
     /// M tokens a dispatch): {m, kernels {NxK: name}, npad {N: Npad}, x {K: global}, y {Npad: global}}.
     nlohmann::json gemm_dit;
+    /// layout.router: the router run on the host between a mixer dispatch and the expert
+    /// dispatch (`hostroute`, LFM2-MoE). Reads xm (bf16) at xm_off in the layer's act, writes
+    /// idx u32[8] at idx_off and the weights f32[topk] at weights_off of the record.
+    struct HostRouter {
+        bool present = false;
+        std::string weight, bias, gating;     ///< tensor names ({l} = layer), "sigmoid" | "softmax"
+        bool norm_topk = true;
+        double norm_eps = 1e-6, scale = 1.0;
+        uint64_t xm_off = 0, idx_off = 1024, weights_off = 1056;
+    } router;
     stream_patch::AttnGeometry attn;
     // the model and its programs
     std::vector<std::string> layers;         ///< per layer: a key of layer_types
