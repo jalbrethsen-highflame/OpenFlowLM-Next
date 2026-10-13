@@ -133,7 +133,26 @@ real time once. Read the whole thing before writing a design.
 ## 6. Prompt processing (prefill)
 
 Token-by-token prefill is decode speed (LFM2-MoE: 19 tok/s). The fix is layer-major: run
-each layer over the whole prompt before the next layer. LFM2-MoE 24B went 19 -> 311 tok/s.
+each layer over the whole prompt before the next layer. LFM2-MoE 24B went 19 -> 595 tok/s.
+
+- **Host threads = physical cores, not SMT threads.** At 32 threads (16 cores) the short
+  parallel regions around each dispatch (tiling, transpose, expert gather / scatter) ran
+  5-10x slower and varied run to run; 16 threads took the 4K prompt from 8-10 s to 6.7 s.
+  The engine now defaults to one thread per physical core on Linux (`physical_cores`).
+- **Find what bounds a kernel before you optimize it.** Build a variant with the arithmetic
+  removed (`EB_NULL_MM`, `GQP_NULL_DEQUANT`) and compare with `--bench-kernel`. eb: 8.33 of
+  8.47 ms was the weight stream, so more tokens per weight stream was the fix, not faster
+  math. The GEMM: removing the dequant changed nothing; a barrier per row block did.
+- **No barrier per block in a runtime sequence.** `TaskGroup(); ...; tg.finish()` per output
+  block serializes DMA and compute. `ironutil.Pipeline(3)` with drains issued first overlaps
+  them (`gemm_q4_prefill` `GQP_PIPE=1`: NPU GEMM time -23 %).
+- **L1 decides the tokens per weight stream.** To fit more tokens, keep fewer accumulator rows
+  live: eb computes up and gate band by band (128 rows) instead of per band pair (256), which
+  let NT go 16 -> 32 (experts 6.1 -> 4.4 s).
+- `OFLM_OPEN_PROMPT_GEMM_PROFILE=1` runs each prompt GEMM alone and prints NPU ms per shape.
+  Its host timings are not representative (the host runs slower when the NPU idles).
+- Staging host work through ordinary memory before one copy into the BO did NOT help when
+  the work overlaps the NPU; the thread count was the real problem.
 
 - **Only 8-bit operands are fast on XDNA2.** The bf16 mmul runs on the vector unit
   (~1 TFLOP/s). The MAC array takes int8 or bfp16ebs8. Two ways in:
@@ -145,8 +164,11 @@ each layer over the whole prompt before the next layer. LFM2-MoE 24B went 19 -> 
   - Cost: logits corr drops ~1e-3 where routing is near a tie; argmax held on every check.
     Experts 17.3 -> 8.4 ms per call; mixer GEMMs 4.9 -> 3.2 s on a 4K prompt.
 - **Mixers:** batch every projection through a prompt GEMM (T = 256 tokens). Keep the
-  sequence-dependent parts (short conv, attention) on the host if they are small; tile them.
-- **MoE experts:** group tokens by expert into fixed slots (16 tokens per slot), one stream
+  sequence-dependent parts (short conv, attention) on the host if they are small. Host
+  attention must be register-blocked with a vector exp (block_host.cpp `attention_tile64`):
+  scalar `std::exp` and row-at-a-time dots were 3.4x slower. Compute rope cos/sin once per
+  position, not per head, and run the prologue in parallel.
+- **MoE experts:** group tokens by expert into fixed slots (32 tokens per slot), one stream
   per slot count (64, 16), and double-buffer x/y so the host gather/scatter of pass n+1
   overlaps the NPU run of pass n.
 - **A merged decode image cannot serve prompts:** its cores run mixer + experts as one

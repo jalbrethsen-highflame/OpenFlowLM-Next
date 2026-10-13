@@ -30,13 +30,17 @@ Read `npu-model-porting` first for the general rules. Source: `open_kernels/reci
 Engine `step_prompt_lfm2` (core.cpp), selected by `--gemm-block` on the CLI and by default in
 the engine's prefill. Layer-major over the whole prompt:
 - Mixers (`prompt_mixers`): projections on `gemm_n{N}_k{K}` (gemm_q4_prefill, T = 256,
-  bfp16, pipelined and double-buffered); short conv and attention on the host
-  (`attention_tiles`, block_host.cpp); standalone `short_conv_mix` / `dx_mix` images.
+  `GQP_BFP=1 GQP_PIPE=1`, host-side double-buffered); short conv and attention on the host
+  (`attention_tile64`, block_host.cpp); standalone `short_conv_mix` / `dx_mix` images.
 - Router: host, same math as decode.
-- Experts (`experts_batch`): `eb64` / `eb16` (designs/lfm2moe/eb.py, `EB_BFP=1`), 16 token
-  slots per expert visit, x/y double-buffered so host gather/scatter overlaps the NPU.
-- 4009-token prompt, 12.9 s: mixers 6.5 s (gemm 3.2, attention 2.35, tile 1.2,
-  read+transpose 1.1), experts 6.15 s (NPU run 5.9; prep and read overlap it).
+- Experts (`experts_batch`): `eb64` / `eb16` (designs/lfm2moe/eb.py, `EB_BFP=1`), 32 token
+  slots per expert visit (`OPEN_LFM2MOE_EB_NT`), up/gate band by band, x/y double-buffered
+  so host gather/scatter overlaps the NPU. eb64 = 11.35 ms; 9.65 ms of it is the weight stream.
+- 4009-token prompt, 6.7 s at 16 host threads: experts 4.08 s (NPU-bound), mixers 2.42 s
+  (gemm 1.28 incl. 0.67 NPU wait, attention 0.60, conv 0.13, norms 0.14), router 0.2.
+- Next levers: experts are bound by the weight stream (each visit streams 5.9 MB of expert
+  weights for 32 tokens). Splitting tokens (not rows) across a column's 4 cores, with the
+  weight band broadcast from the mem tile, would cut weight traffic per token up to 4x.
 
 ## Model directory
 
@@ -78,12 +82,14 @@ manifest points the context at `lm_cm/final.xclbin`.
 | 24B, one context, f32 scales | 49 ms/token (20.3 tok/s) | 19 GB |
 | 24B, three images | 106 ms/token | 19 GB |
 | 8B, three images, bf16 scales | 57 ms/token (17.6 tok/s) | ~6.5 GB |
-| 24B prompt, 4009 tokens | 311 tok/s (12.9 s) | |
+| 24B prompt, 4009 tokens | 595 tok/s (6.7 s) | |
 | 24B decode after a 4K prompt | 63 ms/token (15.8 tok/s) | |
 
 
 Prompt history: 19.5 (token by token) -> 35 (batched experts) -> 130 (batched mixers) ->
-186 (overlap, pipelining) -> 209 (persistent scratch) -> 273 (bfp16 experts) -> 311 (bfp16 GEMMs).
+186 (overlap, pipelining) -> 209 (persistent scratch) -> 273 (bfp16 experts) -> 311 (bfp16 GEMMs)
+-> 346 (parallel rope) -> 359 (NT 32) -> ~405 (GEMM pipe) -> ~470 (attention micro-GEMMs)
+-> 595 (16 host threads instead of 32).
 
 24B step (one context): ex 38 x 0.64 ms, mixers ~0.95 ms (includes the queued ex wait),
 cx 2 x 2.1, head 5.9, router 0.8.
