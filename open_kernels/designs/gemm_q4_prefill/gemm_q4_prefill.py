@@ -71,6 +71,7 @@ HERE = Path(__file__).parent
 N_AIE_ROWS = 4
 N_AIE_COLS = 8
 BFP = os.environ.get("GQP_BFP") == "1"   # see gemm_q4_prefill(): mm.cc on the bfp16 MAC array
+PIPE = os.environ.get("GQP_PIPE") == "1"  # see sequence(): throttled issue instead of a barrier per row block
 M_TILE = 64        # weight rows per band / per matmul m-tile (= mac_dims-compatible, matches q4 band's 64 rows)
 K_TILE = 64        # matmul k-tile (mac_dims s=8 divides it)
 BAND_K = 256       # q4 pool band k-width (one q4_1_pack.py "chunk pair")
@@ -420,6 +421,25 @@ def gemm_q4_prefill(
             for col in range(n_aie_cols):
                 rtp_bufs[row][col][0] = T_TILES
                 rtp_bufs[row][col][1] = NBG
+        if PIPE:
+            # GQP_PIPE=1: no barrier between row-block groups. Each endpoint keeps up to three
+            # transfers in flight (ironutil.Pipeline), the C drains of a group issued before its
+            # fills (npu-model-porting: drains before fills), so group rbg + 1's weights and
+            # activation stream while group rbg computes.
+            import sys
+            sys.path.insert(0, str(HERE.parent.parent))
+            from ironutil import Pipeline
+            pl = Pipeline(3)
+            for rbg in range(NRB):
+                for ntile in range(T_TILES):
+                    for col in range(n_aie_cols):
+                        pl.drain(C_cons_hs[col], c_Y, c_tap(rbg, ntile, col))
+                    for row in range(n_aie_rows):
+                        pl.fill(A_prod_hs[row], a_W, a_tap(row, rbg))
+                    for col in range(n_aie_cols):
+                        pl.fill(B_prod_hs[col], a_X, b_tap(col, ntile))
+            pl.finish()
+            return
         for rbg in range(NRB):
             for ntile in range(T_TILES):
                 tg = TaskGroup()
@@ -441,9 +461,9 @@ SPECIALIZE = {
     "n_weight": N_WEIGHT, "k": K, "t": T, "tile_n": TILE_N,
     "b_reuse": recommend_b_reuse(K, T, TILE_N), "fmt": FMT,
 }
-if BFP:
-    # only when set, so a bf16 build specializes (and caches) exactly as before
-    SPECIALIZE["srchash"] = 0xBF916
+if BFP or PIPE:
+    # only when set, so a default build specializes (and caches) exactly as before
+    SPECIALIZE["srchash"] = (0xBF916 if BFP else 0) ^ (0x919E << 4 if PIPE else 0)
 
 if __name__ == "__main__":
     b = mem_tile_budget_bytes(K, T, TILE_N)
