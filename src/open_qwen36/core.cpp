@@ -15,6 +15,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 #include <omp.h>
@@ -144,15 +145,41 @@ const OmpWaitPolicy g_omp_wait_policy;
 /// its own rate, and 2582 tokens went 20.4 -> 18.9 s. With PASSIVE applied the ordering
 /// reverses -- 17.6 s at the full count against 19.5 at ten -- because sleeping workers
 /// cost the package nothing and the host stages want every core. So the default is the
-/// runtime's own count; OFLM_OPEN_OMP_THREADS stays as a knob for a box where it isn't.
+/// runtime's own count (on Linux, one per physical core -- see physical_cores);
+/// OFLM_OPEN_OMP_THREADS stays as a knob for a box where it isn't.
 ///
 /// This one cannot go through the environment even with the delay-load: vcomp latches its
 /// thread count the first time anything asks, which is inside the Core already.
+///
+/// Linux: one thread per PHYSICAL core, not per SMT thread. Measured on the Strix Halo (16
+/// cores / 32 threads, LFM2-MoE 24B, 4009-token prompt, libgomp, PASSIVE): 32 threads took
+/// 8.0-9.9 s and 16 took 6.7 s, run after run; the short parallel regions around each
+/// dispatch (tile_x, transpose, the expert gather / scatter) went 5-10x faster, the long ones
+/// (attention) were unchanged.
+unsigned physical_cores() {
+#ifdef __linux__
+    std::set<std::string> cores;
+    for (unsigned c = 0; c < 4096; ++c) {
+        std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list");
+        if (!f) {
+            if (c >= std::thread::hardware_concurrency()) break;
+            continue;                                  // offline cpu
+        }
+        std::string sib;
+        std::getline(f, sib);
+        cores.insert(sib);
+    }
+    return static_cast<unsigned>(cores.size());
+#else
+    return 0;
+#endif
+}
+
 unsigned omp_thread_budget() {
     if (std::getenv("OMP_NUM_THREADS")) return 0;      // the environment has already decided
     if (const char* e = std::getenv("OFLM_OPEN_OMP_THREADS"))
         return static_cast<unsigned>(std::strtoul(e, nullptr, 10));
-    return 0;
+    return physical_cores();
 }
 
 }  // namespace
