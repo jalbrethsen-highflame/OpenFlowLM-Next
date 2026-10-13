@@ -544,10 +544,11 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
         std::vector<float> attn_norm, ffn_norm, conv, qn, kn;   ///< conv tap-major [taps][hid]
     };
     std::vector<PromptHost> ph_;
+    std::vector<float> pm_[9];                  ///< prompt_mixers' scratch, reused layer to layer
     bool prompt_gemm_on_ = false;
     void prompt_setup();
-    /// y [T, N] = W(region) x [T, K] on the prompt GEMM, T = layout.prompt_gemm.t
-    void prompt_gemm_run(int layer, const std::string& region, const float* x, float* y);
+    /// y [N, n] = W(region) x [N, k] on the prompt GEMM, T rows per dispatch, pipelined
+    void prompt_gemm_rows(int layer, const std::string& region, const float* x, size_t N, float* y);
     /// The layer's mixer (and, for conv_dense, its FFN) over n tokens: res / xm rows out, or
     /// for conv_dense x updated in place. Returns false when the layer has no batched kind.
     bool prompt_mixers(int layer, float* x, size_t n, float* res, float* xm);

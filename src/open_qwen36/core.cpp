@@ -4079,28 +4079,69 @@ void Core::prompt_setup() {
             v[l].sync(XCL_BO_SYNC_BO_TO_DEVICE);
         }
     }
+    // the pipelined GEMMs' second x / y buffers (prompt_gemm_rows)
+    for (const char* sec : {"x", "y"})
+        for (const auto& [key, nm] : P[sec].items()) {
+            const std::string name = nm.get<std::string>();
+            if (!globals_.count(name + "_b")) globals_[name + "_b"] = alloc(globals_.at(name).size());
+        }
     prompt_gemm_on_ = true;
     log("prompt route: batched mixers on the GEMM (T = " + std::to_string(P["t"].get<size_t>()) + ")");
 }
 
-void Core::prompt_gemm_run(int l, const std::string& region, const float* x, float* y) {
+void Core::prompt_gemm_rows(int l, const std::string& region, const float* x, size_t N, float* y) {
+    // y [N, n] = W(region) x [N, k], T rows per dispatch, pipelined: while block b runs on the
+    // NPU the host tiles block b + 1 into the other x buffer and transposes block b - 1 out of the
+    // other y buffer. Every block uses the same instruction stream (no patch), so runs may queue.
     const auto& P = w_->prompt_gemm;
     const size_t T = P["t"].get<size_t>();
     const auto& g = P["regions"][region];
     const size_t n = g[1].get<size_t>(), k = g[2].get<size_t>();
-    const std::string kn = P["kernels"][std::to_string(n) + "x" + std::to_string(k)].get<std::string>();
-    const std::string xn = P["x"][std::to_string(k)].get<std::string>(), yn = P["y"][std::to_string(n)].get<std::string>();
-    auto t0 = std::chrono::steady_clock::now();
-    xrt::bo& xb = buffer(xn, 0);
-    host::tile_x(x, T, k, xb.map<uint16_t*>());
-    xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, k * T * 2, 0);
-    g_pc.tile += ms_since(t0);
-    g_pc.gemm += run(kerns_.at(kn), {"pg_" + region, xn, yn}, l);
-    auto t1 = std::chrono::steady_clock::now();
-    xrt::bo& yb = buffer(yn, 0);
-    read_back(yb, n * T * 4, 0);
-    host::transpose(yb.map<float*>(), n, T, y);
-    g_pc.read += ms_since(t1);
+    Kern& kn = kerns_.at(P["kernels"][std::to_string(n) + "x" + std::to_string(k)].get<std::string>());
+    const std::string xg = P["x"][std::to_string(k)].get<std::string>(), yg = P["y"][std::to_string(n)].get<std::string>();
+    const std::string xs[2] = {xg, xg + "_b"}, ys[2] = {yg, yg + "_b"};
+    const size_t nb = (N + T - 1) / T;
+    std::vector<float> pad;
+    auto tile = [&](size_t b, int buf) {
+        auto t0 = std::chrono::steady_clock::now();
+        const size_t r0 = b * T, tr = std::min(T, N - r0);
+        const float* src = x + r0 * k;
+        if (tr < T) {
+            pad.assign(T * k, 0.f);
+            std::memcpy(pad.data(), src, tr * k * 4);
+            src = pad.data();
+        }
+        xrt::bo& xb = buffer(xs[buf], 0);
+        host::tile_x(src, T, k, xb.map<uint16_t*>());
+        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, k * T * 2, 0);
+        g_pc.tile += ms_since(t0);
+    };
+    std::vector<float> tmp;
+    auto drain = [&](size_t b, int buf) {
+        auto t1 = std::chrono::steady_clock::now();
+        const size_t r0 = b * T, tr = std::min(T, N - r0);
+        xrt::bo& yb = buffer(ys[buf], 0);
+        read_back(yb, n * T * 4, 0);
+        if (tr == T) {
+            host::transpose(yb.map<float*>(), n, T, y + r0 * n);
+        } else {
+            tmp.resize(T * n);
+            host::transpose(yb.map<float*>(), n, T, tmp.data());
+            std::memcpy(y + r0 * n, tmp.data(), tr * n * 4);
+        }
+        g_pc.read += ms_since(t1);
+    };
+    tile(0, 0);
+    for (size_t b = 0; b < nb; ++b) {
+        const int buf = static_cast<int>(b & 1);
+        auto tg = std::chrono::steady_clock::now();
+        Inflight f = start_run(kn, {"pg_" + region, xs[buf], ys[buf]}, l);
+        if (b + 1 < nb) tile(b + 1, buf ^ 1);
+        if (b > 0) drain(b - 1, buf ^ 1);
+        wait_run(f);
+        g_pc.gemm += ms_since(tg);
+    }
+    drain(nb - 1, static_cast<int>((nb - 1) & 1));
 }
 
 bool Core::prompt_mixers(int l, float* x, size_t N, float* res, float* xm) {
@@ -4110,101 +4151,104 @@ bool Core::prompt_mixers(int l, float* x, size_t N, float* res, float* xm) {
     if (const char* sk = std::getenv("OFLM_OPEN_PROMPT_GEMM_SKIP"); sk && ("," + std::string(sk) + ",").find("," + h.kind + ",") != std::string::npos)
         return false;
     const auto& P = w_->prompt_gemm;
-    const size_t T = P["t"].get<size_t>(), hid = w_->hidden;
+    const size_t hid = w_->hidden;
     const double eps = P["eps"].get<double>();
     const bool conv = h.kind != "attn", dense = h.kind == "conv_dense";
     const size_t ff = P["ff"].get<size_t>(), kv_elems = P["kv_row_elems"].get<size_t>();
-    std::vector<float> xb(T * hid), xn(T * hid), out(T * hid), rb(T * hid), mb(T * hid);
-    // the recurrent state the decode kernels keep on the device: read it, carry it, write it back
-    std::vector<float> s0(hid), s1(hid);
     xrt::bo& st = state_[l];
+    // The whole layer at once, phase by phase: norm, the input projection (pipelined GEMMs), the
+    // mixer's middle on the host over every token, the output projection, residual + norm.
+    // scratch kept across layers (and prompts): fresh 100 MB arrays per layer cost page faults
+    std::vector<float>& xn = pm_[0]; xn.resize(N * hid);
+    std::vector<float>& out = pm_[1]; out.resize(N * hid);
+    auto tn = std::chrono::steady_clock::now();
+    host::rmsnorm_rows(x, N, hid, h.attn_norm.data(), eps, xn.data());
+    g_pc.norm += ms_since(tn);
     if (conv) {
+        std::vector<float>& yin = pm_[2]; yin.resize(N * 3 * hid);
+        std::vector<float>& yc = pm_[3]; yc.resize(N * hid);
+        prompt_gemm_rows(l, "conv_in", xn.data(), N, yin.data());
+        // the recurrent state the decode kernels keep on the device: read it, carry it, write it back
         read_back(st, 2 * hid * 4, 0);
+        std::vector<float> s0(hid), s1(hid);
         std::memcpy(s0.data(), st.map<uint8_t*>(), hid * 4);
         std::memcpy(s1.data(), st.map<uint8_t*>() + hid * 4, hid * 4);
-    } else if (pos_ > 0) {
-        read_back(st, static_cast<size_t>(pos_) * kv_elems * 2, 0);
-    }
-    for (size_t r0 = 0; r0 < N; r0 += T) {
-        const size_t tr = std::min(T, N - r0);
-        std::fill(xb.begin(), xb.end(), 0.f);
-        std::memcpy(xb.data(), x + r0 * hid, tr * hid * 4);
-        host::rmsnorm_rows(xb.data(), T, hid, h.attn_norm.data(), eps, xn.data());
-        if (conv) {
-            std::vector<float> yin(T * 3 * hid), yc(T * hid, 0.f);
-            prompt_gemm_run(l, "conv_in", xn.data(), yin.data());
-            const float *w0 = h.conv.data(), *w1 = w0 + hid, *w2 = w1 + hid;
-            auto tc = std::chrono::steady_clock::now();
-            // every channel is its own recurrence over the tokens: parallel over channel blocks
+        const float *w0 = h.conv.data(), *w1 = w0 + hid, *w2 = w1 + hid;
+        auto tc = std::chrono::steady_clock::now();
+        // every channel is its own recurrence over the tokens: parallel over channel blocks
 #pragma omp parallel for
-            for (long long cb = 0; cb < static_cast<long long>(hid / 64); ++cb)
-                for (size_t t = 0; t < tr; ++t) {
-                    const float *B = yin.data() + t * 3 * hid, *C = B + hid, *u = C + hid;
-                    float* yo = yc.data() + t * hid;
-                    for (size_t c = static_cast<size_t>(cb) * 64; c < static_cast<size_t>(cb + 1) * 64; ++c) {
-                        const float bx = B[c] * u[c];
-                        const float cv = s0[c] * w0[c] + s1[c] * w1[c] + bx * w2[c];
-                        yo[c] = C[c] * cv;
-                        s0[c] = s1[c];
-                        s1[c] = bx;
-                    }
+        for (long long cb = 0; cb < static_cast<long long>(hid / 64); ++cb) {
+            const size_t c0 = static_cast<size_t>(cb) * 64;
+            for (size_t t = 0; t < N; ++t) {
+                const float *B = yin.data() + t * 3 * hid, *C = B + hid, *u = C + hid;
+                float* yo = yc.data() + t * hid;
+                for (size_t c = c0; c < c0 + 64; ++c) {
+                    const float bx = B[c] * u[c];
+                    const float cv = s0[c] * w0[c] + s1[c] * w1[c] + bx * w2[c];
+                    yo[c] = C[c] * cv;
+                    s0[c] = s1[c];
+                    s1[c] = bx;
                 }
-            g_pc.conv += ms_since(tc);
-            prompt_gemm_run(l, "conv_out", yc.data(), out.data());
-        } else {
-            const size_t nh = P["nh"].get<size_t>(), kvh = P["kvh"].get<size_t>(), hd = P["hd"].get<size_t>();
-            const size_t qw = nh * hd, kvw = kvh * hd;
-            std::vector<float> qkv(T * (qw + 2 * kvw)), q(T * qw), k(T * kvw), v(T * kvw), og(T * qw);
-            prompt_gemm_run(l, "qkv", xn.data(), qkv.data());
-            for (size_t t = 0; t < T; ++t) {
-                const float* row = qkv.data() + t * (qw + 2 * kvw);
-                std::memcpy(q.data() + t * qw, row, qw * 4);
-                std::memcpy(k.data() + t * kvw, row + qw, kvw * 4);
-                std::memcpy(v.data() + t * kvw, row + qw + kvw, kvw * 4);
             }
-            host::AttnGeom g;
-            g.T = T;
-            g.t_real = tr;
-            g.nh = nh;
-            g.kvh = kvh;
-            g.hd = hd;
-            g.rot = P["rot"].get<size_t>();
-            g.pos0 = static_cast<size_t>(pos_) + r0;
-            g.eps = eps;
-            auto ta = std::chrono::steady_clock::now();
-            host::attention_block(g, q.data(), k.data(), v.data(), nullptr, h.qn.data(), h.kn.data(),
-                                  w_->rope_inv_freq.data(), st.map<uint16_t*>(), kv_elems, og.data());
-            g_pc.attn += ms_since(ta);
-            prompt_gemm_run(l, "o", og.data(), out.data());
         }
-        auto tn = std::chrono::steady_clock::now();
-        std::fill(rb.begin(), rb.end(), 0.f);
-#pragma omp parallel for
-        for (long long i = 0; i < static_cast<long long>(tr * hid); ++i) rb[i] = xb[i] + out[i];
-        host::rmsnorm_rows(rb.data(), T, hid, h.ffn_norm.data(), eps, mb.data());
-#pragma omp parallel for
-        for (long long i = 0; i < static_cast<long long>(T * hid); ++i)
-            mb[i] = bf16_round(mb[i]);                // the device hands the router / experts bf16 xm
-        g_pc.norm += ms_since(tn);
-        if (dense) {
-            std::vector<float> gg(T * ff), uu(T * ff), dn(T * hid);
-            prompt_gemm_run(l, "ffn_gate", mb.data(), gg.data());
-            prompt_gemm_run(l, "ffn_up", mb.data(), uu.data());
-#pragma omp parallel for
-            for (long long i = 0; i < static_cast<long long>(T * ff); ++i) gg[i] = gg[i] / (1.f + std::exp(-gg[i])) * uu[i];
-            prompt_gemm_run(l, "ffn_down", gg.data(), dn.data());
-            for (size_t i = 0; i < tr * hid; ++i) x[r0 * hid + i] = rb[i] + dn[i];
-        } else {
-            std::memcpy(res + r0 * hid, rb.data(), tr * hid * 4);
-            std::memcpy(xm + r0 * hid, mb.data(), tr * hid * 4);
-        }
-    }
-    if (conv) {
+        g_pc.conv += ms_since(tc);
         std::memcpy(st.map<uint8_t*>(), s0.data(), hid * 4);
         std::memcpy(st.map<uint8_t*>() + hid * 4, s1.data(), hid * 4);
         st.sync(XCL_BO_SYNC_BO_TO_DEVICE, 2 * hid * 4, 0);
+        prompt_gemm_rows(l, "conv_out", yc.data(), N, out.data());
     } else {
+        const size_t nh = P["nh"].get<size_t>(), kvh = P["kvh"].get<size_t>(), hd = P["hd"].get<size_t>();
+        const size_t qw = nh * hd, kvw = kvh * hd;
+        std::vector<float>& qkv = pm_[2]; qkv.resize(N * (qw + 2 * kvw));
+        std::vector<float>& q = pm_[4]; q.resize(N * qw);
+        std::vector<float>& k = pm_[5]; k.resize(N * kvw);
+        std::vector<float>& v = pm_[6]; v.resize(N * kvw);
+        std::vector<float>& og = pm_[3]; og.resize(N * qw);
+        prompt_gemm_rows(l, "qkv", xn.data(), N, qkv.data());
+#pragma omp parallel for
+        for (long long t = 0; t < static_cast<long long>(N); ++t) {
+            const float* row = qkv.data() + t * (qw + 2 * kvw);
+            std::memcpy(q.data() + t * qw, row, qw * 4);
+            std::memcpy(k.data() + t * kvw, row + qw, kvw * 4);
+            std::memcpy(v.data() + t * kvw, row + qw + kvw, kvw * 4);
+        }
+        if (pos_ > 0) read_back(st, static_cast<size_t>(pos_) * kv_elems * 2, 0);
+        host::AttnGeom g;
+        g.T = N;
+        g.t_real = N;
+        g.nh = nh;
+        g.kvh = kvh;
+        g.hd = hd;
+        g.rot = P["rot"].get<size_t>();
+        g.pos0 = static_cast<size_t>(pos_);
+        g.eps = eps;
+        auto ta = std::chrono::steady_clock::now();
+        host::attention_block(g, q.data(), k.data(), v.data(), nullptr, h.qn.data(), h.kn.data(),
+                              w_->rope_inv_freq.data(), st.map<uint16_t*>(), kv_elems, og.data());
+        g_pc.attn += ms_since(ta);
         st.sync(XCL_BO_SYNC_BO_TO_DEVICE, N * kv_elems * 2, static_cast<size_t>(pos_) * kv_elems * 2);
+        prompt_gemm_rows(l, "o", og.data(), N, out.data());
+    }
+    tn = std::chrono::steady_clock::now();
+    float* rb = dense ? out.data() : res;          // dense: the residual goes in `out`'s place
+#pragma omp parallel for
+    for (long long i = 0; i < static_cast<long long>(N * hid); ++i) rb[i] = x[i] + out[i];
+    float* mb = dense ? xn.data() : xm;
+    host::rmsnorm_rows(rb, N, hid, h.ffn_norm.data(), eps, mb);
+#pragma omp parallel for
+    for (long long i = 0; i < static_cast<long long>(N * hid); ++i) mb[i] = bf16_round(mb[i]);
+    g_pc.norm += ms_since(tn);
+    if (dense) {
+        std::vector<float>& gg = pm_[7]; gg.resize(N * ff);
+        std::vector<float>& uu = pm_[8]; uu.resize(N * ff);
+        prompt_gemm_rows(l, "ffn_gate", mb, N, gg.data());
+        prompt_gemm_rows(l, "ffn_up", mb, N, uu.data());
+#pragma omp parallel for
+        for (long long i = 0; i < static_cast<long long>(N * ff); ++i) gg[i] = gg[i] / (1.f + std::exp(-gg[i])) * uu[i];
+        std::vector<float>& dn = pm_[2]; dn.resize(N * hid);
+        prompt_gemm_rows(l, "ffn_down", gg.data(), N, dn.data());
+#pragma omp parallel for
+        for (long long i = 0; i < static_cast<long long>(N * hid); ++i) x[i] = rb[i] + dn[i];
     }
     return true;
 }
