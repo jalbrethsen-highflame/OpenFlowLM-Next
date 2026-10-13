@@ -416,22 +416,41 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
     // to the cache in bf16 with the values. The window is read straight from the bf16 cache in
     // phase 2, chunk by chunk -- converting the whole cache to floats per block was most of the
     // cost at a 4K window.
+    // Parallel over tokens; each token's cos / sin computed once for all its heads (the same
+    // values rope() computes per head, so the result is bit-identical -- per head in double it
+    // was most of this phase at a 4K block).
     std::vector<float> Q(R * qw);
-    for (size_t t = 0; t < R; ++t) {
-        const size_t p = g.pos0 + t;
-        for (size_t h = 0; h < g.nh; ++h) {
-            float* dst = Q.data() + t * qw + h * g.hd;
-            rms_vec(q + t * qw + h * g.hd, g.hd, qn, g.eps, dst);
-            rope(dst, half, inv_freq, static_cast<double>(p));
-        }
-        std::vector<float> kh(kvw);
-        for (size_t h = 0; h < g.kvh; ++h) {
-            rms_vec(k + t * kvw + h * g.hd, g.hd, kn, g.eps, kh.data() + h * g.hd);
-            rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(p));
-        }
-        for (size_t j = 0; j < kvw; ++j) {
-            kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);
-            kv[p * kv_row_elems + kvw + j] = f32_to_bf16(v[t * kvw + j]);
+#pragma omp parallel
+    {
+        std::vector<float> kh(kvw), cs(2 * half);
+#pragma omp for
+        for (long long tt = 0; tt < static_cast<long long>(R); ++tt) {
+            const size_t t = static_cast<size_t>(tt), p = g.pos0 + t;
+            for (size_t i = 0; i < half; ++i) {
+                const double a = static_cast<double>(p) * inv_freq[i];
+                cs[i] = static_cast<float>(std::cos(a));
+                cs[half + i] = static_cast<float>(std::sin(a));
+            }
+            auto rot = [&](float* x) {
+                for (size_t i = 0; i < half; ++i) {
+                    const float c = cs[i], s = cs[half + i], x1 = x[i], x2 = x[half + i];
+                    x[i] = x1 * c - x2 * s;
+                    x[half + i] = x2 * c + x1 * s;
+                }
+            };
+            for (size_t h = 0; h < g.nh; ++h) {
+                float* dst = Q.data() + t * qw + h * g.hd;
+                rms_vec(q + t * qw + h * g.hd, g.hd, qn, g.eps, dst);
+                rot(dst);
+            }
+            for (size_t h = 0; h < g.kvh; ++h) {
+                rms_vec(k + t * kvw + h * g.hd, g.hd, kn, g.eps, kh.data() + h * g.hd);
+                rot(kh.data() + h * g.hd);
+            }
+            for (size_t j = 0; j < kvw; ++j) {
+                kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);
+                kv[p * kv_row_elems + kvw + j] = f32_to_bf16(v[t * kvw + j]);
+            }
         }
     }
     (void)rows;
