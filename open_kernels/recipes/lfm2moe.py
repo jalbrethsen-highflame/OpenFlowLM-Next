@@ -271,6 +271,18 @@ def manifest_layers(spec: ModelSpec) -> list[str]:
     return [DENSE_CONV if l < spec.num_dense_layers else t for l, t in enumerate(spec.layer_types)]
 
 
+def one_context(spec: ModelSpec) -> bool:
+    """The merged layer image (designs/lfm2moe/lm.py): both mixers and the experts as three
+    instruction streams over ONE image, so the layer walk never switches hardware context.
+    OPEN_LFM2MOE_ONE_CTX=0 at export builds the three separate images (cx.py / dx.py with
+    *_MIX, ex.py) instead. A spec whose experts split over a different core count than its
+    mixers (the 8B: 4 against 8) has no single main-core program, so it keeps three images."""
+    import os
+    if os.environ.get("OPEN_LFM2MOE_ONE_CTX", "1") == "0":
+        return False
+    return moe_cores(spec) == geometry(spec).N_CORES
+
+
 def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     V = lfm2_view(spec)
     Lm = layout(spec, max_ctx)
@@ -294,6 +306,18 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     out["kernels"]["ex"] = {"context": "ex", "insts": "ex/insts.bin", "patch": "moeroute2", "build": "ex"}
     bufs = {"consts": Lm.CD_BYTES, "act": Lm.AD_BYTES}
     route = {"op": "hostroute", "kernel": "ex", "act_off": Lm.AD_ROUT}
+    conv_kn, conv_args = "cxm", sc_args
+    if one_context(spec):
+        # one image, three streams, one six-argument signature (lm.py)
+        for k in ("cxm", "dxm", "ex"):
+            del out["contexts"][k]
+        out["contexts"]["layer"] = "lm_cm/final.xclbin"
+        out["kernels"].pop("cxm")
+        out["kernels"]["cm"] = {"context": "layer", "insts": "lm_cm/insts.bin", "build": "lm_cm"}
+        out["kernels"]["dxm"] = {"context": "layer", "insts": "lm_am/insts.bin", "patch": "attnpos",
+                                 "build": "lm_am", "window": 0}
+        out["kernels"]["ex"] = {"context": "layer", "insts": "lm_ex/insts.bin", "patch": "moeroute2", "build": "lm_ex"}
+        conv_kn, conv_args, ex_args = "cm", ax_args, ax_args
     lts = set(manifest_layers(spec))
     if DENSE_CONV in lts:
         out["layer_types"][DENSE_CONV] = {
@@ -302,7 +326,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     if SHORT_CONV in lts:
         out["layer_types"][SHORT_CONV] = {
             "buffers": {**bufs, "state": {"kind": "linear", "bytes": Lm.STATE_BYTES}},
-            "program": [{"op": "run", "kernel": "cxm", "args": sc_args}, route,
+            "program": [{"op": "run", "kernel": conv_kn, "args": conv_args}, route,
                         {"op": "run", "kernel": "ex", "args": ex_args}]}
     if FULL in lts:
         out["layer_types"][FULL] = {
@@ -321,6 +345,19 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     db = D.builds(V)
     h, ff = spec.hidden, spec.intermediate
     sc_env = {"GEMV_SCALES_F32": "1", "SC_HID": str(h), "SC_TAPS": str(TAPS)}
+    if one_context(spec):
+        tag = f"h{h}_ff{spec.moe_intermediate}_e{spec.num_experts}_k{spec.experts_per_tok}_c{moe_cores(spec)}"
+        b = {"short_conv_f32": {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_ff{ff}_f32",
+                                "env": sc_env}}
+        for name, part in (("lm_cm", 0), ("lm_am", 1), ("lm_ex", 2)):
+            b[name] = {"design": "lfm2moe/lm.py", "build_dir": f"lfm2moe/build_lm{part}_{tag}",
+                       "env": {"LM_PART": str(part), "OPEN_LFM2MOE_CORES": str(moe_cores(spec))}}
+        b["ln"] = db["ln"]
+        b["lm_head_q8_f32"] = {"design": "lm_head_q8/lm_head_q8.py",
+                               "build_dir": f"lm_head_q8/build_{lm_q8(spec)['rows']}_k{h}_f32",
+                               "env": {"LMHEAD_N": str(lm_q8(spec)["rows"]), "LMHEAD_K": str(h),
+                                       "LMHEAD_CORES": "8", "LMHEAD_SCALES_F32": "1"}}
+        return b
     return {
         "short_conv_f32": {"design": "short_conv/cx.py", "build_dir": f"short_conv/build_lfm2moe_h{h}_ff{ff}_f32",
                            "env": sc_env},
