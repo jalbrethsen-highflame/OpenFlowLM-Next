@@ -173,7 +173,12 @@ nlohmann::json derive_config(const GgufFile& g) {
     else
         c["vocab_size"] = g.tensor("token_embd.weight").dims.at(1);
     c["num_attention_heads"] = u("attention.head_count");
-    c["num_key_value_heads"] = u("attention.head_count_kv");
+    // LFM2 stores head_count_kv PER LAYER (0 on its conv layers): an array, not a number.
+    // Leave it to config.json then -- check_model names it if neither has it.
+    try {
+        c["num_key_value_heads"] = u("attention.head_count_kv");
+    } catch (const std::exception&) {
+    }
     c["intermediate_size"] = u("feed_forward_length");
     if (g.kv_has(arch + ".attention.key_length")) c["head_dim"] = g.kv_u64(arch + ".attention.key_length");
     else c["head_dim"] = u("embedding_length") / u("attention.head_count");
@@ -702,6 +707,10 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
             if (kd.patch == "attnpos" && kd.rb > 2) kv_slack = std::max<uint64_t>(kv_slack, kd.rb - 2);
         state_.push_back(alloc(lt.state_kind == "kv" ? (cfg_.max_ctx + kv_slack) * lt.state_row : lt.state_bytes));
         if (progress) progress(l + 1, nl_ + 1);
+        // This layer's source pages are packed and uploaded: let them go now rather than after
+        // the last layer, so the peak is one layer of mapped file, not the whole file (a GGUF
+        // MoE's experts are most of it -- 13 GB for LFM2.5-24B-A2B).
+        file_->drop_pages();
         if ((l + 1) % 10 == 0 || l + 1 == nl_)
             log(std::to_string(l + 1) + "/" + std::to_string(nl_) + " layers resident (" +
                 std::to_string(static_cast<int>(ms_since(t0) / 1000)) + " s)");
@@ -739,6 +748,30 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     }
     file_->drop_pages();  // the packers are done with the container; keep only what the steps touch
     if (progress) progress(nl_ + 1, nl_ + 1);
+    // the host router's weights (layout.router): per layer that runs a hostroute step
+    router_w_.assign(nl_, {});
+    router_b_.assign(nl_, {});
+    if (w_->router.present) {
+        auto at = [](std::string s, int l) {
+            for (size_t p = s.find("{l}"); p != std::string::npos; p = s.find("{l}", p)) s.replace(p, 3, std::to_string(l));
+            return s;
+        };
+        for (int l = 0; l < nl_; ++l) {
+            bool host = false;
+            for (const Step& s : types_[l]->program) host = host || s.op == "hostroute";
+            if (!host) continue;
+            router_w_[l] = file_->f32(at(w_->router.weight, l));
+            if (router_w_[l].size() != static_cast<size_t>(w_->moe.experts) * w_->hidden)
+                throw std::runtime_error("open_qwen36: router " + at(w_->router.weight, l) + " has " +
+                                         std::to_string(router_w_[l].size()) + " values, not experts x hidden");
+            if (!w_->router.bias.empty()) {
+                router_b_[l] = file_->f32(at(w_->router.bias, l));
+                if (router_b_[l].size() != w_->moe.experts)
+                    throw std::runtime_error("open_qwen36: router bias " + at(w_->router.bias, l) + " has " +
+                                             std::to_string(router_b_[l].size()) + " values");
+            }
+        }
+    }
     weights_loaded_ = true;
     pos_ = 0;
     log("weights resident: " + std::to_string(nl_) + " pools + lm_head, " +
@@ -1280,7 +1313,7 @@ void Core::bench_decode(int reps) {
     auto replay = [&](int l, std::map<std::string, BenchStat>& into) {
         double ms = 0;
         for (const Step& s : types_[l]->program) {
-            if (s.op != "run") { route(kerns_.at(s.kernel), l, s.act_off); continue; }
+            if (s.op != "run") { route_op(s, l); continue; }
             const auto [submit, wait] = run_split(kerns_.at(s.kernel), s.args, l);
             into[s.kernel].add(submit, wait);
             ms += submit + wait;
@@ -1728,6 +1761,102 @@ void Core::route(Kern& k, int layer, uint64_t act_off) {
     timing_.route_ms += ms_since(t0);
 }
 
+void Core::route_op(const Step& s, int layer) {
+    if (s.op == "hostroute") host_route(kerns_.at(s.kernel), layer, s.act_off);
+    else route(kerns_.at(s.kernel), layer, s.act_off);
+}
+
+void Core::host_route(Kern& k, int layer, uint64_t act_off) {
+    auto t0 = std::chrono::steady_clock::now();
+    const auto& R = w_->router;
+    if (!R.present) throw std::runtime_error("open_qwen36: hostroute without layout.router in the manifest");
+    if (k.moe2.empty()) throw std::runtime_error("open_qwen36: hostroute on " + k.name + ", which has no routed-expert table");
+    if (static_cast<size_t>(layer) >= router_w_.size() || router_w_[layer].empty())
+        throw std::runtime_error("open_qwen36: no router weights for layer " + std::to_string(layer));
+    const size_t hid = w_->hidden, E = w_->moe.experts, K = w_->moe.topk;
+    xrt::bo& act = act_[layer];
+    const uint16_t* xb = reinterpret_cast<const uint16_t*>(act.map<uint8_t*>() + R.xm_off);
+    read_back(act, hid * 2, R.xm_off);
+    // the same late-read guard as route(): arm_route_records() filled xm with 0xFFFF
+    if (route_sentinel_) {
+        auto armed = [&] {
+            for (size_t i = 0; i < hid; ++i)
+                if (xb[i] == 0xFFFF) return true;
+            return false;
+        };
+        ++route_reads_;
+        if (armed()) {
+            ++route_late_;
+            const auto tw = std::chrono::steady_clock::now();
+            do {
+                if (ms_since(tw) > 1000.0)
+                    throw std::runtime_error("open_qwen36: layer " + std::to_string(layer) + " at position " +
+                                             std::to_string(pos_) + ": xm never landed (1 s after the mixer completed)");
+                read_back(act, hid * 2, R.xm_off);
+            } while (armed());
+        }
+    }
+    std::vector<float> xm(hid);
+    for (size_t i = 0; i < hid; ++i) {
+        const uint32_t u = static_cast<uint32_t>(xb[i]) << 16;
+        std::memcpy(&xm[i], &u, 4);
+    }
+    // logits = Wr @ xm, then the gate
+    const float* W = router_w_[layer].data();
+    std::vector<double> p(E), sel(E);
+    // f32 with 16 independent partial sums, so the loop vectorizes without -ffast-math
+    // (one double accumulator was 0.11 ms a layer, 4 ms of a 40-layer step)
+    for (size_t e = 0; e < E; ++e) {
+        const float* r = W + e * hid;
+        float acc[16] = {};
+        size_t i = 0;
+        for (; i + 16 <= hid; i += 16)
+            for (size_t j = 0; j < 16; ++j) acc[j] += r[i + j] * xm[i + j];
+        double sum = 0;
+        for (; i < hid; ++i) sum += static_cast<double>(r[i]) * xm[i];
+        for (size_t j = 0; j < 16; ++j) sum += acc[j];
+        p[e] = sum;
+    }
+    if (R.gating == "sigmoid") {
+        for (size_t e = 0; e < E; ++e) p[e] = 1.0 / (1.0 + std::exp(-p[e]));
+    } else {
+        double mx = p[0], sum = 0;
+        for (size_t e = 1; e < E; ++e) mx = std::max(mx, p[e]);
+        for (size_t e = 0; e < E; ++e) sum += (p[e] = std::exp(p[e] - mx));
+        for (size_t e = 0; e < E; ++e) p[e] /= sum;
+    }
+    // the bias steers the choice only; the weights are the unbiased gate values
+    const std::vector<float>& b = router_b_[layer];
+    for (size_t e = 0; e < E; ++e) sel[e] = p[e] + (b.empty() ? 0.0 : b[e]);
+    uint32_t idx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    std::vector<bool> used(E, false);
+    for (size_t s = 0; s < K; ++s) {
+        size_t best = E;
+        for (size_t e = 0; e < E; ++e)
+            if (!used[e] && (best == E || sel[e] > sel[best])) best = e;   // lowest index on a tie
+        used[best] = true;
+        idx[s] = static_cast<uint32_t>(best);
+    }
+    double sum = 0;
+    float wt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (size_t s = 0; s < K; ++s) sum += p[idx[s]];
+    for (size_t s = 0; s < K; ++s)
+        wt[s] = static_cast<float>((R.norm_topk ? p[idx[s]] / (sum + R.norm_eps) : p[idx[s]]) * R.scale);
+    uint8_t* rec = act.map<uint8_t*>() + act_off;
+    std::memcpy(rec + R.idx_off, idx, sizeof idx);
+    std::memcpy(rec + R.weights_off, wt, 4 * K);
+    const size_t lo = std::min(R.idx_off, R.weights_off), hi = std::max(R.idx_off + 32, R.weights_off + 4 * K);
+    act.sync(XCL_BO_SYNC_BO_TO_DEVICE, hi - lo, act_off + lo);
+    if (route_log_on_) {
+        const size_t n = w_->rout_idx_off + 64;
+        const uint8_t* m = act.map<uint8_t*>() + act_off;
+        route_log_.push_back({layer, std::vector<uint8_t>(m, m + n)});
+    }
+    stream_patch::moe2_apply(k.iw(), k.moe2, idx, w_->moe);
+    k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    timing_.route_ms += ms_since(t0);
+}
+
 void Core::arm_route_records() {
     // Every router record's idx slot -> the sentinel, so route() can tell a record this step's
     // dispatch wrote from one it has not landed yet. Called with nothing outstanding; the
@@ -1735,6 +1864,14 @@ void Core::arm_route_records() {
     for (int l = 0; l < nl_; ++l)
         for (const Step& s : types_[l]->program) {
             if (s.op == "run") continue;
+            if (s.op == "hostroute") {
+                // the host router reads xm, which the mixer dispatch writes: every bf16 of it
+                // -> 0xFFFF (a NaN no RMSNorm output is), so host_route() can tell a stale read
+                uint16_t* x = reinterpret_cast<uint16_t*>(act_[l].map<uint8_t*>() + w_->router.xm_off);
+                for (size_t i = 0; i < w_->hidden; ++i) x[i] = 0xFFFF;
+                act_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE, w_->hidden * 2, w_->router.xm_off);
+                continue;
+            }
             const size_t off = s.act_off + w_->rout_idx_off;
             uint32_t* p = reinterpret_cast<uint32_t*>(act_[l].map<uint8_t*>() + off);
             for (int i = 0; i < 8; ++i) p[i] = kRouteSentinel;
@@ -1887,7 +2024,7 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
                     (nrun++ == 0 ? timing_.part0_ms : timing_.part1_ms) += ms;
                     timing_.dispatch_ms += ms;
                 } else {
-                    route(k, l, s.act_off);
+                    route_op(s, l);
                 }
             }
             if (deepstack && l < n_deepstack) {
@@ -1940,7 +2077,7 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
                     timing_.part1_ms += ms;
                     timing_.dispatch_ms += ms;
                 } else {
-                    route(kerns_.at(s.kernel), l, s.act_off);
+                    route_op(s, l);
                 }
             }
             tail_in = start_run(kerns_.at(prog.back().kernel), prog.back().args, l);

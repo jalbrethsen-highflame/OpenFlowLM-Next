@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import dataclasses
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
 
@@ -80,6 +81,9 @@ class ModelSpec:
     experts_per_tok: int = 0
     moe_intermediate: int = 0
     shared_expert_intermediate: int = 0   # 0 = no shared expert
+    # LFM2-MoE: the first `num_dense_layers` layers carry the dense FFN (`intermediate`),
+    # the rest the routed experts. 0 on every other family (and then not serialised).
+    num_dense_layers: int = 0
     norm_eps: float = 1e-6
     # K2's GroupRMSNorm: one RMS per contiguous hidden/`norm_groups` span (K2: 2 halves of
     # 1280). 1 is every other family's single RMS over the whole width. NOT a family property:
@@ -229,6 +233,8 @@ class ModelSpec:
         d["quant"] = self.canonical_quant()
         if d["norm_groups"] == 1:
             del d["norm_groups"]   # what every shipped spec serialised before the field existed
+        if d["num_dense_layers"] == 0:
+            del d["num_dense_layers"]   # the same: only LFM2-MoE carries it
         return d
 
     def to_json(self) -> str:
@@ -656,6 +662,29 @@ def _lfm2_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
         extra={"model_type": cfg["model_type"], "source": "hf_config"},
     )
 
+
+
+def _lfm2moe_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
+    """LFM2-MoE (LFM2-8B-A1B, LFM2.5-24B-A2B): LFM2's short-conv / attention hybrid with
+    the FFN replaced by routed experts after the first `num_dense_layers` layers. The
+    router is a sigmoid with an expert bias that only steers the selection (DeepSeek-V3
+    style) -- that runs on the host, so ModelSpec carries only the shapes; the routing
+    constants are checked through `hf_config_check`."""
+    base = _lfm2_hf({**cfg, "intermediate_size": _need(cfg, "intermediate_size"),
+                     "block_auto_adjust_ff_dim": False,
+                     "rope_theta": cfg.get("rope_theta",
+                                           (cfg.get("rope_parameters") or {}).get("rope_theta"))},
+                    real_vocab)
+    ne = int(_need(cfg, "num_experts"))
+    return dataclasses.replace(
+        base,
+        family="lfm2moe",
+        num_experts=ne,
+        experts_per_tok=int(_need(cfg, "num_experts_per_tok")),
+        moe_intermediate=int(_need(cfg, "moe_intermediate_size")),
+        num_dense_layers=int(cfg.get("num_dense_layers", 0)),
+        extra={"model_type": cfg["model_type"], "source": "hf_config"},
+    )
 
 
 # GPT-OSS's own layer-type names. `full_attention` here means a plain dense layer, NOT the
@@ -1458,7 +1487,7 @@ HF_FAMILIES = {"qwen3_5_moe": _qwen36moe_hf, "qwen3_5_moe_text": _qwen36moe_hf,
                "qwen3_vl_text": _qwen3vl_hf, "qwen2": _qwen2_hf, "llama": _llama3_hf,
                "qwen2_5_vl": _qwen25vl_hf, "qwen2_5_vl_text": _qwen25vl_hf,
                "gemma3_text": _gemma3_hf, "gemma3": _gemma3_hf, "hunyuan_v1_dense": _hunyuan_hf,
-               "granite": _granite_hf, "phi3": _phi3_hf, "lfm2": _lfm2_hf,
+               "granite": _granite_hf, "phi3": _phi3_hf, "lfm2": _lfm2_hf, "lfm2_moe": _lfm2moe_hf,
                "gpt_oss": _gptoss_hf, "k2_horizon": _k2_hf}
 GGUF_FAMILIES = {"qwen35moe": _qwen36moe_gguf, "qwen3next": _qwen36moe_gguf, "qwen35": _qwen35_gguf, "qwen3": _qwen3_gguf, "llama": _llama3_gguf,
                  "gemma3": _gemma3_gguf, "hunyuan-dense": _hunyuan_gguf, "granite": _granite_gguf}
@@ -1469,7 +1498,7 @@ _FAMILY_OF = {_qwen36moe_hf: "qwen36moe", _qwen36moe_gguf: "qwen36moe", _qwen35_
               _llama3_hf: "llama3", _llama3_gguf: "llama3", _gemma3_hf: "gemma3", _gemma3_gguf: "gemma3",
               _hunyuan_hf: "hunyuan", _hunyuan_gguf: "hunyuan",
               _granite_hf: "granite", _granite_gguf: "granite", _phi3_hf: "phi3",
-              _lfm2_hf: "lfm2", _gptoss_hf: "gptoss", _k2_hf: "k2"}
+              _lfm2_hf: "lfm2", _lfm2moe_hf: "lfm2moe", _gptoss_hf: "gptoss", _k2_hf: "k2"}
 
 
 def hf_model_types(family: str) -> list[str]:
@@ -1506,6 +1535,10 @@ ROLE_TENSORS: dict[str, dict[str, str]] = {
 ROLE_TENSORS["lfm2"] = {**_ATTN_HF, **_FFN_HF,
                         "shortconv.in_proj.weight": "linear",
                         "shortconv.out_proj.weight": "linear_out"}
+# LFM2-MoE: LFM2's mixer roles, the dense layers' FFN, and the routed experts under the
+# GGUF names (the only container this family is built for: GGUF-direct).
+ROLE_TENSORS["lfm2moe"] = {**ROLE_TENSORS["lfm2"], "ffn_up_exps.weight": "experts",
+                           "ffn_gate_exps.weight": "experts", "ffn_down_exps.weight": "experts"}
 for _f in ("qwen3", "llama3", "gemma3", "hunyuan", "granite", "phi3", "qwen2", "k2"):
     ROLE_TENSORS[_f] = {**_ATTN_HF, **_FFN_HF}
 # GPT-OSS's routed experts, under the names q4nx-build writes them

@@ -96,6 +96,14 @@ def main() -> int:
         ids = tk.encode(prompt, add_special_tokens=False).ids
         IM_END, = ids_of("<|end_of_text|>")
         EOT = IM_END
+    elif tk.token_to_id("<|startoftext|>") is not None and tk.token_to_id("<|im_start|>") is not None:
+        # LFM2 / LFM2.5 (chat_template.jinja): <|startoftext|> then ChatML. The thinking
+        # models' template opens the reasoning block itself (add_generation_prompt ends
+        # "<|im_start|>assistant\n<think>"), so that is what is sent when the vocab has it.
+        think = "<think>" if tk.token_to_id("<think>") is not None else ""
+        prompt = f"<|startoftext|><|im_start|>user\n{a.message}<|im_end|>\n<|im_start|>assistant\n{think}"
+        ids = tk.encode(prompt, add_special_tokens=False).ids
+        IM_END, EOT = ids_of("<|im_end|>", "<|endoftext|>")
     elif tk.token_to_id("<|im_start|>") == 166100:
         # Nanbeige 4.1: ChatML, and its template leaves the reasoning to the model (it
         # opens its own <think> block), so no think tags are injected

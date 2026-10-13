@@ -71,6 +71,10 @@ ELN, E_A = L.ELN, L.E_A
 CALL_BYTES = G.CALL_BYTES
 OS = ["-Os"]
 STOP = int(os.environ.get("DX_STOP", 99))     # debug: 1 = after q/k/v, 2 = after attention, 3 = after the o proj + norm
+# DX_MIX=1: the attention block alone -- through the o projection, then res = x + out and
+# xm = post_attn_norm(res) into act, and nothing after. LFM2-MoE's attention layers end
+# there; the routed experts run as their own dispatch (designs/lfm2moe/ex.py).
+MIX = int(os.environ.get("DX_MIX", 0))
 assert not G.GATE, "dx.py: the Qwen3 dense recipe has no attention gate"
 
 # GGUF-direct pools (spec.quant == "q4_1_f32"): f32-scale chunks, the gemv
@@ -172,7 +176,7 @@ if SPEC.norm_groups != 1:                  # ln.h defaults it to 1; adding the f
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, stop: CompileTime[int] = 99,
-       srchash: CompileTime[int] = 0):
+       mix: CompileTime[int] = 0, srchash: CompileTime[int] = 0):
     elem = np.ndarray[(CALL_BYTES,), np.dtype[np.uint8]]
     x_ty = np.ndarray[(ELEM // 2,), np.dtype[bfloat16]]
     y_ty = np.ndarray[(BAND_ROWS,), np.dtype[np.float32]]
@@ -321,7 +325,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             f_prep(oe[i], tab, QW, i)
         role_bands(win, yout, tab, K, "attn", G.O_PC, QW, ms)
         xin.release(G.OG_ELEMS)
-        if stop == 2:
+        if stop == 2 or mix:
             return
         # up | gate per band against xm (K = HID), silu -> h band
         me = acq(xin, G.XM_ELEMS)
@@ -386,13 +390,13 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             if stop >= 3:                      # group 2 runs from the o projection on
                 post_norm(f_nr32)              # 2a. t = post_attn_norm(out)
                 add_norm(True)                 # 2b. res = x + t; xm = pre_ffn_norm(res)
-            if stop >= 99:                     # group 3 only in the full layer
+            if stop >= 99 and not mix:         # group 3 only in the full layer
                 post_norm(f_nr32)              # 3a. t2 = post_ffn_norm(out2)
                 add_norm(False)                # 3b. xres = res + t2
         else:
             if stop >= 3:                      # group 2 runs from the o projection on
                 add_norm(True)                 # 2. res = x + out; xm = post_attn_norm(res)
-            if stop >= 99:                     # group 3 only in the full layer
+            if stop >= 99 and not mix:         # group 3 only in the full layer
                 add_norm(True)                 # 3. xres = res + out2 (the xn is junk)
 
     def _attn(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
@@ -620,6 +624,12 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             py.finish()                                           # out is in DDR
             lni.fill(a_act, tap=bt(L.AD_BYTES, L.AD_OUT, HID * 4), wait=True, group=tg_ln2)
         tg_ln2.finish()                                           # res, xm are in DDR
+        if mix:
+            # the attention block alone: res and xm are in DDR, the FFN is another dispatch's
+            pw.finish()
+            pa_in.finish()
+            tg_x.finish()
+            return
         # 6. up | gate per band, silu -> h
         x_prod.fill(a_act, tap=bt(L.AD_BYTES, L.AD_XM, G.XM_ELEMS * ELEM), wait=True, group=tg_x)
         # The drains first (a core blocks on a full y fifo after two bands), then the per-band
@@ -696,3 +706,6 @@ _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.rea
                    (GEMV / "gemv_tab.h").read_bytes(),
                    (HERE.parent.parent / "include" / "vecmath.h").read_bytes(), (HERE.parent.parent / "include" / "scalar_fp.h").read_bytes(), SPEC.spec_hash().encode()])
 SPECIALIZE = {"stop": STOP, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}
+if MIX:
+    # only when set, so every other family specializes exactly as it always did
+    SPECIALIZE["mix"] = MIX
