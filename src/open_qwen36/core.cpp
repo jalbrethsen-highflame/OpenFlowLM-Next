@@ -15,6 +15,9 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <exception>
+#include <condition_variable>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 
@@ -468,6 +471,7 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (const char* env = std::getenv("OFLM_OPEN_LAYER_MAJOR")) layer_major_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_STAGE_MAJOR")) stage_major_on_ = std::string(env) != "0";
     dit_on_ = !man_.gemm_dit.is_null();
+    if (const char* env = std::getenv("OFLM_OPEN_PIPE")) pipe_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_GEMM_DIT"); env && std::string(env) == "0") dit_on_ = false;
     if (dit_on_ && !stage_major_on_)
         throw std::runtime_error("open_qwen36: the dit GEMMs run only stage-major (OFLM_OPEN_GEMM_DIT=0 for the block-major schedule)");
@@ -3184,6 +3188,10 @@ void Core::step_block_moe(const std::vector<int>& ids, size_t t_real, bool want_
 // slot, so the result is bit-for-bit the block-major one.
 void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
     apply_thread_budget();
+    if (pipe_ok()) {
+        step_prompt_pipe(ids, want_logits);
+        return;
+    }
     if (!layer_major_ok()) throw std::runtime_error("open_qwen36: step_gemm_prompt on a kernel set without a MoE block route");
     if (ids.empty()) throw std::runtime_error("open_qwen36: step_gemm_prompt with no tokens");
     auto t0 = std::chrono::steady_clock::now();
@@ -3227,6 +3235,278 @@ void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
         }
     if (want_logits) tail_logits(xres.data() + (N - 1) * hid);
     timing_.total_ms = ms_since(t0);
+}
+
+// ============================================================================
+// The Qwen3.5 dense prompt as a pipeline (dit GEMMs). Cell (l, c) = layer l over prompt
+// chunk c (M = gemm_dit.m tokens). Its stages, alternating host (H) and NPU (N):
+//   0 H  pre-norm -> bf16 A                       (needs (l - 1, c) finished)
+//   1 N  qkv (+z / +gate) GEMM
+//   2 H  DeltaNet or attention for the chunk      (needs (l, c - 1) past stage 2: S / K V chain)
+//        -> og bf16
+//   3 N  out GEMM
+//   4 H  residual + post-norm -> bf16 A
+//   5 N  FFN: up|gate with the SwiGLU epilogue, then down reading it gathered
+//   6 H  residual
+// An NPU thread takes the lowest ready (l, c) N stage, this thread the lowest ready H stage
+// (its OpenMP team does the work), so the NPU computes later chunks and the next layer while
+// the host runs a chunk's DeltaNet. Each chunk has its own device buffers; H (the FFN's
+// gathered middle) is the NPU thread's alone.
+// ============================================================================
+bool Core::pipe_ok() const {
+    if (!dit_on_ || !pipe_on_ || !man_.gemm_dit.contains("ffn") || !gemm_block_t_) return false;
+    for (int l = 0; l < nl_; ++l) {
+        const GemmBlockProgram& gb = types_[l]->gemm_block;
+        if ((gb.kind != "linear" && gb.kind != "full") || !gb.has_dense_ffn() || gb.program.size() < 2 ||
+            gb.ffn_program.size() < 2)
+            return false;
+    }
+    return true;
+}
+
+void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
+    auto t0 = std::chrono::steady_clock::now();
+    timing_ = StepTiming{};
+    const auto& D = man_.gemm_dit;
+    const size_t M = D["m"].get<size_t>(), hid = man_.hidden, N = ids.size();
+    const size_t C = (N + M - 1) / M, TOT = C * M, L = static_cast<size_t>(nl_);
+    if (static_cast<size_t>(pos_) + N > cfg_.max_ctx)
+        throw std::runtime_error("open_qwen36: prompt of " + std::to_string(N) + " at position " + std::to_string(pos_) +
+                                 " is past the context capacity of " + std::to_string(cfg_.max_ctx));
+    const size_t pos0 = static_cast<size_t>(pos_);
+    const size_t ff = D["ffn"]["ff"].get<size_t>();
+    // widths
+    size_t wq = 0, wmid = 0;
+    for (int l = 0; l < nl_; ++l) {
+        const GemmBlockProgram& gb = types_[l]->gemm_block;
+        const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
+        wq = std::max(wq, nq);
+        wmid = std::max(wmid, gb.kind == "linear" ? gb.vw : gb.qw);
+    }
+    // per chunk device buffers (named globals, so start_run binds them), kept across requests
+    auto need = [&](const std::string& name, size_t bytes) {
+        auto it = globals_.find(name);
+        if (it == globals_.end() || it->second.size() < bytes) globals_[name] = alloc(bytes);
+    };
+    for (size_t c = 0; c < C; ++c) {
+        need("pp_a_" + std::to_string(c), M * hid * 2);
+        need("pp_m_" + std::to_string(c), M * wmid * 2);
+        need("pp_q_" + std::to_string(c), M * wq * 2);
+        need("pp_y_" + std::to_string(c), M * hid * 2);
+    }
+    need("pp_h", M * 2 * ff * 2);
+    // host rows
+    std::vector<float> xres(TOT * hid), res(TOT * hid), xn(TOT * hid);
+    for (size_t t = 0; t < TOT; ++t)
+        file_->bf16_row(w_->embed_tensor, static_cast<size_t>(ids[std::min(t, N - 1)]), hid, xres.data() + t * hid);
+    timing_.setup_ms += ms_since(t0);
+
+    auto kname = [&](size_t n, size_t k) { return D["kernels"][std::to_string(n) + "x" + std::to_string(k)].get<std::string>(); };
+    std::vector<int> stage(L * C, 0), busy(L * C, 0);
+    std::mutex mu;
+    std::condition_variable cv;
+    size_t finished = 0;
+    std::exception_ptr err;
+    auto cell = [&](size_t l, size_t c) { return l * C + c; };
+    auto ready = [&](size_t l, size_t c, bool npu) {
+        const int s = stage[cell(l, c)];
+        if (busy[cell(l, c)] || s >= 7 || ((s & 1) != 0) != npu) return false;
+        if (s == 0) return l == 0 || stage[cell(l - 1, c)] >= 7;
+        if (s == 2) return c == 0 || stage[cell(l, c - 1)] >= 3;
+        return true;
+    };
+    auto pick = [&](bool npu, size_t& ol, size_t& oc) {
+        for (size_t l = 0; l < L; ++l)
+            for (size_t c = 0; c < C; ++c)
+                if (ready(l, c, npu)) { ol = l; oc = c; return true; }
+        return false;
+    };
+    double npu_busy_ms = 0, npu_idle_ms = 0, host_idle_ms = 0;
+    double hst[7] = {0, 0, 0, 0, 0, 0, 0};
+
+    // ---- the NPU thread
+    std::thread npu([&] {
+        try {
+            for (;;) {
+                size_t l = 0, c = 0;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    auto ti = std::chrono::steady_clock::now();
+                    cv.wait(lk, [&] { return err || finished == L * C || pick(true, l, c); });
+                    npu_idle_ms += ms_since(ti);
+                    if (err || finished == L * C) return;
+                    busy[cell(l, c)] = 1;
+                }
+                const int s = stage[cell(l, c)];
+                const GemmBlockProgram& gb = types_[l]->gemm_block;
+                const std::string cs = std::to_string(c);
+                auto tb = std::chrono::steady_clock::now();
+                auto run = [&](const std::string& k, const std::vector<std::string>& args) {
+                    Inflight f = start_run(kerns_.at(k), args, static_cast<int>(l));
+                    wait_run(f);
+                };
+                if (s == 1) {
+                    const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
+                    run(kname(nq, hid), {"pp_a_" + cs, gb.program[0].args[0], "pp_q_" + cs});
+                } else if (s == 3) {
+                    run(kname(hid, gb.kind == "linear" ? gb.vw : gb.qw), {"pp_m_" + cs, gb.program[1].args[0], "pp_y_" + cs});
+                } else {
+                    run(D["ffn"]["up"].get<std::string>(), {"pp_a_" + cs, gb.ffn_program[0].args[0], "pp_h"});
+                    run(D["ffn"]["down"].get<std::string>(), {"pp_h", gb.ffn_program[1].args[0], "pp_y_" + cs});
+                }
+                npu_busy_ms += ms_since(tb);
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    busy[cell(l, c)] = 0;
+                    ++stage[cell(l, c)];
+                }
+                cv.notify_all();
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lk(mu);
+            if (!err) err = std::current_exception();
+            cv.notify_all();
+        }
+    });
+
+    // ---- the host stages, here
+    auto to_bf16 = [&](const float* src, size_t rows, size_t w, const std::string& buf) {
+        xrt::bo& b = buffer(buf, 0);
+        uint16_t* d = b.map<uint16_t*>();
+#pragma omp parallel for
+        for (long long i = 0; i < static_cast<long long>(rows * w); ++i) d[i] = f32_to_bf16(src[i]);
+        b.sync(XCL_BO_SYNC_BO_TO_DEVICE, rows * w * 2, 0);
+    };
+    std::vector<float> ya, yb, yc, yd, og;
+    try {
+        for (;;) {
+            size_t l = 0, c = 0;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                auto ti = std::chrono::steady_clock::now();
+                cv.wait(lk, [&] { return err || finished == L * C || pick(false, l, c); });
+                host_idle_ms += ms_since(ti);
+                if (err) std::rethrow_exception(err);
+                if (finished == L * C) break;
+                busy[cell(l, c)] = 1;
+            }
+            const int s = stage[cell(l, c)];
+            const LayerType& lt = *types_[l];
+            const GemmBlockProgram& gb = lt.gemm_block;
+            const HostConsts& hc = hc_[l];
+            const std::string cs = std::to_string(c);
+            const size_t r0 = c * M, t_real = std::min(M, N - std::min(N, r0));
+            float* xr = xres.data() + r0 * hid;
+            float* rs = res.data() + r0 * hid;
+            float* xc = xn.data() + r0 * hid;
+            auto th = std::chrono::steady_clock::now();
+            if (s == 0) {
+                host::rmsnorm_rows(xr, M, hid, hc.ln.data(), gb.eps, xc);
+                to_bf16(xc, M, hid, "pp_a_" + cs);
+            } else if (s == 2) {
+                xrt::bo& qb = buffer("pp_q_" + cs, 0);
+                const bool lin = gb.kind == "linear";
+                const size_t nq = lin ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
+                read_back(qb, M * nq * 2, 0);
+                const uint16_t* q16 = qb.map<const uint16_t*>();
+                xrt::bo& st = state_[l];
+                uint8_t* sp = st.map<uint8_t*>();
+                if (lin) {
+                    const size_t nch = gb.qkv_dim, vw = gb.vw;
+                    if (c == 0) read_back(st, lt.state_bytes, 0);
+                    ya.resize(M * nch);
+                    yb.resize(M * vw);
+                    og.resize(M * vw);
+#pragma omp parallel for
+                    for (long long t = 0; t < static_cast<long long>(M); ++t) {
+                        for (size_t i = 0; i < nch; ++i) ya[t * nch + i] = bf16_to_f32(q16[t * nq + i]);
+                        for (size_t i = 0; i < vw; ++i) yb[t * vw + i] = bf16_to_f32(q16[t * nq + nch + i]);
+                    }
+                    host::DeltaGeom g;
+                    g.T = M; g.hid = hid;
+                    g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
+                    g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
+                    g.t_real = t_real;
+                    double ph[2] = {0, 0};
+                    host::deltanet_block(g, ya.data(), yb.data(), xc, hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
+                                         hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
+                                         reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
+                    timing_.dn_conv_ms += ph[0];
+                    timing_.dn_rule_ms += ph[1];
+                    if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
+                    to_bf16(og.data(), M, vw, "pp_m_" + cs);
+                } else {
+                    const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
+                    if (c == 0 && pos0 > 0) read_back(st, pos0 * row, 0);
+                    ya.resize(M * qw); yb.resize(M * kvw); yc.resize(M * kvw); yd.resize(M * qw); og.resize(M * qw);
+#pragma omp parallel for
+                    for (long long t = 0; t < static_cast<long long>(M); ++t) {
+                        const uint16_t* r = q16 + t * nq;
+                        for (size_t i = 0; i < qw; ++i) ya[t * qw + i] = bf16_to_f32(r[i]);
+                        for (size_t i = 0; i < kvw; ++i) yb[t * kvw + i] = bf16_to_f32(r[qw + i]);
+                        for (size_t i = 0; i < kvw; ++i) yc[t * kvw + i] = bf16_to_f32(r[qw + kvw + i]);
+                        for (size_t i = 0; i < qw; ++i) yd[t * qw + i] = bf16_to_f32(r[qw + 2 * kvw + i]);
+                    }
+                    host::AttnGeom g;
+                    g.T = M; g.t_real = t_real; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
+                    g.pos0 = pos0 + r0; g.eps = gb.eps;
+                    auto ta = std::chrono::steady_clock::now();
+                    host::attention_block(g, ya.data(), yb.data(), yc.data(), yd.data(), hc.qn.data(), hc.kn.data(),
+                                          man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
+                    timing_.attn_ms += ms_since(ta);
+                    if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, N * row, pos0 * row);
+                    to_bf16(og.data(), M, qw, "pp_m_" + cs);
+                }
+            } else if (s == 4) {
+                xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
+                read_back(yb2, M * hid * 2, 0);
+                const uint16_t* y16 = yb2.map<const uint16_t*>();
+#pragma omp parallel for
+                for (long long i = 0; i < static_cast<long long>(M * hid); ++i) rs[i] = xr[i] + bf16_to_f32(y16[i]);
+                host::rmsnorm_rows(rs, M, hid, hc.postln.data(), gb.eps, xc);
+                to_bf16(xc, M, hid, "pp_a_" + cs);
+            } else {
+                xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
+                read_back(yb2, M * hid * 2, 0);
+                const uint16_t* y16 = yb2.map<const uint16_t*>();
+#pragma omp parallel for
+                for (long long i = 0; i < static_cast<long long>(M * hid); ++i) xr[i] = rs[i] += bf16_to_f32(y16[i]);
+            }
+            hst[s] += ms_since(th);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                busy[cell(l, c)] = 0;
+                if (++stage[cell(l, c)] >= 7) ++finished;
+            }
+            cv.notify_all();
+        }
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            if (!err) err = std::current_exception();
+        }
+        cv.notify_all();
+        npu.join();
+        throw;
+    }
+    npu.join();
+    if (err) std::rethrow_exception(err);
+    pos_ += static_cast<int>(N);
+    block_logits_.clear();
+    if (block_logits_all_)
+        for (size_t t = 0; t < N; ++t) {
+            tail_logits(xres.data() + t * hid);
+            block_logits_.push_back(logits_host_);
+        }
+    if (want_logits) tail_logits(xres.data() + (N - 1) * hid);
+    timing_.total_ms = ms_since(t0);
+    timing_.part0_ms = npu_busy_ms;
+    timing_.part1_ms = hst[0] + hst[2] + hst[4] + hst[6];
+    timing_.mid_ms = hst[2];
+    std::fprintf(stderr, "open_qwen36: pipe %zu tokens (%zu chunks of %zu, %zu layers): %.0f ms | NPU busy %.0f idle %.0f | host "
+                         "pre %.0f mid %.0f (dn conv %.0f rule %.0f attn %.0f) tail %.0f res %.0f idle %.0f\n",
+                 N, C, M, L, timing_.total_ms, npu_busy_ms, npu_idle_ms, hst[0], hst[2], timing_.dn_conv_ms,
+                 timing_.dn_rule_ms, timing_.attn_ms, hst[4], hst[6], host_idle_ms);
 }
 
 void Core::moe_token(int l, const float* xm, const float* res, const float* probs, const int32_t* idx, const float* w,
