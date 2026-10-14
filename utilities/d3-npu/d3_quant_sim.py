@@ -71,6 +71,20 @@ def quant_w_po2(w: torch.Tensor, group: int, bits: int = 4) -> torch.Tensor:
     return (torch.round(g / s).clamp(lo, hi) * s).reshape(o, k)
 
 
+def quant_w_po2m(w: torch.Tensor, group: int, bits: int = 4) -> torch.Tensor:
+    """quant_w_po2, but each group takes the scale or half of it, whichever gives the lower squared
+    error once the mantissas clip to the int range (pack_b4 / dit_encode_b4)."""
+    lo, hi = -2 ** (bits - 1), 2 ** (bits - 1) - 1
+    o, k = w.shape
+    g = w.reshape(o, k // group, group)
+    m = g.abs().amax(-1, keepdim=True).clamp_min(1e-30)
+    s = torch.exp2(torch.ceil(torch.log2(m / hi)))
+    q0 = torch.round(g / s).clamp(lo, hi) * s
+    q1 = torch.round(g / (s / 2)).clamp(lo, hi) * (s / 2)
+    take = ((q1 - g) ** 2).sum(-1, keepdim=True) < ((q0 - g) ** 2).sum(-1, keepdim=True)
+    return torch.where(take, q1, q0).reshape(o, k)
+
+
 def quant_w_po2c(w: torch.Tensor, group: int, bits: int = 4, grid: int = 16) -> torch.Tensor:
     """quant_w_po2 under a float scale per output row (the GEMM output's column, applied after it):
     the row is divided by c in [1, 2) before the power-of-two grouping, c chosen from `grid`
@@ -100,7 +114,7 @@ class QLinear(torch.nn.Module):
         super().__init__()
         w = rotate(lin.weight.float(), H)
         if w_q:
-            w = quant_w(w, group) if wfmt == "int4" else quant_w_po2(w, group) if wfmt == "po2" else quant_w_po2c(w, group)
+            w = {"int4": quant_w, "po2": quant_w_po2, "po2m": quant_w_po2m, "po2c": quant_w_po2c}[wfmt](w, group)
         self.weight = torch.nn.Parameter(w.to(torch.bfloat16), requires_grad=False)
         self.bias = lin.bias
         self.H, self.a_q = H, a_q
@@ -123,8 +137,8 @@ def main() -> int:
     ap.add_argument("--rot", type=int, default=0, help="block Hadamard size along K (0 = no rotation)")
     ap.add_argument("--group", type=int, default=128, help="int4 weight scale group along K")
     ap.add_argument("--w-only", action="store_true")
-    ap.add_argument("--wfmt", default="int4", choices=("int4", "po2", "po2c"),
-                    help="int4: float scale per group; po2: power-of-two scale per group (bfp-style, NPU-native)")
+    ap.add_argument("--wfmt", default="int4", choices=("int4", "po2", "po2m", "po2c"),
+                    help="int4: float scale per group; po2: power-of-two scale per group (bfp-style, NPU-native); po2m: po2 with the lower-error of two scales")
     ap.add_argument("--a-only", action="store_true")
     ap.add_argument("--threads", type=int, default=16)
     a = ap.parse_args()
