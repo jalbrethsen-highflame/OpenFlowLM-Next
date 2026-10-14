@@ -413,20 +413,40 @@ int main(int argc, char** argv) {
             std::printf("READY\n");
             std::fflush(stdout);
             std::string line;
+            // Several prompts on one line, separated by ';', run packed in one pass (each with its
+            // own positions, state and attention) and get one "X" line each, in order.
             while (std::getline(std::cin, line)) {
-                std::vector<int> ids = parse_ids(line);
+                std::vector<int> ids;
+                std::vector<size_t> starts;
+                for (size_t a = 0; a <= line.size();) {
+                    const size_t b = std::min(line.find(';', a), line.size());
+                    std::vector<int> part = parse_ids(line.substr(a, b - a));
+                    if (!part.empty()) {
+                        starts.push_back(ids.size());
+                        ids.insert(ids.end(), part.begin(), part.end());
+                    }
+                    a = b + 1;
+                }
                 if (ids.empty()) continue;
                 try {
                     auto tq = std::chrono::steady_clock::now();
                     core.reset();
+                    if (starts.size() > 1) core.set_segments(starts);
                     core.step_gemm_prompt(ids, false);
-                    const auto& x = core.last_x();
-                    std::string out = "X";
+                    std::string out;
                     char b[32];
-                    for (float v : x) { std::snprintf(b, sizeof b, " %.9g", v); out += b; }
-                    std::printf("%s\n", out.c_str());
+                    auto put = [&](const std::vector<float>& x) {
+                        out += "X";
+                        for (float v : x) { std::snprintf(b, sizeof b, " %.9g", v); out += b; }
+                        out += "\n";
+                    };
+                    if (starts.size() > 1)
+                        for (const auto& x : core.seg_x()) put(x);
+                    else
+                        put(core.last_x());
+                    std::fputs(out.c_str(), stdout);
                     std::fflush(stdout);
-                    std::fprintf(stderr, "decision %zu tokens: %.0f ms\n", ids.size(),
+                    std::fprintf(stderr, "decision %zu tokens (%zu prompts): %.0f ms\n", ids.size(), starts.size(),
                                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq).count());
                 } catch (const std::exception& e) {
                     std::printf("E %s\n", e.what());

@@ -12,6 +12,7 @@
 #include <immintrin.h>
 #include <omp.h>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -478,6 +479,12 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
     // every token's work is independent: row r of token t's window is qkv row t - pre + r,
     // and the carried state stands in where that runs before the block.
     const size_t pre = g.taps - 1;
+    // packed prompts: row t's sequence starts at seg0[t]; window rows before it read as zero
+    // (LLONG_MIN: the sequence began before the block, the carried rows are its own)
+    std::vector<long long> seg0(R, LLONG_MIN);
+    if (g.reset)
+        for (size_t t = 0; t < R; ++t)
+            seg0[t] = g.reset[t] ? static_cast<long long>(t) : t ? seg0[t - 1] : LLONG_MIN;
     std::vector<float> carry(pre * nch);
     for (size_t r = 0; r < pre; ++r)
         for (size_t j = 0; j < nch; ++j) carry[r * nch + j] = bf16_to_f32(conv_state[r * nch + j]);
@@ -503,6 +510,7 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
             for (size_t r = 0; r < g.taps; ++r) {
                 const long long s = tt - static_cast<long long>(pre) + static_cast<long long>(r);
                 const float* __restrict cw = convw + r * nch;
+                if (s < seg0[t]) continue;
                 if (s < 0) {
                     const float* __restrict v = carry.data() + (static_cast<size_t>(s) + pre) * nch;
                     for (size_t j = 0; j < nch; ++j) c[j] += cw[j] * v[j];
@@ -588,9 +596,12 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
     }
     // the window the next block starts from: the last `pre` rows, short blocks keeping what
     // the shift would have left in front of them
+    const long long last0 = R ? seg0[R - 1] : LLONG_MIN;   // the sequence the next block continues
     for (size_t r = 0; r < pre; ++r) {
         const long long s = static_cast<long long>(R) - static_cast<long long>(pre) + static_cast<long long>(r);
-        if (s < 0) {
+        if (s < last0) {
+            std::fill(conv_state + r * nch, conv_state + (r + 1) * nch, uint16_t{0});
+        } else if (s < 0) {
             std::copy(conv_state + (R + r) * nch, conv_state + (R + r + 1) * nch, conv_state + r * nch);
         } else {
             const float* row = qkv + static_cast<size_t>(s) * nch;
@@ -600,7 +611,15 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
 
     // ---- phase 2, per head over every token: the gated delta rule on S (in place), the gated norm
     const auto tp1 = std::chrono::steady_clock::now();
-    delta_rule_heads(g, R, grp, inv_sqrt, Q.data(), Kk.data(), V.data(), decay.data(), beta.data(), z, nw, S, og);
+    // one pass per packed sequence, S zeroed where one starts
+    for (size_t a = 0; a < R;) {
+        size_t b = a + 1;
+        while (b < R && !(g.reset && g.reset[b])) ++b;
+        if (g.reset && g.reset[a]) std::fill(S, S + g.value_heads * g.s_rows * dim, 0.f);
+        delta_rule_heads(g, b - a, grp, inv_sqrt, Q.data() + a * key_w, Kk.data() + a * key_w, V.data() + a * vw,
+                         decay.data() + a * g.value_heads, beta.data() + a * g.value_heads, z + a * vw, nw, S, og + a * vw);
+        a = b;
+    }
     if (phase_ms) {
         using ms = std::chrono::duration<double, std::milli>;
         const auto tp2 = std::chrono::steady_clock::now();
@@ -945,16 +964,16 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
     std::vector<float> kh(kvw);                 // once a thread, not once a token
 #pragma omp for
     for (long long tt = 0; tt < static_cast<long long>(R); ++tt) {
-        const size_t t = static_cast<size_t>(tt), p = g.pos0 + t;
+        const size_t t = static_cast<size_t>(tt), p = g.pos0 + t, rp = g.rpos ? g.rpos[t] : p;
         for (size_t h = 0; h < g.nh; ++h) {
             float* dst = Q + t * qw + h * g.hd;
             rms_vec(q + t * qw + h * g.hd, g.hd, qn, g.eps, dst);
-            rope(dst, half, inv_freq, static_cast<double>(p));
+            rope(dst, half, inv_freq, static_cast<double>(rp));
             for (size_t j = 0; j < g.hd; ++j) dst[j] *= scale;
         }
         for (size_t h = 0; h < g.kvh; ++h) {
             rms_vec(k + t * kvw + h * g.hd, g.hd, kn, g.eps, kh.data() + h * g.hd);
-            rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(p));
+            rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(rp));
         }
         for (size_t j = 0; j < kvw; ++j) {
             kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);

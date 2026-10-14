@@ -44,6 +44,9 @@ struct DeltaGeom {
     size_t lanes = 0;       ///< columns of the packed alpha / beta projection (the value heads, padded)
     size_t s_rows = 0;      ///< rows of one head's S in the state buffer (head_dim real, the rest zero)
     double eps = 1e-6;      ///< the gated norm's eps
+    /// packed prompts: reset[t] != 0 starts a new sequence at row t -- the conv window sees
+    /// zeros before it and S restarts from zero. nullptr: one sequence.
+    const uint8_t* reset = nullptr;
 };
 
 /// The linear-attention layer's middle over a block. qkv [T, 2*key_w + vw] and z [T, vw]
@@ -61,6 +64,9 @@ struct AttnGeom {
     size_t T = 0, t_real = 0, nh = 0, kvh = 0, hd = 0, rot = 0;
     size_t pos0 = 0;        ///< the block's first position (and KV row)
     double eps = 1e-6;      ///< the q / k norms' eps
+    /// packed prompts (attention_prep): row t's rope position, its KV row staying pos0 + t.
+    /// nullptr: position pos0 + t.
+    const size_t* rpos = nullptr;
 };
 
 /// The full-attention layer's middle over a block. q / gate [T, nh*hd], k / v [T, kvh*hd]

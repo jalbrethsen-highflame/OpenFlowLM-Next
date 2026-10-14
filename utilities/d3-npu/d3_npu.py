@@ -132,6 +132,18 @@ class Engine:
             raise RuntimeError(f"engine: {line.strip()}")
         return np.array(line[2:].split(), dtype=np.float32)
 
+    def last_x_many(self, seqs: list[list[int]]) -> list[np.ndarray]:
+        """Several prompts packed into one pass (each its own positions, state and attention)."""
+        self.p.stdin.write(";".join(",".join(map(str, ids)) for ids in seqs) + "\n")
+        self.p.stdin.flush()
+        out = []
+        for _ in seqs:
+            line = self.p.stdout.readline()
+            if not line.startswith("X "):
+                raise RuntimeError(f"engine: {line.strip()}")
+            out.append(np.array(line[2:].split(), dtype=np.float32))
+        return out
+
     def memory(self) -> str:
         """The engine's resident and peak memory (VmRSS / VmHWM)."""
         st = dict(l.split(":", 1) for l in Path(f"/proc/{self.p.pid}/status").read_text().splitlines() if ":" in l)
@@ -151,25 +163,39 @@ def main() -> int:
     ap.add_argument("--cases", type=Path, required=True, help='json list of {"id", "state", "question"}')
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--log", type=Path)
+    ap.add_argument("--pack", type=int, default=0,
+                    help="pack consecutive cases into one pass up to this many tokens (0: one case per pass)")
     a = ap.parse_args()
     cases = json.loads(a.cases.read_text())
     pr, ro = Prompter(a.src), Readout(a.src)
     seqs = [pr.ids(c["state"], c["question"]) for c in cases]
-    max_ctx = (max(len(s) for s in seqs) + 1023) // 1024 * 1024 + 512
+    longest = max(max(len(s) for s in seqs), a.pack)      # a packed pass is up to --pack tokens
+    max_ctx = (longest + 1023) // 1024 * 1024 + 512
     t0 = time.time()
     eng = Engine(a.cli, a.model, a.kernels, max_ctx, log=a.log)
     print(f"engine resident in {time.time() - t0:.0f} s", file=sys.stderr)
+    groups, cur = [], []
+    for i, ids in enumerate(seqs):          # greedy, in order, up to --pack tokens a pass
+        if cur and (not a.pack or sum(len(seqs[j]) for j in cur) + len(ids) > a.pack):
+            groups.append(cur)
+            cur = []
+        cur.append(i)
+    groups.append(cur)
     out = []
-    for c, ids in zip(cases, seqs):
+    for grp in groups:
         t1 = time.time()
-        lg = ro.logits(eng.last_x(ids))
-        keys = options(c["question"])[0]
-        p = ro.probs(lg, len(keys), pr.temperature)
-        ms = (time.time() - t1) * 1e3
-        out.append({"id": c["id"], "tokens": len(ids), "ms": round(ms), "keys": keys, "probs": p,
-                    "logits": lg[:len(keys)].tolist()})
-        best = keys[int(np.argmax(p))]
-        print(f"{c['id']:>14}  {len(ids):5d} tok  {ms:7.0f} ms  -> {best} ({max(p):.3f})", file=sys.stderr)
+        xs = [eng.last_x(seqs[grp[0]])] if len(grp) == 1 else eng.last_x_many([seqs[i] for i in grp])
+        ms = (time.time() - t1) * 1e3 / len(grp)      # the pass's time shared by its cases
+        for i, x in zip(grp, xs):
+            c, ids = cases[i], seqs[i]
+            lg = ro.logits(x)
+            keys = options(c["question"])[0]
+            p = ro.probs(lg, len(keys), pr.temperature)
+            out.append({"id": c["id"], "tokens": len(ids), "ms": round(ms), "keys": keys, "probs": p,
+                        "logits": lg[:len(keys)].tolist(), "pass": len(grp)})
+            best = keys[int(np.argmax(p))]
+            print(f"{c['id']:>14}  {len(ids):5d} tok  {ms:7.0f} ms  -> {best} ({max(p):.3f})  [{len(grp)} in pass]",
+                  file=sys.stderr)
     print(f"engine memory: {eng.memory()}", file=sys.stderr)
     eng.close()
     a.out.write_text(json.dumps(out, indent=1))

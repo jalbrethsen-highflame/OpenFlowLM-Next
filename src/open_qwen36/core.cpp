@@ -3454,6 +3454,7 @@ void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
         step_prompt_pipe(ids, want_logits);
         return;
     }
+    if (!segs_.empty()) throw std::runtime_error("open_qwen36: packed prompts need the prompt pipeline");
     if (!layer_major_ok()) throw std::runtime_error("open_qwen36: step_gemm_prompt on a kernel set without a MoE block route");
     if (ids.empty()) throw std::runtime_error("open_qwen36: step_gemm_prompt with no tokens");
     auto t0 = std::chrono::steady_clock::now();
@@ -3536,6 +3537,29 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         throw std::runtime_error("open_qwen36: prompt of " + std::to_string(N) + " at position " + std::to_string(pos_) +
                                  " is past the context capacity of " + std::to_string(cfg_.max_ctx));
     const size_t pos0 = static_cast<size_t>(pos_);
+    // packed prompts (set_segments): row flags where one starts (DeltaNet resets there) and
+    // each row's position inside its own prompt (rope); attention stays inside each prompt
+    std::vector<size_t> segs = std::move(segs_);
+    segs_.clear();
+    seg_x_.clear();
+    const bool packed = segs.size() > 1;
+    std::vector<uint8_t> rflag;
+    std::vector<size_t> rpos;
+    if (!segs.empty()) {
+        if (!noncausal_ || segs[0] != 0)
+            throw std::runtime_error("open_qwen36: packed prompts need noncausal mode and a first segment at row 0");
+        for (size_t i = 1; i < segs.size(); ++i)
+            if (segs[i] <= segs[i - 1] || segs[i] >= N) throw std::runtime_error("open_qwen36: packed prompt starts out of order");
+    }
+    if (packed) {
+        rflag.assign(TOT, 0);
+        rpos.resize(TOT);
+        for (size_t i = 0; i < segs.size(); ++i) {
+            const size_t a = segs[i], b = i + 1 < segs.size() ? segs[i + 1] : TOT;
+            rflag[a] = 1;
+            for (size_t t = a; t < b; ++t) rpos[t] = t - a;
+        }
+    }
     const size_t ff = D["ffn"]["ff"].get<size_t>();
     size_t wq = 0, wmid = 0;
     for (int l = 0; l < nl_; ++l) {
@@ -3563,7 +3587,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // the chunk, its valid_len sentinel patched to N; host attention below OFLM_OPEN_FA_NC_MIN
     // tokens or past the streams the set carries
     std::string nc_kernel;
-    if (noncausal_ && fa_on && D.contains("fa") && D["fa"].contains("nc")) {
+    if (noncausal_ && !packed && fa_on && D.contains("fa") && D["fa"].contains("nc")) {
         static const size_t nc_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_NC_MIN"); return e ? std::strtoul(e, nullptr, 10) : 1024ul; }();
         const std::string lk = std::to_string((pos0 + N + M - 1) / M * M);
         if (N >= nc_min && D["fa"]["nc"].contains(lk)) {
@@ -3575,6 +3599,17 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 if (k.words[i] == sent) { k.iw()[i] = static_cast<uint32_t>(pos0 + N); ++hits; }
             if (!hits) throw std::runtime_error("open_qwen36: " + nc_kernel + " carries no valid_len sentinel");
             k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            // The stream reads key rows up to lk; rows [N, lk) still hold an earlier, longer
+            // prompt's K / V, and those changed the result despite the valid_len mask (1.6% of
+            // the residual at 1809 tokens after a 2017-token prompt). Zero them.
+            const size_t lkn = std::stoul(lk);
+            for (int l = 0; l < nl_; ++l) {
+                const LayerType& lt = *types_[l];
+                if (lt.state_kind == "linear") continue;
+                const size_t row = lt.state_row, a = pos0 + N;
+                std::memset(state_[l].map<uint8_t*>() + a * row, 0, (lkn - a) * row);
+                state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE, (lkn - a) * row, a * row);
+            }
         }
     }
     const bool nc_npu = !nc_kernel.empty();
@@ -3850,6 +3885,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
                     g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
                     g.t_real = t_real;
+                    g.reset = packed ? rflag.data() + r0 : nullptr;
                     double ph[2] = {0, 0};
                     host::deltanet_block(g, ya.data(), yb.data(), xc, hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
                                          hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
@@ -3876,6 +3912,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     host::AttnGeom g;
                     g.T = M; g.t_real = t_real; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
                     g.pos0 = pos0 + r0; g.eps = gb.eps;
+                    g.rpos = packed ? rpos.data() + r0 : nullptr;
                     auto ta = std::chrono::steady_clock::now();
                     if (noncausal_ && nc_npu) {
                         // Q for the noncausal stream (unscaled, as the causal one), K / V into the cache
@@ -3923,7 +3960,23 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 g.pos0 = pos0 + r0; g.eps = gb.eps;
                 og.resize(M * qw);
                 auto ta = std::chrono::steady_clock::now();
-                host::attention_full(g, qprep[c].data(), state_[l].map<uint16_t*>(), row / 2, pos0 + N, og.data());
+                if (!packed) {
+                    host::attention_full(g, qprep[c].data(), state_[l].map<uint16_t*>(), row / 2, pos0 + N, og.data());
+                } else {
+                    // each prompt's queries in this chunk over that prompt's own keys
+                    std::fill(og.begin(), og.end(), 0.f);
+                    const uint16_t* kv = state_[l].map<const uint16_t*>();
+                    for (size_t i = 0; i < segs.size(); ++i) {
+                        const size_t a = segs[i], b = i + 1 < segs.size() ? segs[i + 1] : N;
+                        const size_t q0 = std::max(a, r0), q1 = std::min(b, r0 + t_real);
+                        if (q0 >= q1) continue;
+                        host::AttnGeom gs = g;
+                        gs.T = gs.t_real = q1 - q0;
+                        gs.pos0 = 0;
+                        host::attention_full(gs, qprep[c].data() + (q0 - r0) * qw, kv + a * (row / 2), row / 2, b - a,
+                                             og.data() + (q0 - r0) * qw);
+                    }
+                }
                 timing_.attn_ms += ms_since(ta);
                 const uint16_t* q16 = buffer("pp_q_" + cs, 0).map<const uint16_t*>();
 #pragma omp parallel for
@@ -4013,6 +4066,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     if (err) std::rethrow_exception(err);
     pos_ += static_cast<int>(N);
     last_x_.assign(xres.data() + (N - 1) * hid, xres.data() + N * hid);
+    for (size_t i = 0; i < segs.size(); ++i) {
+        const size_t e = i + 1 < segs.size() ? segs[i + 1] : N;
+        seg_x_.emplace_back(xres.data() + (e - 1) * hid, xres.data() + e * hid);
+    }
     block_logits_.clear();
     if (block_logits_all_)
         for (size_t t = 0; t < N; ++t) {
