@@ -43,7 +43,10 @@ namespace {
 // tile [16 n-blocks][8 k-blocks][8 n][8 k], tiles column-major, each 8 k of one column a
 // bfp16ebs8 block (exponent byte = the largest IEEE exponent, 8 int8 mantissas, rounded to
 // nearest exactly as pack.py's bfp16ebs8_encode).
-void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8_t* out) {
+// colmap (optional, npad entries): packed column c takes source row colmap[c] (-1 = zeros), for
+// the SwiGLU epilogue's [gate 64 | up 64] tiles.
+void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8_t* out,
+                     const int64_t* colmap = nullptr) {
     std::vector<float> W(n * k);
     const size_t per_band = 2 * k / 256, nch = n * k / (32 * 256);
 #pragma omp parallel for
@@ -70,7 +73,9 @@ void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8
         for (size_t nb = 0; nb < 16; ++nb)
             for (size_t kb = 0; kb < 8; ++kb)
                 for (size_t nin = 0; nin < 8; ++nin) {
-                    const size_t col = nt * 128 + nb * 8 + nin, k0 = kt * 64 + kb * 8;
+                    const size_t c = nt * 128 + nb * 8 + nin, k0 = kt * 64 + kb * 8;
+                    const int64_t src = colmap ? colmap[c] : static_cast<int64_t>(c);
+                    const size_t col = src < 0 ? n : static_cast<size_t>(src);
                     uint8_t* blk = out + ((((nt * KT + kt) * 16 + nb) * 8 + kb) * 8 + nin) * 9;
                     uint32_t bits[8];
                     for (size_t j = 0; j < 8; ++j) {
@@ -434,6 +439,8 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
         for (const auto& [shape, k] : w_->prompt_gemm["kernels"].items()) wanted[k.get<std::string>()] = true;
     if (!man_.gemm_dit.is_null())   // dit_on_ is decided later; loading an unused kernel is harmless
         for (const auto& [shape, k] : man_.gemm_dit["kernels"].items()) wanted[k.get<std::string>()] = true;
+    if (man_.gemm_dit.contains("ffn"))
+        for (const char* f : {"up", "down"}) wanted[man_.gemm_dit["ffn"][f].get<std::string>()] = true;
     for (const auto& [name, d] : w_->kernels)
         if (wanted.count(name)) load_kernel(name, d);
     logits_host_.assign(w_->vocab, 0.f);
@@ -681,7 +688,20 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                     throw std::runtime_error("open_qwen36: dit GEMM: no [N, K] for weight " + name + " or not a 5120 B chunk pool");
                 const size_t npad = man_.gemm_dit["npad"][std::to_string(n)].get<size_t>();
                 xrt::bo w = xrt::ext::bo(*dev_, padup(k * npad / 8 * 9));
-                dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>());
+                // the FFN up|gate weight ([up ff | gate ff] rows) for the SwiGLU epilogue: every
+                // 128-column tile j is [gate 64j.. | up 64j..]
+                std::vector<int64_t> cm;
+                if (man_.gemm_dit.contains("ffn") && !lt.gemm_block.ffn_program.empty() &&
+                    lt.gemm_block.ffn_program[0].args[0] == name) {
+                    const size_t ff = man_.gemm_dit["ffn"]["ff"].get<size_t>();
+                    if (n != 2 * ff || npad != n) throw std::runtime_error("open_qwen36: dit FFN: up|gate is not [2 ff]");
+                    cm.resize(npad);
+                    for (size_t c = 0; c < npad; ++c) {
+                        const size_t j = c / 128, w = c % 128;
+                        cm[c] = static_cast<int64_t>(w < 64 ? ff + 64 * j + w : 64 * j + (w - 64));
+                    }
+                }
+                dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data());
                 w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 v[l] = std::move(w);
                 continue;
@@ -3766,6 +3786,60 @@ void Core::staged_tail(int l, size_t b, size_t T, size_t N, const float* y, cons
 void Core::ffn_staged(int l, const std::vector<Step>& prog, size_t ff, float* xres, size_t B, size_t T, size_t N,
                       const std::vector<float>* gate_w) {
     const size_t hid = man_.hidden;
+    if (dit_on_ && !gate_w && man_.gemm_dit.contains("ffn")) {
+        // The dense FFN on the device end to end: up|gate with the SwiGLU epilogue writes h into
+        // the first 64 of every 128 columns of H, down reads H gathered. The host only converts
+        // xm in and adds y onto the residual, both overlapped with the other dispatch.
+        const auto& D = man_.gemm_dit;
+        const size_t M = D["m"].get<size_t>(), G = M / T, nd = (B + G - 1) / G;
+        Kern& ku = kerns_.at(D["ffn"]["up"].get<std::string>());
+        Kern& kd = kerns_.at(D["ffn"]["down"].get<std::string>());
+        const std::string xg = D["x"][std::to_string(hid)].get<std::string>();
+        const std::string hg = D["y"][std::to_string(2 * ff)].get<std::string>();
+        const std::string yg = D["y"][std::to_string(hid)].get<std::string>();
+        for (const std::string& g : {xg, yg})
+            if (!globals_.count(g + "_b")) globals_[g + "_b"] = alloc(globals_.at(g).size());
+        const std::string xs[2] = {xg, xg + "_b"}, ys[2] = {yg, yg + "_b"};
+        auto put = [&](size_t d, int buf) {
+            auto t0 = std::chrono::steady_clock::now();
+            const size_t r0 = d * M, rows = std::min(M, B * T - r0);
+            uint16_t* a = buffer(xs[buf], 0).map<uint16_t*>();
+            const float* x = moe_.xm.data() + r0 * hid;
+#pragma omp parallel for
+            for (long long i = 0; i < static_cast<long long>(M * hid); ++i)
+                a[i] = static_cast<size_t>(i) < rows * hid ? f32_to_bf16(x[i]) : 0;
+            buffer(xs[buf], 0).sync(XCL_BO_SYNC_BO_TO_DEVICE, M * hid * 2, 0);
+            timing_.part1_ms += ms_since(t0);
+            timing_.gemm_tile_ms += ms_since(t0);
+        };
+        auto get = [&](size_t d, int buf) {
+            auto t1 = std::chrono::steady_clock::now();
+            const size_t r0 = d * M, rows = std::min(M, B * T - r0);
+            xrt::bo& yb = buffer(ys[buf], 0);
+            read_back(yb, rows * hid * 2, 0);
+            const uint16_t* c = yb.map<const uint16_t*>();
+            float* res = moe_.res.data() + r0 * hid;
+            float* xo = xres + r0 * hid;
+#pragma omp parallel for
+            for (long long i = 0; i < static_cast<long long>(rows * hid); ++i) xo[i] = res[i] += bf16_to_f32(c[i]);
+            timing_.part1_ms += ms_since(t1);
+            timing_.shared_ms += ms_since(t1);
+        };
+        put(0, 0);
+        for (size_t d = 0; d < nd; ++d) {
+            const int buf = static_cast<int>(d & 1);
+            Inflight fu = start_run(ku, {xs[buf], prog[0].args[0], hg}, l);
+            timing_.part0_ms += fu.submit_ms;
+            if (d + 1 < nd) put(d + 1, buf ^ 1);
+            timing_.part0_ms += wait_run(fu).second;
+            Inflight fd = start_run(kd, {hg, prog[1].args[0], ys[buf]}, l);
+            timing_.part0_ms += fd.submit_ms;
+            if (d > 0) get(d - 1, buf ^ 1);
+            timing_.part0_ms += wait_run(fd).second;
+        }
+        get(nd - 1, static_cast<int>((nd - 1) & 1));
+        return;
+    }
     float* h_all = BlockScratch::fit(ss_.h, B * T * ff);
     gemm_phase(l, prog[0], B, T, hid, 2 * ff,
                [&](size_t b) -> const float* { return moe_.xm.data() + b * T * hid; },
