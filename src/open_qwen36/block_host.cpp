@@ -391,7 +391,10 @@ void attention_tile(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, flo
 }
 
 // ---- the fast path (hd a multiple of 64): the window's K and V converted from bf16 ONCE per
-// call, K transposed to KT[g][d][pos] and V to VF[g][pos][d] (pos padded to whole 64-key
+// call, K transposed per 64-key chunk to KT[g][chunk][d][64] and V to VF[g][pos][d] (a chunk
+// of either is one contiguous 16 KB block: KT[g][d][pos] put a chunk's 64 rows P floats
+// apart, a power-of-two stride from 8K keys on that aliased one cache set -- 4.5x the 4K
+// time at 8K, 9.8x more at 16K) (pos padded to whole 64-key
 // chunks with zeros), then per work item (kv head, query tile) S = Q K^T and acc += P V as
 // register-blocked micro-GEMMs over 64-key chunks (4 query rows x 64 keys / 64 dims), the
 // online softmax in between with a vector exp (Cephes expf's polynomial, ~1 ulp on the range
@@ -458,7 +461,7 @@ void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, s
             v16f a00{}, a01{}, a02{}, a03{}, a10{}, a11{}, a12{}, a13{}, a20{}, a21{}, a22{}, a23{}, a30{}, a31{}, a32{}, a33{};
             const float *q0 = q + i0 * hd, *q1 = q0 + hd, *q2 = q1 + hd, *q3 = q2 + hd;
             for (size_t d = 0; d < hd; ++d) {
-                const float* kd = kt + d * P + c0;
+                const float* kd = kt + (c0 / 64 * hd + d) * 64;
                 const v16f k0 = ld(kd), k1 = ld(kd + 16), k2 = ld(kd + 32), k3 = ld(kd + 48);
                 const v16f b0 = bc(q0[d]), b1 = bc(q1[d]), b2 = bc(q2[d]), b3 = bc(q3[d]);
                 a00 += b0 * k0; a01 += b0 * k1; a02 += b0 * k2; a03 += b0 * k3;
@@ -548,10 +551,10 @@ void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, fl
             for (size_t p = static_cast<size_t>(pb) * 64; p < static_cast<size_t>(pb) * 64 + 64; ++p) {
                 const uint16_t* row = kv + p * kv_row_elems;
                 for (size_t gh = 0; gh < kvh; ++gh) {
-                    float* kd = kt + gh * hd * P + p;
+                    float* kd = kt + gh * hd * P + (p / 64 * hd) * 64 + p % 64;
                     float* vd = vf + (gh * P + p) * hd;
                     for (size_t d = 0; d < hd; ++d) {
-                        kd[d * P] = p < rows ? bf16_to_f32(row[gh * hd + d]) : 0.f;
+                        kd[d * 64] = p < rows ? bf16_to_f32(row[gh * hd + d]) : 0.f;
                         vd[d] = p < rows ? bf16_to_f32(row[kvw + gh * hd + d]) : 0.f;
                     }
                 }
