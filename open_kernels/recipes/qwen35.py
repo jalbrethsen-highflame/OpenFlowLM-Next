@@ -253,6 +253,37 @@ def gemm_route(spec: ModelSpec) -> dict | None:
         return None
 
 
+# ---- the prompt GEMMs on dit_gemm (designs/dit_gemm: bf16 activations x bfp16 weights the
+# engine repacks from the q4_1 bytes at load, 15-19 TFLOPS against gemm_q4_prefill's 2.5-4.4).
+# OPEN_QWEN35_GEMM_DIT=0 keeps gemm_q4_prefill. DIT_M tokens per dispatch (4 route blocks).
+import os as _os
+GEMM_DIT = _os.environ.get("OPEN_QWEN35_GEMM_DIT", "1") != "0"
+DIT_M = 1024
+
+
+def gemm_dit(spec: ModelSpec) -> dict | None:
+    """{m, kernels {NxK: name}, npad {N: Npad}, x {K: global}, y {Npad: global}} for every
+    gemm_route shape dit_gemm can take (K % 512, N padded to 1024), or None."""
+    r = gemm_route(spec) if GEMM_DIT else None
+    if not r:
+        return None
+    shapes = []
+    for name in r["kernels"]:
+        if not name.startswith("gemm_n"):
+            continue
+        n, k = (int(x) for x in name[len("gemm_n"):].split("_k"))
+        if k % 512:
+            return None
+        shapes.append((n, k))
+    npad = {n: -(-n // 1024) * 1024 for n, _ in shapes}
+    return {"m": DIT_M,
+            "kernels": {f"{n}x{k}": f"dit_n{npad[n]}_k{k}" for n, k in shapes},
+            "npad": {str(n): p for n, p in npad.items()},
+            "x": {str(k): f"dit_x_k{k}" for k in sorted({k for _, k in shapes})},
+            "y": {str(p): f"dit_y_n{p}" for p in sorted(set(npad.values()))},
+            "_shapes": [(npad[n], k) for n, k in shapes]}
+
+
 # ---- the step program: ONE run per layer type (nothing is routed, so no part split)
 def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     L = layout(spec)
@@ -294,6 +325,14 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             out[k].update(r[k])
         for lt, gb in r["layer_types"].items():
             out["layer_types"][lt]["gemm_block"] = gb
+    d = gemm_dit(spec)
+    if d:
+        for npad, k in sorted(set(d["_shapes"])):
+            name = f"dit_n{npad}_k{k}"
+            out["contexts"].setdefault("dit", f"{name}/final.xclbin")
+            out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
+            out["globals"][f"dit_x_k{k}"] = DIT_M * k * 2
+            out["globals"][f"dit_y_n{npad}"] = DIT_M * npad * 2
     return out
 
 
@@ -314,6 +353,7 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
         "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES, "lmhead_chunk_bytes": Q8_CHUNK,
         "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim,
         "rope_theta": spec.rope_theta, "rope_inv_freq": spec.rope_inv_freq(),
+        **({"gemm_dit": {k: v for k, v in gemm_dit(spec).items() if not k.startswith("_")}} if gemm_dit(spec) else {}),
     }
 
 
@@ -341,6 +381,12 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     r = gemm_route(spec)
     if r:
         b.update(r["builds"])
+    d = gemm_dit(spec)
+    if d:
+        for npad, k in sorted(set(d["_shapes"])):
+            b[f"dit_n{npad}_k{k}"] = {"design": "dit_gemm/dit_gemm.py",
+                                      "build_dir": f"dit_gemm/build_m{DIT_M}_k{k}_n{npad}",
+                                      "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(npad)}}
     return b
 
 
@@ -353,6 +399,7 @@ KERNEL_SOURCES = [
     "designs/ln/ln.h", "designs/ln/*.cc", "designs/ln/ln.py", "designs/lin_layer/ln_nr.cc",
     "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.cc", "designs/lm_head_q8/*.h",
     "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc", "designs/gemm_q4_prefill/*.h",
+    "designs/dit_gemm/*.py", "designs/dit_gemm/*.cc",
     "designs/attn_block/attn_gemm.py", "../npu_offload/gemm_rtp/gemm_pretiled.py", "../npu_offload/gemm_rtp/npue.py",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",
 ]

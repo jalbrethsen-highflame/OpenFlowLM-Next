@@ -36,6 +36,63 @@ namespace open_qwen36 {
 namespace fs = std::filesystem;
 
 namespace {
+// dit_gemm's B operand from a q4_1 pool region (q4_1_pack.py's chunk order, rs = 2: a 64-row
+// band's 256-wide k-group is two 5120 B chunks of 32 rows): B[k][n] = W[n][k], N padded with
+// zeros to npad, as designs/dit_gemm/pack.py's pack_b lays it out -- per 64 (K) x 128 (N)
+// tile [16 n-blocks][8 k-blocks][8 n][8 k], tiles column-major, each 8 k of one column a
+// bfp16ebs8 block (exponent byte = the largest IEEE exponent, 8 int8 mantissas, rounded to
+// nearest exactly as pack.py's bfp16ebs8_encode).
+void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8_t* out) {
+    std::vector<float> W(n * k);
+    const size_t per_band = 2 * k / 256, nch = n * k / (32 * 256);
+#pragma omp parallel for
+    for (long long cc = 0; cc < static_cast<long long>(nch); ++cc) {
+        const size_t c = static_cast<size_t>(cc), band = c / per_band, ci = c % per_band;
+        const size_t r0 = 64 * band + 32 * (ci % 2), c0 = 256 * (ci / 2);
+        const uint8_t* b = pool + c * 5120;
+        const uint16_t* d = reinterpret_cast<const uint16_t*>(b);
+        const uint16_t* m = reinterpret_cast<const uint16_t*>(b + 512);
+        const uint8_t* qb = b + 1024;
+        for (size_t rb = 0; rb < 2; ++rb)
+            for (size_t kk = 0; kk < 256; ++kk)
+                for (size_t r16 = 0; r16 < 16; ++r16) {
+                    const size_t i = (rb * 256 + kk) * 16 + r16, r = rb * 16 + r16;
+                    const uint8_t nib = (i & 1) ? (qb[i >> 1] >> 4) : (qb[i >> 1] & 0xF);
+                    const size_t si = (kk / 32) * 32 + r;
+                    W[(r0 + r) * k + c0 + kk] = static_cast<float>(nib) * bf16_to_f32(d[si]) + bf16_to_f32(m[si]);
+                }
+    }
+    const size_t KT = k / 64, NT = npad / 128;
+#pragma omp parallel for
+    for (long long tt = 0; tt < static_cast<long long>(NT * KT); ++tt) {
+        const size_t nt = static_cast<size_t>(tt) / KT, kt = static_cast<size_t>(tt) % KT;
+        for (size_t nb = 0; nb < 16; ++nb)
+            for (size_t kb = 0; kb < 8; ++kb)
+                for (size_t nin = 0; nin < 8; ++nin) {
+                    const size_t col = nt * 128 + nb * 8 + nin, k0 = kt * 64 + kb * 8;
+                    uint8_t* blk = out + ((((nt * KT + kt) * 16 + nb) * 8 + kb) * 8 + nin) * 9;
+                    uint32_t bits[8];
+                    for (size_t j = 0; j < 8; ++j) {
+                        const float v = col < n ? W[col * k + k0 + j] : 0.f;
+                        std::memcpy(&bits[j], &v, 4);
+                    }
+                    int max_exp = 0;
+                    for (uint32_t bt : bits) max_exp = std::max(max_exp, static_cast<int>((bt >> 23) & 0xFF));
+                    blk[0] = static_cast<uint8_t>(max_exp);
+                    for (size_t j = 0; j < 8; ++j) {
+                        const int e = static_cast<int>((bits[j] >> 23) & 0xFF);
+                        int64_t mant = static_cast<int64_t>(bits[j] & 0x7FFFFF) | (e != 0 ? (int64_t{1} << 23) : 0);
+                        if (bits[j] >> 31) mant = -mant;
+                        const int shift = 17 + std::min(max_exp - e, 31);
+                        // floor((mant + half) / 2^shift): an arithmetic shift is the floor
+                        int64_t q = (mant + (int64_t{1} << (shift - 1))) >> shift;
+                        q = std::clamp<int64_t>(q, -128, 127);
+                        blk[1 + j] = static_cast<uint8_t>(static_cast<int8_t>(q));
+                    }
+                }
+    }
+}
+
 
 // 0167/#32: the GEMM route's host math reuses this file's own
 // open_qwen36::bf16_to_f32 / open_qwen36::f32_to_bf16 (q4nx_file.hpp) --
@@ -339,6 +396,8 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
         for (const auto& [rows, k] : types_[l]->gemm_block.attn_block.kernels_pv) wanted[k] = true;
     }
     for (const auto& s : w_->tail) wanted[s.kernel] = true;
+    if (!man_.gemm_dit.is_null())   // dit_on_ is decided later; loading an unused kernel is harmless
+        for (const auto& [shape, k] : man_.gemm_dit["kernels"].items()) wanted[k.get<std::string>()] = true;
     for (const auto& [name, d] : w_->kernels)
         if (wanted.count(name)) load_kernel(name, d);
     logits_host_.assign(w_->vocab, 0.f);
@@ -365,6 +424,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (const char* env = std::getenv("OFLM_OPEN_ATTN_BLOCK")) attn_block_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_LAYER_MAJOR")) layer_major_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_STAGE_MAJOR")) stage_major_on_ = std::string(env) != "0";
+    dit_on_ = !man_.gemm_dit.is_null();
+    if (const char* env = std::getenv("OFLM_OPEN_GEMM_DIT"); env && std::string(env) == "0") dit_on_ = false;
+    if (dit_on_ && !stage_major_on_)
+        throw std::runtime_error("open_qwen36: the dit GEMMs run only stage-major (OFLM_OPEN_GEMM_DIT=0 for the block-major schedule)");
     dispatch_log_ = std::getenv("OFLM_OPEN_DISPATCH_LOG") != nullptr;
     // Stage 2.5 Gate A: per-dxB-dispatch phase CSV (layer,pos,patch,prep,submit,wait,read).
     // Measurement only; off (and free) unless the env names a file.
@@ -566,6 +629,26 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                     throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the " + from + " ops of " + name +
                                              " are not contiguous -- the route needs one memcpy per weight buffer");
                 total += bytes;
+            }
+            if (dit_on_) {
+                // dit_gemm: the band-order q4_1 bytes repacked as bfp16 [K, Npad] (9 bytes per 8)
+                size_t n = 0, k = 0;
+                for (const auto* prog : {&lt.gemm_block.program, &lt.gemm_block.ffn_program, &lt.gemm_block.shared_program})
+                    for (const Step& st : *prog)
+                        if (!st.args.empty() && st.args[0] == name) {
+                            if (st.split) throw std::runtime_error("open_qwen36: dit GEMM: " + name + " is a split (q8) step");
+                            const std::string& kn = st.kernel;          // gemm_n<N>_k<K>
+                            n = std::stoul(kn.substr(6, kn.find("_k") - 6));
+                            k = std::stoul(kn.substr(kn.find("_k") + 2));
+                        }
+                if (!n || n * k / 8192 * w_->chunk_bytes != total || w_->chunk_bytes != 5120)
+                    throw std::runtime_error("open_qwen36: dit GEMM: no [N, K] for weight " + name + " or not a 5120 B chunk pool");
+                const size_t npad = man_.gemm_dit["npad"][std::to_string(n)].get<size_t>();
+                xrt::bo w = xrt::ext::bo(*dev_, padup(k * npad / 8 * 9));
+                dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>());
+                w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                v[l] = std::move(w);
+                continue;
             }
             xrt::bo w = xrt::ext::bo(*dev_, padup(total));
             std::memcpy(w.map<uint8_t*>(), host + off0, total);
@@ -3347,6 +3430,69 @@ void Core::block_layer_full(int l, float* xres, size_t T, size_t t_real, size_t 
 void Core::gemm_phase(int l, const Step& s, size_t B, size_t T, size_t K, size_t N,
                       const std::function<const float*(size_t)>& prep,
                       const std::function<void(size_t, const float*)>& post) {
+    if (dit_on_) {
+        // dit_gemm: G = M / T route blocks a dispatch; A bf16 [M, K] and C bf16 [M, Npad], both
+        // row-major, so post() gets y as ROW-major [T, N] (the callers check dit_on_). While
+        // dispatch d runs, the host fills d + 1's A and converts + posts d - 1's C.
+        const auto& D = man_.gemm_dit;
+        const size_t M = D["m"].get<size_t>();
+        if (M % T) throw std::runtime_error("open_qwen36: dit GEMM: M " + std::to_string(M) + " is not whole route blocks of " + std::to_string(T));
+        const size_t G = M / T, nd = (B + G - 1) / G;
+        const std::string key = std::to_string(N) + "x" + std::to_string(K);
+        if (!D["kernels"].contains(key)) throw std::runtime_error("open_qwen36: dit GEMM: no kernel for " + key);
+        Kern& k = kerns_.at(D["kernels"][key].get<std::string>());
+        const size_t npad = D["npad"][std::to_string(N)].get<size_t>();
+        const std::string xg = D["x"][std::to_string(K)].get<std::string>(), yg = D["y"][std::to_string(npad)].get<std::string>();
+        for (const std::string& g : {xg, yg})
+            if (!globals_.count(g + "_b")) globals_[g + "_b"] = alloc(globals_.at(g).size());
+        const std::string xs[2] = {xg, xg + "_b"}, ys[2] = {yg, yg + "_b"};
+        if (dit_y_.size() < M * N) dit_y_.resize(M * N);
+        auto put = [&](size_t d, int buf) {
+            auto t0 = std::chrono::steady_clock::now();
+            uint16_t* a = buffer(xs[buf], 0).map<uint16_t*>();
+            for (size_t j = 0; j < G; ++j) {
+                const size_t b = d * G + j;
+                uint16_t* dst = a + j * T * K;
+                if (b < B) {
+                    const float* x = prep(b);
+#pragma omp parallel for
+                    for (long long i = 0; i < static_cast<long long>(T * K); ++i) dst[i] = f32_to_bf16(x[i]);
+                } else {
+                    std::memset(dst, 0, T * K * 2);
+                }
+            }
+            buffer(xs[buf], 0).sync(XCL_BO_SYNC_BO_TO_DEVICE, M * K * 2, 0);
+            timing_.part1_ms += ms_since(t0);
+            timing_.gemm_tile_ms += ms_since(t0);
+        };
+        auto get = [&](size_t d, int buf) {
+            const size_t nb = std::min(G, B - d * G);
+            auto t1 = std::chrono::steady_clock::now();
+            xrt::bo& yb = buffer(ys[buf], 0);
+            read_back(yb, nb * T * npad * 2, 0);
+            const uint16_t* c = yb.map<const uint16_t*>();
+            float* yf = dit_y_.data();
+#pragma omp parallel for
+            for (long long r = 0; r < static_cast<long long>(nb * T); ++r)
+                for (size_t i = 0; i < N; ++i) yf[r * N + i] = bf16_to_f32(c[r * npad + i]);
+            timing_.part1_ms += ms_since(t1);
+            timing_.gemm_tr_ms += ms_since(t1);
+            for (size_t j = 0; j < nb; ++j) post(d * G + j, yf + j * T * N);
+        };
+        put(0, 0);
+        for (size_t d = 0; d < nd; ++d) {
+            const int buf = static_cast<int>(d & 1);
+            Inflight f = start_run(k, {xs[buf], s.args[0], ys[buf]}, l);
+            timing_.part0_ms += f.submit_ms;
+            if (d + 1 < nd) put(d + 1, buf ^ 1);
+            if (d > 0) get(d - 1, buf ^ 1);
+            const auto [elapsed, blocked] = wait_run(f);
+            timing_.part0_ms += blocked;
+            if (dispatch_log_) dispatch_stats_[k.name].add(f.submit_ms + elapsed);
+        }
+        get(nd - 1, static_cast<int>((nd - 1) & 1));
+        return;
+    }
     const size_t rows = s.split ? 2 * N : N;
     Step twin = s;
     twin.args[1] += "#1";
@@ -3420,8 +3566,12 @@ void Core::staged_tail(int l, size_t b, size_t T, size_t N, const float* y, cons
     float* res = moe_.res.data() + row0 * hid;
     float* xm = moe_.xm.data() + row0 * hid;
     auto tt = std::chrono::steady_clock::now();
-    float* out = BlockScratch::fit(gout_, T * hid);
-    host::transpose(y, hid, T, out);
+    const float* out = y;                         // dit: already [T, hid]
+    if (!dit_on_) {
+        float* o = BlockScratch::fit(gout_, T * hid);
+        host::transpose(y, hid, T, o);
+        out = o;
+    }
     timing_.part1_ms += ms_since(tt);
     timing_.gemm_tr_ms += ms_since(tt);
     auto t1 = std::chrono::steady_clock::now();
@@ -3443,8 +3593,12 @@ void Core::ffn_staged(int l, const std::vector<Step>& prog, size_t ff, float* xr
                [&](size_t b) -> const float* { return moe_.xm.data() + b * T * hid; },
                [&](size_t b, const float* y) {
                    auto tt = std::chrono::steady_clock::now();
-                   float* ug = BlockScratch::fit(sg_ug_, T * 2 * ff);
-                   host::transpose(y, 2 * ff, T, ug);
+                   const float* ug = y;
+                   if (!dit_on_) {
+                       float* u2 = BlockScratch::fit(sg_ug_, T * 2 * ff);
+                       host::transpose(y, 2 * ff, T, u2);
+                       ug = u2;
+                   }
                    timing_.part1_ms += ms_since(tt);
                    timing_.gemm_tr_ms += ms_since(tt);
                    auto t0 = std::chrono::steady_clock::now();
@@ -3465,8 +3619,12 @@ void Core::ffn_staged(int l, const std::vector<Step>& prog, size_t ff, float* xr
                    float* res = moe_.res.data() + row0 * hid;
                    const float* xm = moe_.xm.data() + row0 * hid;
                    auto tt = std::chrono::steady_clock::now();
-                   float* y = BlockScratch::fit(sg_y_, T * hid);
-                   host::transpose(yd, hid, T, y);
+                   const float* y = yd;
+                   if (!dit_on_) {
+                       float* y2 = BlockScratch::fit(sg_y_, T * hid);
+                       host::transpose(yd, hid, T, y2);
+                       y = y2;
+                   }
                    timing_.part1_ms += ms_since(tt);
                    timing_.gemm_tr_ms += ms_since(tt);
                    auto t1 = std::chrono::steady_clock::now();
@@ -3526,7 +3684,8 @@ void Core::layer_linear_staged(int l, float* xres, size_t B, size_t T, size_t N)
                    float* z = BlockScratch::fit(bs_.part[1], T * vw);
                    auto tt = std::chrono::steady_clock::now();
                    const host::TransposePart parts[2] = {{qkv, 0, nch}, {z, nch, vw}};
-                   host::transpose_parts(yq, T, parts, 2);
+                   if (dit_on_) host::split_cols(yq, T, nch + vw, parts, 2);
+                   else host::transpose_parts(yq, T, parts, 2);
                    timing_.part1_ms += ms_since(tt);
                    timing_.gemm_tr_ms += ms_since(tt);
                    g.t_real = std::min(T, N - b * T);
@@ -3591,7 +3750,8 @@ void Core::layer_full_staged(int l, float* xres, size_t B, size_t T, size_t N, s
                    auto tt = std::chrono::steady_clock::now();
                    const host::TransposePart parts[4] = {
                        {q, 0, qw}, {k, qw, kvw}, {v, qw + kvw, kvw}, {gate, qw + 2 * kvw, qw}};
-                   host::transpose_parts(yf, T, parts, 4);
+                   if (dit_on_) host::split_cols(yf, T, nf, parts, 4);
+                   else host::transpose_parts(yf, T, parts, 4);
                    timing_.part1_ms += ms_since(tt);
                    timing_.gemm_tr_ms += ms_since(tt);
                    const host::AttnGeom g = geom(b);

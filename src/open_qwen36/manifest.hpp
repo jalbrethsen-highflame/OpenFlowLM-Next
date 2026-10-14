@@ -216,6 +216,9 @@ struct Manifest {
     std::vector<double> rope_inv_freq;       ///< per rotary pair (rotary_dim / 2 values; Llama 3's scaling is in here)
     bool has_moe = false;                    ///< layout.moe present (a family with routed experts)
     stream_patch::MoeGeometry moe;
+    /// layout.gemm_dit: the block route's GEMMs on dit_gemm (bf16 x bfp16, row-major A and C,
+    /// M tokens a dispatch): {m, kernels {NxK: name}, npad {N: Npad}, x {K: global}, y {Npad: global}}.
+    nlohmann::json gemm_dit;
     stream_patch::AttnGeometry attn;
     // the model and its programs
     std::vector<std::string> layers;         ///< per layer: a key of layer_types

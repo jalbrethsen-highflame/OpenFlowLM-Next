@@ -184,6 +184,7 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     m.moe.share_down = get<uint64_t>(moe, "share_down", mw);
     if (m.moe.topk > 8 || m.moe.topk == 0) fail(mw, "topk " + std::to_string(m.moe.topk) + " (the router record holds 8)");
     }
+    if (lay.contains("gemm_dit")) m.gemm_dit = lay["gemm_dit"];
     m.attn.kv_row = m.kv_row;
     m.attn.ptab_row = m.ptab_row;
 
