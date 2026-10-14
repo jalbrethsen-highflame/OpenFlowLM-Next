@@ -272,6 +272,11 @@ _HS_SFX = "_hs" if GEMM_HS else ""
 # designs/dit_fa256: causal GQA flash attention at head dim 256 for the full-attention layers,
 # one instruction stream per key length (q_off = lk - DIT_M) up to FA_MAX_LK, one image.
 FA_MAX_LK = int(_os.environ.get("OPEN_QWEN35_FA_MAX_LK", 32768))
+# The same kernel with no causal mask (DF_CAUSAL=0) for decision models whose full-attention
+# layers see the whole prompt (vllm-sr/d3): one stream per key length, valid_len compiled as
+# FA_NC_VALID and patched to the prompt's length by the engine. OPEN_QWEN35_FA_NC=0 off.
+FA_NC = _os.environ.get("OPEN_QWEN35_FA_NC", "1") != "0"
+FA_NC_VALID = 0x7A11D5EE
 
 
 def gemm_dit(spec: ModelSpec) -> dict | None:
@@ -307,6 +312,9 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
     if GEMM_DIT2 and FA_MAX_LK >= DIT_M and spec.has_full and spec.head_dim == 256:
         fa = {"lk": {str(lk): f"fa256_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)},
               "q_cols": spec.num_heads * spec.head_dim}
+        if FA_NC:
+            fa["nc"] = {str(lk): f"fa256nc_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)}
+            fa["nc_valid"] = FA_NC_VALID
     return {"m": DIT_M,
             **({"hs": True} if GEMM_HS and k2 else {}),
             **({"fa": fa} if fa else {}),
@@ -375,9 +383,10 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         for name in names2:
             out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
             out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
-        for lk, name in d.get("fa", {}).get("lk", {}).items():
-            out["contexts"].setdefault("fa", f"{name}/final.xclbin")
-            out["kernels"][name] = {"context": "fa", "insts": f"{name}/insts.bin", "build": name}
+        for key in ("lk", "nc"):      # the noncausal streams share the causal ones' image
+            for lk, name in d.get("fa", {}).get(key, {}).items():
+                out["contexts"].setdefault("fa", f"{name}/final.xclbin")
+                out["kernels"][name] = {"context": "fa", "insts": f"{name}/insts.bin", "build": name}
         if "fa" in d:
             out["globals"]["fa_q"] = DIT_M * d["fa"]["q_cols"] * 2
             out["globals"]["fa_o"] = DIT_M * d["fa"]["q_cols"] * 2
@@ -447,6 +456,11 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             # of docs prose the whole fast path is within noise (NLL -0.0002 +- 0.0016)
             b[name] = {"design": "dit_fa256/dit_fa256.py", "build_dir": f"dit_fa256/build_l{DIT_M}_lk{lk}_fix",
                        "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": str(int(lk) - DIT_M), "DF_EXP_FIX": "1",
+                               "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
+        for lk, name in d.get("fa", {}).get("nc", {}).items():
+            b[name] = {"design": "dit_fa256/dit_fa256.py", "build_dir": f"dit_fa256/build_l{DIT_M}_lk{lk}_fix_nc",
+                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": "0", "DF_EXP_FIX": "1",
+                               "DF_CAUSAL": "0", "DF_VALID": str(FA_NC_VALID),
                                "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
         if "down2" in d.get("ffn", {}):
             b[d["ffn"]["down2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{d['ffn']['ff']}_n{spec.hidden}{_HS_SFX}",

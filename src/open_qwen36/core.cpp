@@ -570,7 +570,9 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (man_.gemm_dit.contains("kernels2"))
         for (const auto& [shape, k] : man_.gemm_dit["kernels2"].items()) wanted[k.get<std::string>()] = true;
     if (man_.gemm_dit.contains("fa"))
-        for (const auto& [lk, k] : man_.gemm_dit["fa"]["lk"].items()) wanted[k.get<std::string>()] = true;
+        for (const char* key : {"lk", "nc"})
+            if (man_.gemm_dit["fa"].contains(key))
+                for (const auto& [lk, k] : man_.gemm_dit["fa"][key].items()) wanted[k.get<std::string>()] = true;
     for (const auto& [name, d] : w_->kernels)
         if (wanted.count(name)) load_kernel(name, d);
     logits_host_.assign(w_->vocab, 0.f);
@@ -3321,6 +3323,25 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     const nlohmann::json& FA = D.contains("fa") ? D["fa"]["lk"] : kEmpty;
     static const bool fa_on = [] { const char* e = std::getenv("OFLM_OPEN_FA"); return !(e && *e == '0'); }();
     static const size_t fa_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_MIN_LK"); return e ? std::strtoul(e, nullptr, 10) : 3072ul; }();
+    // noncausal (d3): one NPU stream for the whole prompt, keys [0, N) of lk = N rounded up to
+    // the chunk, its valid_len sentinel patched to N; host attention below OFLM_OPEN_FA_NC_MIN
+    // tokens or past the streams the set carries
+    std::string nc_kernel;
+    if (noncausal_ && fa_on && D.contains("fa") && D["fa"].contains("nc")) {
+        static const size_t nc_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_NC_MIN"); return e ? std::strtoul(e, nullptr, 10) : 1024ul; }();
+        const std::string lk = std::to_string((pos0 + N + M - 1) / M * M);
+        if (N >= nc_min && D["fa"]["nc"].contains(lk)) {
+            nc_kernel = D["fa"]["nc"][lk].get<std::string>();
+            Kern& k = kerns_.at(nc_kernel);
+            const uint32_t sent = D["fa"]["nc_valid"].get<uint32_t>();
+            size_t hits = 0;
+            for (size_t i = 0; i < k.words.size(); ++i)
+                if (k.words[i] == sent) { k.iw()[i] = static_cast<uint32_t>(pos0 + N); ++hits; }
+            if (!hits) throw std::runtime_error("open_qwen36: " + nc_kernel + " carries no valid_len sentinel");
+            k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+    }
+    const bool nc_npu = !nc_kernel.empty();
     auto fa_kernel = [&](size_t c) -> std::string {
         const size_t lk = pos0 + (c + 1) * M;
         if (!fa_on || lk < fa_min || !FA.contains(std::to_string(lk))) return {};
@@ -3436,8 +3457,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     if (has2(nq, hid)) run(K2[std::to_string(nq) + "x" + std::to_string(hid)].get<std::string>(),
                                            {"pp_a2_" + cs, gb.program[0].args[0], "pp_q_" + cs});
                     else run(kname(nq, hid), {"pp_a_" + cs, gb.program[0].args[0], "pp_q_" + cs});
+                } else if (op == FAT && noncausal_ && nc_npu) {
+                    auto tf = std::chrono::steady_clock::now();
+                    run(nc_kernel, {"fa_q_" + cs, "state", "state", "fa_o_" + cs});
+                    fa_ms += ms_since(tf);
+                    ++n_fa;
                 } else if (op == FAT && noncausal_) {
-                    // noncausal: the barrier only; GATE runs the attention on the host
+                    // noncausal on the host: the barrier only; GATE runs the attention
                 } else if (op == FAT) {
                     auto tf = std::chrono::steady_clock::now();
                     run(fa_kernel(c), {"fa_q_" + cs, "state", "state", "fa_o_" + cs});
@@ -3572,7 +3598,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     g.T = M; g.t_real = t_real; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
                     g.pos0 = pos0 + r0; g.eps = gb.eps;
                     auto ta = std::chrono::steady_clock::now();
-                    if (noncausal_) {
+                    if (noncausal_ && nc_npu) {
+                        // Q for the noncausal stream (unscaled, as the causal one), K / V into the cache
+                        host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
+                                             man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
+                        timing_.attn_ms += ms_since(ta);
+                        to_bf16(og.data(), M, qw, "fa_q_" + cs, std::sqrt(static_cast<float>(gb.hd)));
+                    } else if (noncausal_) {
                         // Q prepped for GATE (after every chunk's K / V rows are in the cache)
                         qprep[c].resize(M * qw);
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
@@ -3604,7 +3636,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     }
                     st.sync(XCL_BO_SYNC_BO_TO_DEVICE, t_real * row, (pos0 + r0) * row);
                 }
-            } else if (op == GATE && noncausal_) {
+            } else if (op == GATE && noncausal_ && !nc_npu) {
                 // d3's noncausal full attention: this chunk's queries over the whole prompt's K / V
                 const size_t qw = gb.qw, kvw = gb.kvw, nq = 2 * qw + 2 * kvw, row = lt.state_row;
                 host::AttnGeom g;
