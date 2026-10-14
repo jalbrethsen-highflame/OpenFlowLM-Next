@@ -263,6 +263,12 @@ DIT_M = 1024
 # dit_gemm's 19.4 at 4096x5120x16384. Every shape but the FFN down (which reads the up GEMM's
 # gathered bf16 C on the device) runs on it. OPEN_QWEN35_GEMM_DIT2=0 keeps dit_gemm everywhere.
 GEMM_DIT2 = _os.environ.get("OPEN_QWEN35_GEMM_DIT2", "1") != "0"
+# designs/peak/hsgen.py: dit2 with the hand-scheduled 2x2 microkernel (DIT_HS; A and B in the
+# 2x2 orders, manifest "hs"), 31-33 TFLOPS on the 27B shapes against 26-27 -- the data-movement
+# floor (32.8 with no math at all). OPEN_QWEN35_GEMM_HS=0 keeps the 4x1 kernel.
+GEMM_HS = GEMM_DIT2 and _os.environ.get("OPEN_QWEN35_GEMM_HS", "1") != "0"
+_HS_ENV = {"DG_KFLAGS": "-DDIT_HS"} if GEMM_HS else {}
+_HS_SFX = "_hs" if GEMM_HS else ""
 # designs/dit_fa256: causal GQA flash attention at head dim 256 for the full-attention layers,
 # one instruction stream per key length (q_off = lk - DIT_M) up to FA_MAX_LK, one image.
 FA_MAX_LK = int(_os.environ.get("OPEN_QWEN35_FA_MAX_LK", 32768))
@@ -302,6 +308,7 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
         fa = {"lk": {str(lk): f"fa256_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)},
               "q_cols": spec.num_heads * spec.head_dim}
     return {"m": DIT_M,
+            **({"hs": True} if GEMM_HS and k2 else {}),
             **({"fa": fa} if fa else {}),
             **({"ffn": ffn} if ffn else {}),
             **({"kernels2": k2} if k2 else {}),
@@ -433,8 +440,8 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                                       "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(npad)}}
         for key, name in d.get("kernels2", {}).items():
             n, k = (int(x) for x in key.split("x"))
-            b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{k}_n{d['npad'][str(n)]}",
-                       "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(d["npad"][str(n)])}}
+            b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{k}_n{d['npad'][str(n)]}{_HS_SFX}",
+                       "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), **_HS_ENV}}
         for lk, name in d.get("fa", {}).get("lk", {}).items():
             # DF_EXP_FIX: the corrected exp2 (+9 % kernel time); against host attention on 4K tokens
             # of docs prose the whole fast path is within noise (NLL -0.0002 +- 0.0016)
@@ -442,13 +449,13 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                        "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": str(int(lk) - DIT_M), "DF_EXP_FIX": "1",
                                "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
         if "down2" in d.get("ffn", {}):
-            b[d["ffn"]["down2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{d['ffn']['ff']}_n{spec.hidden}",
-                                    "env": {"DG_M": str(DIT_M), "DG_K": str(d["ffn"]["ff"]), "DG_N": str(spec.hidden)}}
+            b[d["ffn"]["down2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{d['ffn']['ff']}_n{spec.hidden}{_HS_SFX}",
+                                    "env": {"DG_M": str(DIT_M), "DG_K": str(d["ffn"]["ff"]), "DG_N": str(spec.hidden), **_HS_ENV}}
         if "up2" in d.get("ffn", {}):
             ff2 = d["ffn"]["ff"]
-            b[d["ffn"]["up2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi",
+            b[d["ffn"]["up2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi{_HS_SFX}",
                                   "env": {"DG_M": str(DIT_M), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
-                                          "DG_LAYOUT": '{"epi": {"first_cb": 0}}'}}
+                                          "DG_LAYOUT": '{"epi": {"first_cb": 0}}', **_HS_ENV}}
         if "ffn" in d:
             ff, hid = d["ffn"]["ff"], spec.hidden
             b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",

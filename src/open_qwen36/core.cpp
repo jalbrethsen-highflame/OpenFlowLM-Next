@@ -101,7 +101,9 @@ inline void bfp_encode8(const float* v, uint8_t* blk) {
 // designs/dit2's A operand (pack_a.py's order): x [M, K] f32 -> [row group M/512][core row 4]
 // [k-step K/64][quarter 4][k-block 8][row-block 4] blocks of 8 rows x 8 k, each row's 8 k one
 // bfp16ebs8 block. Rows past `rows` are zeros.
-void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out) {
+// hs (manifest gemm_dit.hs, the hand-scheduled 2x2 microkernel): inside each quarter, row-block
+// pairs, each [k-block 8][the pair's 2 row blocks] (pack_a.py order2) instead of [k-block][row-block].
+void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out, bool hs = false) {
     const size_t KS = K / 64;
     const long long units = static_cast<long long>(M / 512 * 4 * KS);
 #pragma omp parallel for
@@ -110,13 +112,14 @@ void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out) 
         uint8_t* o = out + u * (4 * 8 * 4 * 8 * 9);
         float zero[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (size_t q = 0; q < 4; ++q)
-            for (size_t kb = 0; kb < 8; ++kb)
-                for (size_t rb = 0; rb < 4; ++rb)
-                    for (size_t i = 0; i < 8; ++i) {
-                        const size_t r = rc * 128 + q * 32 + rb * 8 + i, k0 = ks * 64 + kb * 8;
-                        bfp_encode8_avx2(r < rows ? x + r * K + k0 : zero, o);
-                        o += 9;
-                    }
+            for (size_t j = 0; j < 32; ++j)
+                for (size_t i = 0; i < 8; ++i) {
+                    // j walks [k-block 8][row-block 4], or under hs [pair 2][k-block 8][2]
+                    const size_t kb = hs ? (j / 2) % 8 : j / 4, rb = hs ? (j / 16) * 2 + j % 2 : j % 4;
+                    const size_t r = rc * 128 + q * 32 + rb * 8 + i, k0 = ks * 64 + kb * 8;
+                    bfp_encode8_avx2(r < rows ? x + r * K + k0 : zero, o);
+                    o += 9;
+                }
     }
 }
 
@@ -145,7 +148,9 @@ void dit_decode_q4(const uint8_t* pool, size_t n, size_t k, float* W) {
 // [n, k] f32 -> designs/dit2's B operand: bfp16 [Npad/128][K/64][16][8][8] blocks (9 bytes per 8).
 // colmap (optional, npad entries): packed column c takes source row colmap[c] (-1 = zeros), for
 // the SwiGLU epilogue's [gate 64 | up 64] tiles.
-void dit_encode(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, const int64_t* colmap = nullptr) {
+// hs: per [N tile][K tile], column-block pairs, each [k-block 8][the pair's 2] (pack.py layout2).
+void dit_encode(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, const int64_t* colmap = nullptr,
+                bool hs = false) {
     const size_t KT = k / 64, NT = npad / 128;
 #pragma omp parallel for
     for (long long tt = 0; tt < static_cast<long long>(NT * KT); ++tt) {
@@ -156,7 +161,9 @@ void dit_encode(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, c
                     const size_t c = nt * 128 + nb * 8 + nin, k0 = kt * 64 + kb * 8;
                     const int64_t src = colmap ? colmap[c] : static_cast<int64_t>(c);
                     const size_t col = src < 0 ? n : static_cast<size_t>(src);
-                    uint8_t* blk = out + ((((nt * KT + kt) * 16 + nb) * 8 + kb) * 8 + nin) * 9;
+                    const size_t bi = hs ? ((((nt * KT + kt) * 8 + nb / 2) * 8 + kb) * 2 + nb % 2) * 8 + nin
+                                         : ((((nt * KT + kt) * 16 + nb) * 8 + kb) * 8 + nin);
+                    uint8_t* blk = out + bi * 9;
                     float v8[8];
                     for (size_t j = 0; j < 8; ++j) v8[j] = col < n ? W[col * k + k0 + j] : 0.f;
                     bfp_encode8_avx2(v8, blk);
@@ -165,10 +172,10 @@ void dit_encode(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, c
 }
 
 void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8_t* out,
-                     const int64_t* colmap = nullptr) {
+                     const int64_t* colmap = nullptr, bool hs = false) {
     std::vector<float> W(n * k);
     dit_decode_q4(pool, n, k, W.data());
-    dit_encode(W.data(), n, k, npad, out, colmap);
+    dit_encode(W.data(), n, k, npad, out, colmap, hs);
 }
 
 
@@ -626,6 +633,7 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (const char* env = std::getenv("OFLM_OPEN_LAYER_MAJOR")) layer_major_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_STAGE_MAJOR")) stage_major_on_ = std::string(env) != "0";
     dit_on_ = !man_.gemm_dit.is_null();
+    dit_hs_ = dit_on_ && man_.gemm_dit.value("hs", false);
     if (const char* env = std::getenv("OFLM_OPEN_PIPE")) pipe_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_GEMM_DIT"); env && std::string(env) == "0") dit_on_ = false;
     if (dit_on_ && !stage_major_on_)
@@ -888,10 +896,10 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                         log("bf16 check: layer " + std::to_string(l) + " " + name + " [" + std::to_string(n) + ", " +
                             std::to_string(k) + "]: |q4 - bf16| / |bf16| = " + std::to_string(std::sqrt(num / den)));
                     }
-                    dit_encode(W.data(), n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data());
+                    dit_encode(W.data(), n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data(), dit_hs_);
                 } else {
                     if (!host) throw std::runtime_error("open_qwen36: prompt only: " + name + " is not in the bf16 source");
-                    dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data());
+                    dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data(), dit_hs_);
                 }
                 w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 v[l] = std::move(w);
@@ -3537,7 +3545,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         file_->bf16_row(w_->embed_tensor, static_cast<size_t>(ids[std::min(t, N - 1)]), hid, xres.data() + t * hid);
     timing_.setup_ms += ms_since(t0);
 
-    auto kname = [&](size_t n, size_t k) { return D["kernels"][std::to_string(n) + "x" + std::to_string(k)].get<std::string>(); };
+    auto kname = [&](size_t n, size_t k) {
+        if (dit_hs_) throw std::runtime_error("open_qwen36: dit GEMM " + std::to_string(n) + "x" + std::to_string(k) +
+                                              " has no dit2 kernel, and the weights are in the hs (2x2) order");
+        return D["kernels"][std::to_string(n) + "x" + std::to_string(k)].get<std::string>();
+    };
     std::vector<int> stage(L * C, 0), busy(L * C, 0);
     std::mutex mu;
     std::condition_variable cv;
@@ -3616,6 +3628,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     run(D["ffn"]["up2"].get<std::string>(), {"pp_a2_" + cs, gb.ffn_program[0].args[0], "pp_h_" + cs});
                 } else if (op == UP) {
                     if (up2) run(D["ffn"]["up2"].get<std::string>(), {"pp_a2_" + cs, gb.ffn_program[0].args[0], "pp_h"});
+                    else if (dit_hs_) throw std::runtime_error("open_qwen36: the dit FFN up has no dit2 kernel under hs");
                     else run(D["ffn"]["up"].get<std::string>(), {"pp_a_" + cs, gb.ffn_program[0].args[0], "pp_h"});
                     run(D["ffn"]["down"].get<std::string>(), {"pp_h", gb.ffn_program[1].args[0], "pp_y_" + cs});
                 } else {   // DOWN
@@ -3647,7 +3660,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     };
     auto to_bfp2 = [&](const float* src, size_t w, const std::string& buf) {
         xrt::bo& b = buffer(buf, 0);
-        dit2_pack_a(src, M, M, w, b.map<uint8_t*>());
+        dit2_pack_a(src, M, M, w, b.map<uint8_t*>(), dit_hs_);
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * w * 9 / 8, 0);
     };
     std::vector<float> ya, yb, yc, yd, og, hf;
@@ -4293,6 +4306,8 @@ void Core::gemm_phase(int l, const Step& s, size_t B, size_t T, size_t K, size_t
         const size_t G = M / T, nd = (B + G - 1) / G;
         const std::string key = std::to_string(N) + "x" + std::to_string(K);
         if (!D["kernels"].contains(key)) throw std::runtime_error("open_qwen36: dit GEMM: no kernel for " + key);
+        if (dit_hs_) throw std::runtime_error("open_qwen36: dit GEMM " + key + ": this route runs dit_gemm, whose weights are "
+                                              "not in the hs (2x2) order; use the pipelined prompt (OFLM_OPEN_PIPE=1)");
         Kern& k = kerns_.at(D["kernels"][key].get<std::string>());
         const size_t npad = D["npad"][std::to_string(N)].get<size_t>();
         const std::string xg = D["x"][std::to_string(K)].get<std::string>(), yg = D["y"][std::to_string(npad)].get<std::string>();
@@ -4447,6 +4462,7 @@ void Core::ffn_staged(int l, const std::vector<Step>& prog, size_t ff, float* xr
         // xm in and adds y onto the residual, both overlapped with the other dispatch.
         const auto& D = man_.gemm_dit;
         const size_t M = D["m"].get<size_t>(), G = M / T, nd = (B + G - 1) / G;
+        if (dit_hs_) throw std::runtime_error("open_qwen36: the staged dit FFN runs dit_gemm; its weights are in the hs order");
         Kern& ku = kerns_.at(D["ffn"]["up"].get<std::string>());
         Kern& kd = kerns_.at(D["ffn"]["down"].get<std::string>());
         const std::string xg = D["x"][std::to_string(hid)].get<std::string>();

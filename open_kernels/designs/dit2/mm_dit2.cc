@@ -152,6 +152,14 @@ extern "C" {
 extern int oflm_dit_quarter;
 
 #ifdef MATMUL_ONLY
+#ifdef DIT_HS
+// The hand-scheduled 2x2 call (designs/peak/hsgen.py -> hs_call.inc): bit-exact with
+// matmul_vectorized_2x2_bfp16_bf16 on the 2x2 orders (pack_a.py order2, pack.py layout2).
+}
+#include "hs_call.inc"
+extern "C" {
+void hs_call(const bfp16ebs8 *pA, const bfp16ebs8 *pB, bfloat16 *pC);
+#endif
 __attribute__((section(".data"))) int oflm_dit_quarter = 0;
 
 void dit_matmul_quarter(bfp16ebs8 *__restrict pA, bfp16ebs8 *__restrict pB,
@@ -165,7 +173,9 @@ void dit_matmul_quarter(bfp16ebs8 *__restrict pA, bfp16ebs8 *__restrict pB,
   return;
 #endif
   aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
-#ifdef DIT_STOCK_MM
+#if defined(DIT_HS)
+  hs_call(pA, pB, pCq);
+#elif defined(DIT_STOCK_MM)
   matmul_vectorized_2x2_bfp16_bf16<m / r, k / s, n / t, r, s, t>(pA, pB, pCq);
 #else
   matmul_4x1_bfp16(pA, pB, pCq);
