@@ -276,7 +276,14 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             return None
         shapes.append((n, k))
     npad = {n: -(-n // 1024) * 1024 for n, _ in shapes}
+    ff, hid = spec.intermediate, spec.hidden
+    # the FFN fused on the device: up|gate with the SwiGLU epilogue (h in the first 64 of every
+    # 128 columns of its C), then down reading that C gathered -- no host pass in between
+    ffn = None
+    if (2 * ff, hid) in shapes and (hid, ff) in shapes and (2 * ff) % 1024 == 0:
+        ffn = {"up": f"dit_n{2 * ff}_k{hid}_epi", "down": f"dit_n{hid}_k{ff}_gat", "ff": ff}
     return {"m": DIT_M,
+            **({"ffn": ffn} if ffn else {}),
             "kernels": {f"{n}x{k}": f"dit_n{npad[n]}_k{k}" for n, k in shapes},
             "npad": {str(n): p for n, p in npad.items()},
             "x": {str(k): f"dit_x_k{k}" for k in sorted({k for _, k in shapes})},
@@ -333,6 +340,9 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
             out["globals"][f"dit_x_k{k}"] = DIT_M * k * 2
             out["globals"][f"dit_y_n{npad}"] = DIT_M * npad * 2
+        if "ffn" in d:
+            for name in (d["ffn"]["up"], d["ffn"]["down"]):
+                out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
     return out
 
 
@@ -387,6 +397,16 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             b[f"dit_n{npad}_k{k}"] = {"design": "dit_gemm/dit_gemm.py",
                                       "build_dir": f"dit_gemm/build_m{DIT_M}_k{k}_n{npad}",
                                       "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(npad)}}
+        if "ffn" in d:
+            ff, hid = d["ffn"]["ff"], spec.hidden
+            b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",
+                                 "build_dir": f"dit_gemm/build_m{DIT_M}_k{hid}_n{2 * ff}_epi",
+                                 "env": {"DG_M": str(DIT_M), "DG_K": str(hid), "DG_N": str(2 * ff),
+                                         "DG_LAYOUT": '{"epi": {"first_cb": 0}}'}}
+            b[d["ffn"]["down"]] = {"design": "dit_gemm/dit_gemm.py",
+                                   "build_dir": f"dit_gemm/build_m{DIT_M}_k{ff}_n{hid}_gat",
+                                   "env": {"DG_M": str(DIT_M), "DG_K": str(ff), "DG_N": str(hid),
+                                           "DG_LAYOUT": '{"a_gather": true}'}}
     return b
 
 
