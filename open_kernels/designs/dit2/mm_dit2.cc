@@ -227,6 +227,36 @@ void dit_swiglu_epi(bfloat16 *__restrict c, int32_t *__restrict rtp, int32_t t) 
 #endif
     }
   }
+  // rtp[4] (dit2.py pack_h): h packed in place as the FFN down GEMM's A unit: this tile's 128 rows x 64 h columns,
+  // bfp16 blocks in pack_a.py order (order2 under DIT_HS), the first 9216 bytes of the tile's
+  // stream out of the memtile; the drain writes the whole tile to a unit slot and the down
+  // GEMM reads those bytes (a_units). Quarter by quarter through a scratch: quarter q's 2304 bytes land on
+  // quarters <= q, which are done.
+  alignas(64) static bfp16ebs8 scr[32 * 64 / 64];
+  for (int q = 0; q < 4 && rtp[4]; q++) {
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(scr);
+    for (int j = 0; j < 32; j++) {
+#ifdef DIT_HS
+      const int kb = (j / 2) % 8, rb = (j / 16) * 2 + j % 2;
+#else
+      const int kb = j / 4, rb = j % 4;
+#endif
+      aie::accum<accfloat, 64> a;
+      a.from_vector(aie::load_v<64>(c + (q * 4 + rb) * 1024 + kb * 64));
+      o << a.template to_vector<bfp16ebs8>();
+    }
+    // The memtile streams the tile out row-major (dit2.py's C dims, fixed in the image every
+    // dit2 kernel shares), so stream element e comes from the block position of row e / 128,
+    // column e % 128: put the packed bytes there, 16 at a time (8 elements of one block row).
+    // Quarter q's elements [1152 q, 1152 (q + 1)) are rows 9q..9q+8: quarters <= q, done.
+    const uint8_t *__restrict src = reinterpret_cast<const uint8_t *>(scr);
+    uint8_t *__restrict dst = reinterpret_cast<uint8_t *>(c);
+    for (int p = 0; p < 2304 / 16; p++) {
+      const int e = q * 1152 + p * 8, row = e / 128, col = e % 128;
+      const int pos = (row / 8) * 1024 + (col / 8) * 64 + (row % 8) * 8;
+      aie::store_v(dst + pos * 2, aie::load_v<16>(src + p * 16));
+    }
+  }
   aie::set_rounding(saved);
 }
 #endif

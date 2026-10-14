@@ -308,6 +308,11 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             # the down GEMM on dit2 too: the host packs h (the up GEMM's gathered C) as bfp16
             ffn["down2"] = f"dit2_n{hid}_k{ff}"
             k2.pop(f"{2 * ff}x{hid}", None)
+            if GEMM_HS:
+                # the FFN on the device in one step: up|gate's epilogue packs h as the down GEMM's
+                # A in unit slots (pack_h), down reads them (a_units) -- no host repack
+                ffn["up2p"] = f"dit2_n{2 * ff}_k{hid}_epi_ph"
+                ffn["down2u"] = f"dit2_n{hid}_k{ff}_au"
     fa = None
     if GEMM_DIT2 and FA_MAX_LK >= DIT_M and spec.has_full and spec.head_dim == 256:
         fa = {"lk": {str(lk): f"fa256_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)},
@@ -379,7 +384,8 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         if "ffn" in d:
             for name in (d["ffn"]["up"], d["ffn"]["down"]):
                 out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
-        names2 = list(d.get("kernels2", {}).values()) + [d["ffn"][x] for x in ("up2", "down2") if x in d.get("ffn", {})]
+        names2 = list(d.get("kernels2", {}).values()) + [d["ffn"][x] for x in ("up2", "down2", "up2p", "down2u")
+                                                         if x in d.get("ffn", {})]
         for name in names2:
             out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
             out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
@@ -470,6 +476,14 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             b[d["ffn"]["up2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi{_HS_SFX}",
                                   "env": {"DG_M": str(DIT_M), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
                                           "DG_LAYOUT": '{"epi": {"first_cb": 0}}', **_HS_ENV}}
+        if "up2p" in d.get("ffn", {}):
+            ff2 = d["ffn"]["ff"]
+            b[d["ffn"]["up2p"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi_ph{_HS_SFX}",
+                                   "env": {"DG_M": str(DIT_M), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
+                                           "DG_LAYOUT": '{"epi": {"first_cb": 0}, "pack_h": true}', **_HS_ENV}}
+            b[d["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{ff2}_n{spec.hidden}_au{_HS_SFX}",
+                                     "env": {"DG_M": str(DIT_M), "DG_K": str(ff2), "DG_N": str(spec.hidden),
+                                             "DG_LAYOUT": '{"a_units": true}', **_HS_ENV}}
         if "ffn" in d:
             ff, hid = d["ffn"]["ff"], spec.hidden
             b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",
