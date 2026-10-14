@@ -98,10 +98,18 @@ tok/s. Host attention grows faster than T^2 past 4K (0.59 / 4.2 / 31 / 130 s at 
 the f32 K/V window of 8 kv heads outgrows the L3 at 8K. Decode after the prompt: 49 / 54 /
 64 / 84 / 124 / 207 ms per token at 1/2/4/8/16/32K.
 
-Accuracy: the three NPU paths (token by token, q4 GEMM, dit) differ from each other by a mean
-KL of ~0.10 and 86 % top-1 agreement over a 4K prompt, with equal prompt NLL. dit adds nothing
-measurable. Whether that ~0.10 floor is the bfp16 / MoE-routing noise or a defect is not
-checked against the fp64 replica at long context yet.
+Accuracy over long prompts (`model/replica_lfm2moe_batch.py`: the replica layer-major, 29 s
+for 6 tokens x 40 layers, minutes for 4K; `--bf16` rounds where the engine holds bf16). KL to
+the fp reference, top-1 agreement, prompt NLL vs reference:
+
+| text | tok-by-tok | q4 GEMM route | dit route | bf16-only reference |
+|---|---|---|---|---|
+| spec.md 4K (ppl 97) | 0.065 / 89.5 % / +0.059 | 0.093 / 87.5 % / +0.008 | 0.099 / 86.6 % / +0.044 | 0.050 / 91.2 % / +0.007 |
+| GPL-3 3K (ppl 3.79) | 0.017 / 95.3 % / -0.000 | 0.031 / 93.7 % / +0.001 | 0.035 / 93.2 % / -0.005 | |
+
+No defect: bf16 rounding alone, everything else exact, gives most of the KL (MoE routing
+amplifies small differences on high-entropy text); the bfp16 GEMMs add ~0.015-0.03; dit and
+the q4 GEMM are equal within the standard error on the prose text.
 
 24B step (one context): ex 38 x 0.64 ms, mixers ~0.95 ms (includes the queued ex wait),
 cx 2 x 2.1, head 5.9, router 0.8.
