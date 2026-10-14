@@ -118,6 +118,8 @@ def dit_gemm(
     C_l1_ty = np.ndarray[(m, n), np.dtype[bfloat16]]
 
     flags = [f"-DDIM_M={m}", f"-DDIM_K={k}", f"-DDIM_N={n}", f"-I{_AIE_KERNELS_INC}"]
+    # DG_KFLAGS: extra microkernel defines, for timing variants of mm_dit.cc (build into a fresh dir)
+    flags += os.environ.get("DG_KFLAGS", "").split()
     zero_kernel = ExternalFunction("dit_zero_c", source_file=str(_KERNEL_SRC),
                                    arg_types=[C_l1_ty], compile_flags=flags + ["-DZERO_ONLY"])
     rtp_ty = np.ndarray[(RTP_LEN,), np.dtype[np.int32]]

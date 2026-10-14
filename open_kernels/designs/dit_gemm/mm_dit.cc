@@ -80,10 +80,14 @@ void matmul_vectorized_2x2_bfp16_bf16(const bfloat16 *__restrict pA,
         aie::block_vector<bfp16ebs8, sizeB> B0;
         aie::block_vector<bfp16ebs8, sizeB> B1;
 
+#ifdef DIT_NO_CLOAD   // timing ablation: no C reload (output wrong)
+        aie::accum<accfloat, sizeC> accC00 = aie::zeros<accfloat, sizeC>(), accC01 = accC00, accC10 = accC00, accC11 = accC00;
+#else
         aie::accum<accfloat, sizeC> accC00(aie::load_v<sizeC>(pC1));
         aie::accum<accfloat, sizeC> accC01(aie::load_v<sizeC>(pC1 + sizeC));
         aie::accum<accfloat, sizeC> accC10(aie::load_v<sizeC>(pC2));
         aie::accum<accfloat, sizeC> accC11(aie::load_v<sizeC>(pC2 + sizeC));
+#endif
 
         aie::accum<accfloat, 64> accA0;
         aie::accum<accfloat, 64> accA1;
@@ -143,6 +147,9 @@ void dit_matmul_quarter(bfloat16 *__restrict pA, bfp16ebs8 *__restrict pB,
   static_assert(m % (2 * r) == 0 && k % s == 0 && n % (2 * t) == 0);
   bfloat16 *pCq = pC + oflm_dit_quarter * m * n;
   oflm_dit_quarter = (oflm_dit_quarter + 1) & 3;
+#ifdef DIT_NULL_MM     // timing ablation: the streams only (output wrong)
+  return;
+#endif
   aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
   matmul_vectorized_2x2_bfp16_bf16<m / r, k / s, n / t, r, s, t>(pA, pB, pCq);
   aie::set_rounding(saved);

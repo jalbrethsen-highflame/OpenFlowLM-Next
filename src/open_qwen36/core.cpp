@@ -46,6 +46,47 @@ namespace {
 // tile [16 n-blocks][8 k-blocks][8 n][8 k], tiles column-major, each 8 k of one column a
 // bfp16ebs8 block (exponent byte = the largest IEEE exponent, 8 int8 mantissas, rounded to
 // nearest exactly as pack.py's bfp16ebs8_encode).
+// One bfp16ebs8 block from 8 floats: exponent byte = the largest IEEE exponent, 8 int8
+// mantissas rounded to nearest exactly as designs/dit_gemm/pack.py's bfp16ebs8_encode.
+inline void bfp_encode8(const float* v, uint8_t* blk) {
+    uint32_t bits[8];
+    std::memcpy(bits, v, 32);
+    int max_exp = 0;
+    for (uint32_t bt : bits) max_exp = std::max(max_exp, static_cast<int>((bt >> 23) & 0xFF));
+    blk[0] = static_cast<uint8_t>(max_exp);
+    for (size_t j = 0; j < 8; ++j) {
+        const int e = static_cast<int>((bits[j] >> 23) & 0xFF);
+        int64_t mant = static_cast<int64_t>(bits[j] & 0x7FFFFF) | (e != 0 ? (int64_t{1} << 23) : 0);
+        if (bits[j] >> 31) mant = -mant;
+        const int shift = 17 + std::min(max_exp - e, 31);
+        int64_t q = (mant + (int64_t{1} << (shift - 1))) >> shift;   // floor((m + half) / 2^shift)
+        q = std::clamp<int64_t>(q, -128, 127);
+        blk[1 + j] = static_cast<uint8_t>(static_cast<int8_t>(q));
+    }
+}
+
+// designs/dit2's A operand (pack_a.py's order): x [M, K] f32 -> [row group M/512][core row 4]
+// [k-step K/64][quarter 4][k-block 8][row-block 4] blocks of 8 rows x 8 k, each row's 8 k one
+// bfp16ebs8 block. Rows past `rows` are zeros.
+void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out) {
+    const size_t KS = K / 64;
+    const long long units = static_cast<long long>(M / 512 * 4 * KS);
+#pragma omp parallel for
+    for (long long uu = 0; uu < units; ++uu) {
+        const size_t u = static_cast<size_t>(uu), ks = u % KS, rc = u / KS;   // rc = rg * 4 + crow
+        uint8_t* o = out + u * (4 * 8 * 4 * 8 * 9);
+        float zero[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (size_t q = 0; q < 4; ++q)
+            for (size_t kb = 0; kb < 8; ++kb)
+                for (size_t rb = 0; rb < 4; ++rb)
+                    for (size_t i = 0; i < 8; ++i) {
+                        const size_t r = rc * 128 + q * 32 + rb * 8 + i, k0 = ks * 64 + kb * 8;
+                        bfp_encode8(r < rows ? x + r * K + k0 : zero, o);
+                        o += 9;
+                    }
+    }
+}
+
 // colmap (optional, npad entries): packed column c takes source row colmap[c] (-1 = zeros), for
 // the SwiGLU epilogue's [gate 64 | up 64] tiles.
 void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8_t* out,
@@ -80,24 +121,9 @@ void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8
                     const int64_t src = colmap ? colmap[c] : static_cast<int64_t>(c);
                     const size_t col = src < 0 ? n : static_cast<size_t>(src);
                     uint8_t* blk = out + ((((nt * KT + kt) * 16 + nb) * 8 + kb) * 8 + nin) * 9;
-                    uint32_t bits[8];
-                    for (size_t j = 0; j < 8; ++j) {
-                        const float v = col < n ? W[col * k + k0 + j] : 0.f;
-                        std::memcpy(&bits[j], &v, 4);
-                    }
-                    int max_exp = 0;
-                    for (uint32_t bt : bits) max_exp = std::max(max_exp, static_cast<int>((bt >> 23) & 0xFF));
-                    blk[0] = static_cast<uint8_t>(max_exp);
-                    for (size_t j = 0; j < 8; ++j) {
-                        const int e = static_cast<int>((bits[j] >> 23) & 0xFF);
-                        int64_t mant = static_cast<int64_t>(bits[j] & 0x7FFFFF) | (e != 0 ? (int64_t{1} << 23) : 0);
-                        if (bits[j] >> 31) mant = -mant;
-                        const int shift = 17 + std::min(max_exp - e, 31);
-                        // floor((mant + half) / 2^shift): an arithmetic shift is the floor
-                        int64_t q = (mant + (int64_t{1} << (shift - 1))) >> shift;
-                        q = std::clamp<int64_t>(q, -128, 127);
-                        blk[1 + j] = static_cast<uint8_t>(static_cast<int8_t>(q));
-                    }
+                    float v8[8];
+                    for (size_t j = 0; j < 8; ++j) v8[j] = col < n ? W[col * k + k0 + j] : 0.f;
+                    bfp_encode8(v8, blk);
                 }
     }
 }
@@ -443,7 +469,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (!man_.gemm_dit.is_null())   // dit_on_ is decided later; loading an unused kernel is harmless
         for (const auto& [shape, k] : man_.gemm_dit["kernels"].items()) wanted[k.get<std::string>()] = true;
     if (man_.gemm_dit.contains("ffn"))
-        for (const char* f : {"up", "down"}) wanted[man_.gemm_dit["ffn"][f].get<std::string>()] = true;
+        for (const auto& [f, v] : man_.gemm_dit["ffn"].items())
+            if (v.is_string()) wanted[v.get<std::string>()] = true;
+    if (man_.gemm_dit.contains("kernels2"))
+        for (const auto& [shape, k] : man_.gemm_dit["kernels2"].items()) wanted[k.get<std::string>()] = true;
     for (const auto& [name, d] : w_->kernels)
         if (wanted.count(name)) load_kernel(name, d);
     logits_host_.assign(w_->vocab, 0.f);
@@ -3295,6 +3324,16 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         need("pp_y_" + std::to_string(c), M * hid * 2);
     }
     need("pp_h", M * 2 * ff * 2);
+    // designs/dit2 (bfp16 A, host-packed): the shapes it serves, and their own A buffers
+    static const nlohmann::json kEmpty = nlohmann::json::object();
+    const nlohmann::json& K2 = D.contains("kernels2") ? D["kernels2"] : kEmpty;
+    const bool up2 = D["ffn"].contains("up2");
+    auto has2 = [&](size_t n, size_t k) { return K2.contains(std::to_string(n) + "x" + std::to_string(k)); };
+    if (!K2.empty() || up2)
+        for (size_t c = 0; c < C; ++c) {
+            need("pp_a2_" + std::to_string(c), M * hid * 9 / 8);
+            need("pp_m2_" + std::to_string(c), M * wmid * 9 / 8);
+        }
     // host rows
     std::vector<float> xres(TOT * hid), res(TOT * hid), xn(TOT * hid);
     for (size_t t = 0; t < TOT; ++t)
@@ -3347,11 +3386,23 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 };
                 if (s == 1) {
                     const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
-                    run(kname(nq, hid), {"pp_a_" + cs, gb.program[0].args[0], "pp_q_" + cs});
+                    if (has2(nq, hid))
+                        run(K2[std::to_string(nq) + "x" + std::to_string(hid)].get<std::string>(),
+                            {"pp_a2_" + cs, gb.program[0].args[0], "pp_q_" + cs});
+                    else
+                        run(kname(nq, hid), {"pp_a_" + cs, gb.program[0].args[0], "pp_q_" + cs});
                 } else if (s == 3) {
-                    run(kname(hid, gb.kind == "linear" ? gb.vw : gb.qw), {"pp_m_" + cs, gb.program[1].args[0], "pp_y_" + cs});
+                    const size_t km = gb.kind == "linear" ? gb.vw : gb.qw;
+                    if (has2(hid, km))
+                        run(K2[std::to_string(hid) + "x" + std::to_string(km)].get<std::string>(),
+                            {"pp_m2_" + cs, gb.program[1].args[0], "pp_y_" + cs});
+                    else
+                        run(kname(hid, km), {"pp_m_" + cs, gb.program[1].args[0], "pp_y_" + cs});
                 } else {
-                    run(D["ffn"]["up"].get<std::string>(), {"pp_a_" + cs, gb.ffn_program[0].args[0], "pp_h"});
+                    if (up2)
+                        run(D["ffn"]["up2"].get<std::string>(), {"pp_a2_" + cs, gb.ffn_program[0].args[0], "pp_h"});
+                    else
+                        run(D["ffn"]["up"].get<std::string>(), {"pp_a_" + cs, gb.ffn_program[0].args[0], "pp_h"});
                     run(D["ffn"]["down"].get<std::string>(), {"pp_h", gb.ffn_program[1].args[0], "pp_y_" + cs});
                 }
                 npu_busy_ms += ms_since(tb);
@@ -3376,6 +3427,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
 #pragma omp parallel for
         for (long long i = 0; i < static_cast<long long>(rows * w); ++i) d[i] = f32_to_bf16(src[i]);
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE, rows * w * 2, 0);
+    };
+    auto to_bfp2 = [&](const float* src, size_t w, const std::string& buf) {
+        xrt::bo& b = buffer(buf, 0);
+        dit2_pack_a(src, M, M, w, b.map<uint8_t*>());
+        b.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * w * 9 / 8, 0);
     };
     std::vector<float> ya, yb, yc, yd, og;
     try {
@@ -3402,7 +3458,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             auto th = std::chrono::steady_clock::now();
             if (s == 0) {
                 host::rmsnorm_rows(xr, M, hid, hc.ln.data(), gb.eps, xc);
-                to_bf16(xc, M, hid, "pp_a_" + cs);
+                const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
+                if (has2(nq, hid)) to_bfp2(xc, hid, "pp_a2_" + cs);
+                else to_bf16(xc, M, hid, "pp_a_" + cs);
             } else if (s == 2) {
                 xrt::bo& qb = buffer("pp_q_" + cs, 0);
                 const bool lin = gb.kind == "linear";
@@ -3434,7 +3492,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     timing_.dn_conv_ms += ph[0];
                     timing_.dn_rule_ms += ph[1];
                     if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
-                    to_bf16(og.data(), M, vw, "pp_m_" + cs);
+                    if (has2(hid, vw)) to_bfp2(og.data(), vw, "pp_m2_" + cs);
+                    else to_bf16(og.data(), M, vw, "pp_m_" + cs);
                 } else {
                     const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
                     if (c == 0 && pos0 > 0) read_back(st, pos0 * row, 0);
@@ -3455,7 +3514,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                           man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
                     timing_.attn_ms += ms_since(ta);
                     if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, N * row, pos0 * row);
-                    to_bf16(og.data(), M, qw, "pp_m_" + cs);
+                    if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs);
+                    else to_bf16(og.data(), M, qw, "pp_m_" + cs);
                 }
             } else if (s == 4) {
                 xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
@@ -3464,7 +3524,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
 #pragma omp parallel for
                 for (long long i = 0; i < static_cast<long long>(M * hid); ++i) rs[i] = xr[i] + bf16_to_f32(y16[i]);
                 host::rmsnorm_rows(rs, M, hid, hc.postln.data(), gb.eps, xc);
-                to_bf16(xc, M, hid, "pp_a_" + cs);
+                if (up2) to_bfp2(xc, hid, "pp_a2_" + cs);
+                else to_bf16(xc, M, hid, "pp_a_" + cs);
             } else {
                 xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
                 read_back(yb2, M * hid * 2, 0);

@@ -172,51 +172,292 @@ void tile_x(const float* x, size_t T, size_t K, uint16_t* out) {
         }
 }
 
+// 16-lane vector helpers for the DeltaNet (GCC vector types: one body for the AVX-512 and AVX2
+// clones). dn_exp is the Cephes expf polynomial over [-87, 88].
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpsabi"
+typedef float dnv __attribute__((vector_size(64)));
+typedef int32_t dni __attribute__((vector_size(64)));
+typedef float dnu __attribute__((vector_size(64), aligned(4)));
+__attribute__((always_inline)) inline dnv dn_ld(const float* p) { return *reinterpret_cast<const dnu*>(p); }
+__attribute__((always_inline)) inline void dn_st(float* p, dnv v) { *reinterpret_cast<dnu*>(p) = v; }
+__attribute__((always_inline)) inline dnv dn_bc(float c) { return dnv{} + c; }
+__attribute__((always_inline)) inline dnv dn_exp(dnv x) {
+    x = x < dn_bc(-87.f) ? dn_bc(-87.f) : x;
+    x = x > dn_bc(88.f) ? dn_bc(88.f) : x;
+    const dnv t = x * 1.44269504088896341f + 12582912.f;
+    const dnv n = t - 12582912.f;
+    const dni ni = reinterpret_cast<dni>(t) - 0x4B400000;
+    dnv r = x - n * 0.693359375f;
+    r = r - n * -2.12194440e-4f;
+    dnv p = dn_bc(1.9875691500e-4f);
+    p = p * r + 1.3981999507e-3f;
+    p = p * r + 8.3334519073e-3f;
+    p = p * r + 4.1665795894e-2f;
+    p = p * r + 1.6666665459e-1f;
+    p = p * r + 5.0000001201e-1f;
+    const dnv y = p * r * r + r + 1.f;
+    return reinterpret_cast<dnv>(reinterpret_cast<dni>(y) + (ni << 23));
+}
+__attribute__((always_inline)) inline dnv dn_silu(dnv x) { return x / (dn_bc(1.f) + dn_exp(-x)); }
+
+// The gated delta rule in chunks of (up to) 4 tokens, head_dim 128 -- the same recurrence
+// (S_t = a_t S_{t-1} + k_t d_t^T, d_t = b_t (v_t - a_t S_{t-1}^T k_t), o_t = S_t^T q_t) in its
+// exact chunked form: with G_t = a_0..a_t and r_ts = a_{s+1}..a_t,
+//   d_t = b_t (v_t - G_t S0^T k_t - sum_{s<t} r_ts (k_t.k_s) d_s)
+//   o_t = G_t S0^T q_t + sum_{s<=t} r_ts (q_t.k_s) d_s
+//   S   = G_last S0 + sum_s r_{last,s} k_s d_s^T
+// One pass over S per chunk: the update of chunk n and the S^T k / S^T q of chunk n + 1 are
+// computed row by row together, so S is read and written once per 4 tokens instead of read
+// twice and written once per token (the recurrent form was bound by that traffic, ~7K cycles a
+// token-head for ~32K FMAs). Columns go in quarters of 32 so the 16 + 8 accumulators fit the
+// 32 vector registers. OFLM_OPEN_DN_RECURRENT=1 runs the recurrent form instead.
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
+void delta_rule_chunk4(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, const float* Qp, const float* Kp,
+                       const float* Vp, const float* decayp, const float* betap, const float* z, const float* nw, float* S,
+                       float* og) {
+    constexpr size_t D = 128, CN = 4;
+    const size_t key_w = g.key_heads * D, vw = g.value_heads * D, nv = g.value_heads;
+    const size_t nchunks = (R + CN - 1) / CN;
+#pragma omp parallel for schedule(static)
+    for (long long hh = 0; hh < static_cast<long long>(nv); ++hh) {
+        const size_t h = static_cast<size_t>(hh), kh = h / grp;
+        float* Sh = S + h * g.s_rows * D;
+        alignas(64) float P[CN][D], Qs[CN][D], dl[CN][D], o[D], on[D];
+        // S0^T k and S0^T q for chunk 0 (a plain pass)
+        auto first_pass = [&](size_t t0, size_t nt) {
+            for (size_t u = 0; u < CN; ++u)
+                for (size_t j = 0; j < D; ++j) P[u][j] = Qs[u][j] = 0.f;
+            for (size_t i = 0; i < D; ++i) {
+                const float* Si = Sh + i * D;
+                for (size_t u = 0; u < nt; ++u) {
+                    const float ki = Kp[(t0 + u) * key_w + kh * D + i], qi = Qp[(t0 + u) * key_w + kh * D + i];
+                    for (size_t j = 0; j < D; j += 16) {
+                        dn_st(&P[u][j], dn_ld(&P[u][j]) + dn_bc(ki) * dn_ld(Si + j));
+                        dn_st(&Qs[u][j], dn_ld(&Qs[u][j]) + dn_bc(qi) * dn_ld(Si + j));
+                    }
+                }
+            }
+        };
+        first_pass(0, std::min(CN, R));
+        for (size_t c = 0; c < nchunks; ++c) {
+            const size_t t0 = c * CN, nt = std::min(CN, R - t0);
+            const float* kt[CN];
+            const float* qt[CN];
+            float a[CN], b[CN], G[CN];
+            for (size_t u = 0; u < nt; ++u) {
+                kt[u] = Kp + (t0 + u) * key_w + kh * D;
+                qt[u] = Qp + (t0 + u) * key_w + kh * D;
+                a[u] = decayp[(t0 + u) * nv + h];
+                b[u] = betap[(t0 + u) * nv + h];
+                G[u] = (u ? G[u - 1] : 1.f) * a[u];
+            }
+            // r[t][s] = a_{s+1} .. a_t (s <= t)
+            float r[CN][CN], KK[CN][CN], QK[CN][CN];
+            for (size_t t = 0; t < nt; ++t) {
+                r[t][t] = 1.f;
+                for (size_t s2 = t; s2-- > 0;) r[t][s2] = r[t][s2 + 1] * a[s2 + 1];
+                for (size_t s2 = 0; s2 <= t; ++s2) {
+                    dnv kk{}, qk{};
+                    for (size_t i = 0; i < D; i += 16) {
+                        const dnv ks = dn_ld(kt[s2] + i);
+                        kk += dn_ld(kt[t] + i) * ks;
+                        qk += dn_ld(qt[t] + i) * ks;
+                    }
+                    float a1 = 0.f, a2 = 0.f;
+                    for (int e = 0; e < 16; ++e) { a1 += kk[e]; a2 += qk[e]; }
+                    KK[t][s2] = a1;
+                    QK[t][s2] = a2;
+                }
+            }
+            // d_t, then o_t
+            for (size_t t = 0; t < nt; ++t) {
+                const float* v = Vp + (t0 + t) * vw + h * D;
+                for (size_t j = 0; j < D; j += 16) {
+                    dnv x = dn_ld(v + j) - dn_bc(G[t]) * dn_ld(&P[t][j]);
+                    for (size_t s2 = 0; s2 < t; ++s2) x = x - dn_bc(r[t][s2] * KK[t][s2]) * dn_ld(&dl[s2][j]);
+                    dn_st(&dl[t][j], dn_bc(b[t]) * x);
+                }
+            }
+            for (size_t t = 0; t < nt; ++t) {
+                for (size_t j = 0; j < D; j += 16) {
+                    dnv x = dn_bc(G[t]) * dn_ld(&Qs[t][j]);
+                    for (size_t s2 = 0; s2 <= t; ++s2) x = x + dn_bc(r[t][s2] * QK[t][s2]) * dn_ld(&dl[s2][j]);
+                    dn_st(o + j, x * dn_bc(inv_sqrt));
+                }
+                rms_vec(o, D, nw, g.eps, on);
+                float* out = og + (t0 + t) * vw + h * D;
+                const float* zz = z + (t0 + t) * vw + h * D;
+                for (size_t j = 0; j < D; j += 16) dn_st(out + j, dn_ld(on + j) * dn_silu(dn_ld(zz + j)));
+            }
+            // S <- G_last S + sum_s r[last][s] k_s d_s^T, fused with the next chunk's S^T k, S^T q
+            const size_t last = nt - 1;
+            float cs[CN];
+            for (size_t s2 = 0; s2 < nt; ++s2) cs[s2] = r[last][s2];
+            const dnv gl = dn_bc(G[last]);
+            const size_t n0 = t0 + CN, nn = n0 < R ? std::min(CN, R - n0) : 0;
+            const float* kn[CN];
+            const float* qn[CN];
+            for (size_t u = 0; u < nn; ++u) {
+                kn[u] = Kp + (n0 + u) * key_w + kh * D;
+                qn[u] = Qp + (n0 + u) * key_w + kh * D;
+            }
+            if (nt == CN && nn == CN) {
+                // the bulk: every count a constant, so the 16 accumulators and 8 deltas stay in registers
+                const float *k0 = kt[0], *k1 = kt[1], *k2 = kt[2], *k3 = kt[3];
+                const float *nk0 = kn[0], *nk1 = kn[1], *nk2 = kn[2], *nk3 = kn[3];
+                const float *nq0 = qn[0], *nq1 = qn[1], *nq2 = qn[2], *nq3 = qn[3];
+                for (size_t jq = 0; jq < D; jq += 32) {
+                    const dnv e00 = dn_ld(&dl[0][jq]), e01 = dn_ld(&dl[0][jq + 16]), e10 = dn_ld(&dl[1][jq]),
+                              e11 = dn_ld(&dl[1][jq + 16]), e20 = dn_ld(&dl[2][jq]), e21 = dn_ld(&dl[2][jq + 16]),
+                              e30 = dn_ld(&dl[3][jq]), e31 = dn_ld(&dl[3][jq + 16]);
+                    dnv pa0{}, pa1{}, pb0{}, pb1{}, pc0{}, pc1{}, pd0{}, pd1{};
+                    dnv qa0{}, qa1{}, qb0{}, qb1{}, qc0{}, qc1{}, qd0{}, qd1{};
+                    for (size_t i = 0; i < D; ++i) {
+                        float* Si = Sh + i * D + jq;
+                        const dnv w0 = dn_bc(cs[0] * k0[i]), w1 = dn_bc(cs[1] * k1[i]), w2 = dn_bc(cs[2] * k2[i]),
+                                  w3 = dn_bc(cs[3] * k3[i]);
+                        const dnv s0 = gl * dn_ld(Si) + w0 * e00 + w1 * e10 + w2 * e20 + w3 * e30;
+                        const dnv s1 = gl * dn_ld(Si + 16) + w0 * e01 + w1 * e11 + w2 * e21 + w3 * e31;
+                        dn_st(Si, s0);
+                        dn_st(Si + 16, s1);
+                        const dnv u0 = dn_bc(nk0[i]), u1 = dn_bc(nk1[i]), u2 = dn_bc(nk2[i]), u3 = dn_bc(nk3[i]);
+                        pa0 += u0 * s0; pa1 += u0 * s1; pb0 += u1 * s0; pb1 += u1 * s1;
+                        pc0 += u2 * s0; pc1 += u2 * s1; pd0 += u3 * s0; pd1 += u3 * s1;
+                        const dnv v0 = dn_bc(nq0[i]), v1 = dn_bc(nq1[i]), v2 = dn_bc(nq2[i]), v3 = dn_bc(nq3[i]);
+                        qa0 += v0 * s0; qa1 += v0 * s1; qb0 += v1 * s0; qb1 += v1 * s1;
+                        qc0 += v2 * s0; qc1 += v2 * s1; qd0 += v3 * s0; qd1 += v3 * s1;
+                    }
+                    dn_st(&P[0][jq], pa0); dn_st(&P[0][jq + 16], pa1); dn_st(&P[1][jq], pb0); dn_st(&P[1][jq + 16], pb1);
+                    dn_st(&P[2][jq], pc0); dn_st(&P[2][jq + 16], pc1); dn_st(&P[3][jq], pd0); dn_st(&P[3][jq + 16], pd1);
+                    dn_st(&Qs[0][jq], qa0); dn_st(&Qs[0][jq + 16], qa1); dn_st(&Qs[1][jq], qb0); dn_st(&Qs[1][jq + 16], qb1);
+                    dn_st(&Qs[2][jq], qc0); dn_st(&Qs[2][jq + 16], qc1); dn_st(&Qs[3][jq], qd0); dn_st(&Qs[3][jq + 16], qd1);
+                }
+                continue;
+            }
+            for (size_t jq = 0; jq < D; jq += 32) {
+                dnv p0[CN], p1[CN], q0[CN], q1[CN];
+                for (size_t u = 0; u < CN; ++u) p0[u] = p1[u] = q0[u] = q1[u] = dnv{};
+                dnv e0[CN], e1[CN];
+                for (size_t s2 = 0; s2 < CN; ++s2) {
+                    e0[s2] = s2 < nt ? dn_ld(&dl[s2][jq]) : dnv{};
+                    e1[s2] = s2 < nt ? dn_ld(&dl[s2][jq + 16]) : dnv{};
+                }
+                for (size_t i = 0; i < D; ++i) {
+                    float* Si = Sh + i * D + jq;
+                    dnv s0 = gl * dn_ld(Si), s1 = gl * dn_ld(Si + 16);
+                    for (size_t s2 = 0; s2 < nt; ++s2) {
+                        const dnv w = dn_bc(cs[s2] * kt[s2][i]);
+                        s0 = s0 + w * e0[s2];
+                        s1 = s1 + w * e1[s2];
+                    }
+                    dn_st(Si, s0);
+                    dn_st(Si + 16, s1);
+                    for (size_t u = 0; u < nn; ++u) {
+                        const dnv ku = dn_bc(kn[u][i]), qu = dn_bc(qn[u][i]);
+                        p0[u] = p0[u] + ku * s0; p1[u] = p1[u] + ku * s1;
+                        q0[u] = q0[u] + qu * s0; q1[u] = q1[u] + qu * s1;
+                    }
+                }
+                for (size_t u = 0; u < nn; ++u) {
+                    dn_st(&P[u][jq], p0[u]); dn_st(&P[u][jq + 16], p1[u]);
+                    dn_st(&Qs[u][jq], q0[u]); dn_st(&Qs[u][jq + 16], q1[u]);
+                }
+            }
+        }
+    }
+}
+
 // The gated delta rule over every token of the block, one head per work item (phase 2 of
-// deltanet_block), cloned for AVX-512: each inner loop runs along j, so the clone keeps the
-// summation order over i and therefore every bit.
+// deltanet_block). For head_dim 128 the per-token work is register-blocked: tv = S^T k and
+// o = S'^T q live in 8 sixteen-lane registers each for the whole pass over S's 128 rows
+// (they were arrays the compiler reloaded and stored per row: ~20K cycles a token-head for
+// ~32K FMAs), and silu is the vector polynomial. Same per-element operation order as the
+// scalar form (sums over i ascending, mul then add), so only silu's last bits differ.
 __attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, const float* Qp, const float* Kp,
                       const float* Vp, const float* decayp, const float* betap, const float* z, const float* nw, float* S,
                       float* og) {
     const size_t dim = g.head_dim, key_w = g.key_heads * dim, vw = g.value_heads * dim;
+    if (dim != 128) {
+#pragma omp parallel for
+        for (long long h = 0; h < static_cast<long long>(g.value_heads); ++h) {
+            std::vector<float> tv(dim), delta(dim), o(dim), on(dim);
+            float* Sh = S + h * g.s_rows * dim;
+            for (size_t t = 0; t < R; ++t) {
+                const float* kk = Kp + t * key_w + (h / grp) * dim;
+                const float* qq = Qp + t * key_w + (h / grp) * dim;
+                const float* v = Vp + t * vw + h * dim;
+                const float dc = decayp[t * g.value_heads + h], bt = betap[t * g.value_heads + h];
+                std::fill(tv.begin(), tv.end(), 0.f);
+                for (size_t i = 0; i < dim; ++i) {
+                    const float* Si = Sh + i * dim;
+                    const float ki = kk[i];
+                    for (size_t j = 0; j < dim; ++j) tv[j] += ki * (Si[j] * dc);
+                }
+                for (size_t j = 0; j < dim; ++j) delta[j] = bt * (v[j] - tv[j]);
+                std::fill(o.begin(), o.end(), 0.f);
+                for (size_t i = 0; i < dim; ++i) {
+                    float* Si = Sh + i * dim;
+                    const float ki = kk[i], qi = qq[i];
+                    for (size_t j = 0; j < dim; ++j) {
+                        const float s = Si[j] * dc + ki * delta[j];
+                        Si[j] = s;
+                        o[j] += s * qi;
+                    }
+                }
+                for (size_t j = 0; j < dim; ++j) o[j] *= inv_sqrt;
+                rms_vec(o.data(), dim, nw, g.eps, on.data());
+                float* out = og + t * vw + h * dim;
+                const float* zz = z + t * vw + h * dim;
+                for (size_t j = 0; j < dim; ++j) out[j] = on[j] * silu(zz[j]);
+            }
+        }
+        return;
+    }
+    if (std::getenv("OFLM_OPEN_DN_RECURRENT") == nullptr) {
+        delta_rule_chunk4(g, R, grp, inv_sqrt, Qp, Kp, Vp, decayp, betap, z, nw, S, og);
+        return;
+    }
 #pragma omp parallel for
     for (long long h = 0; h < static_cast<long long>(g.value_heads); ++h) {
-        std::vector<float> tv(dim), delta(dim), o(dim), on(dim);
         float* Sh = S + h * g.s_rows * dim;
+        alignas(64) float o[128], on[128];
         for (size_t t = 0; t < R; ++t) {
             const float* kk = Kp + t * key_w + (h / grp) * dim;
             const float* qq = Qp + t * key_w + (h / grp) * dim;
             const float* v = Vp + t * vw + h * dim;
             const float dc = decayp[t * g.value_heads + h], bt = betap[t * g.value_heads + h];
-            // The decay is applied twice and stored once instead of stored twice: the first
-            // pass only needs the decayed value to accumulate tv, and recomputing Si[j] * dc
-            // in the second pass is one multiply against a whole 64 KB write of S per token
-            // per head. Same operands, same operation, so the same float -- and the second
-            // pass then adds the same k delta to the same number the first pass would have
-            // left there.
-            std::fill(tv.begin(), tv.end(), 0.f);
-            for (size_t i = 0; i < dim; ++i) {
-                const float* Si = Sh + i * dim;
-                const float ki = kk[i];
-                for (size_t j = 0; j < dim; ++j) tv[j] += ki * (Si[j] * dc);
+            const dnv vdc = dn_bc(dc);
+            dnv t0{}, t1{}, t2{}, t3{}, t4{}, t5{}, t6{}, t7{};
+            for (size_t i = 0; i < 128; ++i) {
+                const float* Si = Sh + i * 128;
+                const dnv ki = dn_bc(kk[i]);
+                t0 += ki * (dn_ld(Si) * vdc);       t1 += ki * (dn_ld(Si + 16) * vdc);
+                t2 += ki * (dn_ld(Si + 32) * vdc);  t3 += ki * (dn_ld(Si + 48) * vdc);
+                t4 += ki * (dn_ld(Si + 64) * vdc);  t5 += ki * (dn_ld(Si + 80) * vdc);
+                t6 += ki * (dn_ld(Si + 96) * vdc);  t7 += ki * (dn_ld(Si + 112) * vdc);
             }
-            for (size_t j = 0; j < dim; ++j) delta[j] = bt * (v[j] - tv[j]);
-            std::fill(o.begin(), o.end(), 0.f);
-            for (size_t i = 0; i < dim; ++i) {
-                float* Si = Sh + i * dim;
-                const float ki = kk[i], qi = qq[i];
-                for (size_t j = 0; j < dim; ++j) {
-                    const float s = Si[j] * dc + ki * delta[j];
-                    Si[j] = s;
-                    o[j] += s * qi;
-                }
+            const dnv vbt = dn_bc(bt);
+            const dnv d0 = vbt * (dn_ld(v) - t0), d1 = vbt * (dn_ld(v + 16) - t1), d2 = vbt * (dn_ld(v + 32) - t2),
+                      d3 = vbt * (dn_ld(v + 48) - t3), d4 = vbt * (dn_ld(v + 64) - t4), d5 = vbt * (dn_ld(v + 80) - t5),
+                      d6 = vbt * (dn_ld(v + 96) - t6), d7 = vbt * (dn_ld(v + 112) - t7);
+            dnv o0{}, o1{}, o2{}, o3{}, o4{}, o5{}, o6{}, o7{};
+            for (size_t i = 0; i < 128; ++i) {
+                float* Si = Sh + i * 128;
+                const dnv ki = dn_bc(kk[i]), qi = dn_bc(qq[i]);
+#define DN_ROW(J, D, O) { const dnv s_ = dn_ld(Si + J) * vdc + ki * D; dn_st(Si + J, s_); O += s_ * qi; }
+                DN_ROW(0, d0, o0) DN_ROW(16, d1, o1) DN_ROW(32, d2, o2) DN_ROW(48, d3, o3)
+                DN_ROW(64, d4, o4) DN_ROW(80, d5, o5) DN_ROW(96, d6, o6) DN_ROW(112, d7, o7)
+#undef DN_ROW
             }
-            for (size_t j = 0; j < dim; ++j) o[j] *= inv_sqrt;
-            rms_vec(o.data(), dim, nw, g.eps, on.data());
+            const dnv is = dn_bc(inv_sqrt);
+            dn_st(o, o0 * is); dn_st(o + 16, o1 * is); dn_st(o + 32, o2 * is); dn_st(o + 48, o3 * is);
+            dn_st(o + 64, o4 * is); dn_st(o + 80, o5 * is); dn_st(o + 96, o6 * is); dn_st(o + 112, o7 * is);
+            rms_vec(o, dim, nw, g.eps, on);
             float* out = og + t * vw + h * dim;
             const float* zz = z + t * vw + h * dim;
-            for (size_t j = 0; j < dim; ++j) out[j] = on[j] * silu(zz[j]);
+            for (size_t j = 0; j < 128; j += 16) dn_st(out + j, dn_ld(on + j) * dn_silu(dn_ld(zz + j)));
         }
     }
 }
@@ -275,7 +516,11 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                     for (; j < nch; ++j) c[j] += cw[j] * bf16r(v[j]);
                 }
             }
-            for (size_t j = 0; j < nch; ++j) c[j] = silu(c[j]);
+            {   // silu, 16 lanes at a time (nch is a multiple of 16 at every Qwen3.5 width)
+                size_t j = 0;
+                for (; j + 16 <= nch; j += 16) dn_st(c.data() + j, dn_silu(dn_ld(c.data() + j)));
+                for (; j < nch; ++j) c[j] = silu(c[j]);
+            }
             for (size_t hh = 0; hh < g.key_heads; ++hh)
                 for (int which = 0; which < 2; ++which) {
                     const float* src = c.data() + which * key_w + hh * dim;
