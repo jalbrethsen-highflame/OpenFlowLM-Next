@@ -55,6 +55,32 @@ bool dit_ffn_on() {
     return on;
 }
 
+// The same block with AVX2 (bit-identical: every shift past 24 yields 0 for a 24-bit mantissa,
+// so the int32 lanes never overflow, and the arithmetic shift is the same floor).
+__attribute__((target("avx2"))) inline void bfp_encode8_avx2(const float* v, uint8_t* blk) {
+    const __m256i bits = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(v));
+    const __m256i e = _mm256_and_si256(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(0xFF));
+    __m256i mx = _mm256_max_epi32(e, _mm256_permute2x128_si256(e, e, 1));
+    mx = _mm256_max_epi32(mx, _mm256_shuffle_epi32(mx, 0x4E));
+    mx = _mm256_max_epi32(mx, _mm256_shuffle_epi32(mx, 0xB1));
+    const __m256i implicit = _mm256_andnot_si256(_mm256_cmpeq_epi32(e, _mm256_setzero_si256()), _mm256_set1_epi32(1 << 23));
+    __m256i mant = _mm256_or_si256(_mm256_and_si256(bits, _mm256_set1_epi32(0x7FFFFF)), implicit);
+    const __m256i neg = _mm256_srai_epi32(bits, 31);                      // -1 where negative
+    mant = _mm256_sub_epi32(_mm256_xor_si256(mant, neg), neg);           // two's complement negate
+    const __m256i shift = _mm256_add_epi32(_mm256_sub_epi32(mx, e), _mm256_set1_epi32(17));
+    const __m256i big = _mm256_cmpgt_epi32(shift, _mm256_set1_epi32(24));
+    const __m256i sh = _mm256_min_epi32(shift, _mm256_set1_epi32(24));
+    const __m256i half = _mm256_sllv_epi32(_mm256_set1_epi32(1), _mm256_sub_epi32(sh, _mm256_set1_epi32(1)));
+    __m256i q = _mm256_srav_epi32(_mm256_add_epi32(mant, half), sh);
+    q = _mm256_andnot_si256(big, q);
+    q = _mm256_max_epi32(_mm256_min_epi32(q, _mm256_set1_epi32(127)), _mm256_set1_epi32(-128));
+    const __m128i lo = _mm256_castsi256_si128(q), hi = _mm256_extracti128_si256(q, 1);
+    const __m128i w16 = _mm_packs_epi32(lo, hi);
+    const __m128i b8 = _mm_packs_epi16(w16, w16);
+    blk[0] = static_cast<uint8_t>(_mm256_cvtsi256_si32(mx));
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(blk + 1), b8);
+}
+
 inline void bfp_encode8(const float* v, uint8_t* blk) {
     uint32_t bits[8];
     std::memcpy(bits, v, 32);
@@ -88,7 +114,7 @@ void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out) 
                 for (size_t rb = 0; rb < 4; ++rb)
                     for (size_t i = 0; i < 8; ++i) {
                         const size_t r = rc * 128 + q * 32 + rb * 8 + i, k0 = ks * 64 + kb * 8;
-                        bfp_encode8(r < rows ? x + r * K + k0 : zero, o);
+                        bfp_encode8_avx2(r < rows ? x + r * K + k0 : zero, o);
                         o += 9;
                     }
     }
@@ -130,7 +156,7 @@ void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8
                     uint8_t* blk = out + ((((nt * KT + kt) * 16 + nb) * 8 + kb) * 8 + nin) * 9;
                     float v8[8];
                     for (size_t j = 0; j < 8; ++j) v8[j] = col < n ? W[col * k + k0 + j] : 0.f;
-                    bfp_encode8(v8, blk);
+                    bfp_encode8_avx2(v8, blk);
                 }
     }
 }
