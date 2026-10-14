@@ -3362,10 +3362,18 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     const nlohmann::json& K2 = D.contains("kernels2") ? D["kernels2"] : kEmpty;
     const bool up2 = D["ffn"].contains("up2");
     auto has2 = [&](size_t n, size_t k) { return K2.contains(std::to_string(n) + "x" + std::to_string(k)); };
+    // down2: the FFN down GEMM on dit2 as well. Then the FFN is three stages -- 5 N up (into this
+    // chunk's own H), 6 H gather h + pack bfp16, 7 N down -- and the residual moves to stage 8.
+    const bool down2 = up2 && D["ffn"].contains("down2");
+    const int NST = down2 ? 9 : 7;
     if (!K2.empty() || up2)
         for (size_t c = 0; c < C; ++c) {
             need("pp_a2_" + std::to_string(c), M * hid * 9 / 8);
             need("pp_m2_" + std::to_string(c), M * wmid * 9 / 8);
+            if (down2) {
+                need("pp_h_" + std::to_string(c), M * 2 * ff * 2);
+                need("pp_d2_" + std::to_string(c), M * ff * 9 / 8);
+            }
         }
     // host rows
     std::vector<float> xres(TOT * hid), res(TOT * hid), xn(TOT * hid);
@@ -3382,8 +3390,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     auto cell = [&](size_t l, size_t c) { return l * C + c; };
     auto ready = [&](size_t l, size_t c, bool npu) {
         const int s = stage[cell(l, c)];
-        if (busy[cell(l, c)] || s >= 7 || ((s & 1) != 0) != npu) return false;
-        if (s == 0) return l == 0 || stage[cell(l - 1, c)] >= 7;
+        if (busy[cell(l, c)] || s >= NST || ((s & 1) != 0) != npu) return false;
+        if (s == 0) return l == 0 || stage[cell(l - 1, c)] >= NST;
         if (s == 2) return c == 0 || stage[cell(l, c - 1)] >= 3;
         return true;
     };
@@ -3394,7 +3402,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         return false;
     };
     double npu_busy_ms = 0, npu_idle_ms = 0, host_idle_ms = 0;
-    double hst[7] = {0, 0, 0, 0, 0, 0, 0};
+    double hst[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};   // [6] = residual, [8] = the h pack (down2)
 
     // ---- the NPU thread
     std::thread npu([&] {
@@ -3431,6 +3439,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             {"pp_m2_" + cs, gb.program[1].args[0], "pp_y_" + cs});
                     else
                         run(kname(hid, km), {"pp_m_" + cs, gb.program[1].args[0], "pp_y_" + cs});
+                } else if (down2 && s == 5) {
+                    run(D["ffn"]["up2"].get<std::string>(), {"pp_a2_" + cs, gb.ffn_program[0].args[0], "pp_h_" + cs});
+                } else if (down2 && s == 7) {
+                    run(D["ffn"]["down2"].get<std::string>(), {"pp_d2_" + cs, gb.ffn_program[1].args[0], "pp_y_" + cs});
                 } else {
                     if (up2)
                         run(D["ffn"]["up2"].get<std::string>(), {"pp_a2_" + cs, gb.ffn_program[0].args[0], "pp_h"});
@@ -3466,7 +3478,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         dit2_pack_a(src, M, M, w, b.map<uint8_t*>());
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * w * 9 / 8, 0);
     };
-    std::vector<float> ya, yb, yc, yd, og;
+    std::vector<float> ya, yb, yc, yd, og, hf;
     try {
         for (;;) {
             size_t l = 0, c = 0;
@@ -3559,6 +3571,16 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 host::rmsnorm_rows(rs, M, hid, hc.postln.data(), gb.eps, xc);
                 if (up2) to_bfp2(xc, hid, "pp_a2_" + cs);
                 else to_bf16(xc, M, hid, "pp_a_" + cs);
+            } else if (down2 && s == 6) {
+                // h = the first 64 of every 128 columns of the up GEMM's C, packed as dit2's A
+                xrt::bo& hb = buffer("pp_h_" + cs, 0);
+                read_back(hb, M * 2 * ff * 2, 0);
+                const uint16_t* h16 = hb.map<const uint16_t*>();
+                hf.resize(M * ff);
+#pragma omp parallel for
+                for (long long r = 0; r < static_cast<long long>(M); ++r)
+                    for (size_t j = 0; j < ff; ++j) hf[r * ff + j] = bf16_to_f32(h16[r * 2 * ff + (j / 64) * 128 + j % 64]);
+                to_bfp2(hf.data(), ff, "pp_d2_" + cs);
             } else {
                 xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
                 read_back(yb2, M * hid * 2, 0);
@@ -3566,11 +3588,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
 #pragma omp parallel for
                 for (long long i = 0; i < static_cast<long long>(M * hid); ++i) xr[i] = rs[i] += bf16_to_f32(y16[i]);
             }
-            hst[s] += ms_since(th);
+            hst[s == NST - 1 ? 6 : (s == 6 ? 8 : s)] += ms_since(th);
             {
                 std::lock_guard<std::mutex> lk(mu);
                 busy[cell(l, c)] = 0;
-                if (++stage[cell(l, c)] >= 7) ++finished;
+                if (++stage[cell(l, c)] >= NST) ++finished;
             }
             cv.notify_all();
         }
@@ -3595,12 +3617,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     if (want_logits) tail_logits(xres.data() + (N - 1) * hid);
     timing_.total_ms = ms_since(t0);
     timing_.part0_ms = npu_busy_ms;
-    timing_.part1_ms = hst[0] + hst[2] + hst[4] + hst[6];
+    timing_.part1_ms = hst[0] + hst[2] + hst[4] + hst[6] + hst[8];
     timing_.mid_ms = hst[2];
     std::fprintf(stderr, "open_qwen36: pipe %zu tokens (%zu chunks of %zu, %zu layers): %.0f ms | NPU busy %.0f idle %.0f | host "
-                         "pre %.0f mid %.0f (dn conv %.0f rule %.0f attn %.0f) tail %.0f res %.0f idle %.0f\n",
+                         "pre %.0f mid %.0f (dn conv %.0f rule %.0f attn %.0f) tail %.0f hpack %.0f res %.0f idle %.0f\n",
                  N, C, M, L, timing_.total_ms, npu_busy_ms, npu_idle_ms, hst[0], hst[2], timing_.dn_conv_ms,
-                 timing_.dn_rule_ms, timing_.attn_ms, hst[4], hst[6], host_idle_ms);
+                 timing_.dn_rule_ms, timing_.attn_ms, hst[4], hst[8], hst[6], host_idle_ms);
 }
 
 void Core::moe_token(int l, const float* xm, const float* res, const float* probs, const int32_t* idx, const float* w,
