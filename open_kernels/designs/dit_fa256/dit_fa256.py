@@ -304,7 +304,10 @@ SPECIALIZE = dict(
     kv_heads=int(os.environ.get("DF_KV_HEADS", 4)),
     lk=int(os.environ.get("DF_LK", 1024)),
     q_off=int(os.environ.get("DF_QOFF", 0)),
-    causal=1,
+    # DF_CAUSAL=0: every query sees keys [0, valid_len) (d3's noncausal full attention); the
+    # engine patches DF_VALID (a sentinel word) to the prompt's length in the stream
+    causal=int(os.environ.get("DF_CAUSAL", 1)),
+    valid_len=int(os.environ.get("DF_VALID", 0)),
     # the engine's layout: Q / O [L, heads * 256]; K and V in place in the KV cache, whose
     # rows are [k (kv_heads * 256) | v (kv_heads * 256)]
     q_ld=int(os.environ.get("DF_Q_LD", 0)),
