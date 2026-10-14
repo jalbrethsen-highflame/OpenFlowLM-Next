@@ -436,8 +436,10 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{k}_n{d['npad'][str(n)]}",
                        "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(d["npad"][str(n)])}}
         for lk, name in d.get("fa", {}).get("lk", {}).items():
-            b[name] = {"design": "dit_fa256/dit_fa256.py", "build_dir": f"dit_fa256/build_l{DIT_M}_lk{lk}",
-                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": str(int(lk) - DIT_M),
+            # DF_EXP_FIX: the corrected exp2 (+9 % kernel time); against host attention on 4K tokens
+            # of docs prose the whole fast path is within noise (NLL -0.0002 +- 0.0016)
+            b[name] = {"design": "dit_fa256/dit_fa256.py", "build_dir": f"dit_fa256/build_l{DIT_M}_lk{lk}_fix",
+                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": str(int(lk) - DIT_M), "DF_EXP_FIX": "1",
                                "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
         if "down2" in d.get("ffn", {}):
             b[d["ffn"]["down2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{d['ffn']['ff']}_n{spec.hidden}",

@@ -3336,6 +3336,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * w * 9 / 8, 0);
     };
     std::vector<float> ya, yb, yc, yd, og, hf;
+    // OFLM_OPEN_FA_CHECK=1 (debug): every NPU-attention chunk also runs host attention, and GATE
+    // prints the NPU output's error against it per (layer, chunk)
+    static const bool fa_check = [] { const char* e = std::getenv("OFLM_OPEN_FA_CHECK"); return e && *e == '1'; }();
+    std::map<size_t, std::vector<float>> fa_ref;
     try {
         for (;;) {
             size_t l = 0, c = 0;
@@ -3425,6 +3429,15 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     } else {
                         // NPU attention: q / k normed and roped here, K / V rows into the cache (synced),
                         // Q to the kernel unscaled (it applies 1 / sqrt(hd) itself; prep scaled by it)
+                        if (fa_check) {
+                            std::vector<float> gt(M * qw), ref(M * qw);
+#pragma omp parallel for
+                            for (long long t = 0; t < static_cast<long long>(M); ++t)
+                                for (size_t i = 0; i < qw; ++i) gt[t * qw + i] = bf16_to_f32(q16[t * nq + qw + 2 * kvw + i]);
+                            host::attention_block(g, ya.data(), yb.data(), yc.data(), gt.data(), hc.qn.data(), hc.kn.data(),
+                                                  man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, ref.data());
+                            fa_ref[cell(l, c)] = std::move(ref);
+                        }
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
                                              man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
                         timing_.attn_ms += ms_since(ta);
@@ -3446,6 +3459,22 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         const float gt = bf16_to_f32(q16[t * nq + qw + 2 * kvw + i]);
                         og[t * qw + i] = static_cast<size_t>(t) < t_real ? bf16_to_f32(o16[t * qw + i]) / (1.f + std::exp(-gt)) : 0.f;
                     }
+                if (fa_check && fa_ref.count(cell(l, c))) {
+                    const std::vector<float>& ref = fa_ref[cell(l, c)];
+                    double num = 0, den = 0, worst = 0; size_t wr = 0;
+                    for (size_t t = 0; t < t_real; ++t) {
+                        double n2 = 0, d2 = 0;
+                        for (size_t i = 0; i < qw; ++i) {
+                            const double e = og[t * qw + i] - ref[t * qw + i];
+                            n2 += e * e; d2 += static_cast<double>(ref[t * qw + i]) * ref[t * qw + i];
+                        }
+                        num += n2; den += d2;
+                        const double r = std::sqrt(n2 / std::max(d2, 1e-30));
+                        if (r > worst) { worst = r; wr = t; }
+                    }
+                    std::fprintf(stderr, "fa_check layer %zu chunk %zu: rel_fro %.3e worst row %zu (pos %zu) rel %.3e\n", l, c,
+                                 std::sqrt(num / den), wr, pos0 + r0 + wr, worst);
+                }
                 if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs);
                 else to_bf16(og.data(), M, qw, "pp_m_" + cs);
             } else if (op == TAIL) {
