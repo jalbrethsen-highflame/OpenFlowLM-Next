@@ -263,6 +263,9 @@ DIT_M = 1024
 # dit_gemm's 19.4 at 4096x5120x16384. Every shape but the FFN down (which reads the up GEMM's
 # gathered bf16 C on the device) runs on it. OPEN_QWEN35_GEMM_DIT2=0 keeps dit_gemm everywhere.
 GEMM_DIT2 = _os.environ.get("OPEN_QWEN35_GEMM_DIT2", "1") != "0"
+# designs/dit_fa256: causal GQA flash attention at head dim 256 for the full-attention layers,
+# one instruction stream per key length (q_off = lk - DIT_M) up to FA_MAX_LK, one image.
+FA_MAX_LK = int(_os.environ.get("OPEN_QWEN35_FA_MAX_LK", 32768))
 
 
 def gemm_dit(spec: ModelSpec) -> dict | None:
@@ -294,7 +297,12 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             # the down GEMM on dit2 too: the host packs h (the up GEMM's gathered C) as bfp16
             ffn["down2"] = f"dit2_n{hid}_k{ff}"
             k2.pop(f"{2 * ff}x{hid}", None)
+    fa = None
+    if GEMM_DIT2 and FA_MAX_LK >= DIT_M and spec.has_full and spec.head_dim == 256:
+        fa = {"lk": {str(lk): f"fa256_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)},
+              "q_cols": spec.num_heads * spec.head_dim}
     return {"m": DIT_M,
+            **({"fa": fa} if fa else {}),
             **({"ffn": ffn} if ffn else {}),
             **({"kernels2": k2} if k2 else {}),
             "kernels": {f"{n}x{k}": f"dit_n{npad[n]}_k{k}" for n, k in shapes},
@@ -360,6 +368,12 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         for name in names2:
             out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
             out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
+        for lk, name in d.get("fa", {}).get("lk", {}).items():
+            out["contexts"].setdefault("fa", f"{name}/final.xclbin")
+            out["kernels"][name] = {"context": "fa", "insts": f"{name}/insts.bin", "build": name}
+        if "fa" in d:
+            out["globals"]["fa_q"] = DIT_M * d["fa"]["q_cols"] * 2
+            out["globals"]["fa_o"] = DIT_M * d["fa"]["q_cols"] * 2
         for k in sorted({int(x.split("x")[1]) for x in d.get("kernels2", {})} | ({spec.hidden} if names2 else set())
                         | ({d["ffn"]["ff"]} if "down2" in d.get("ffn", {}) else set())):
             out["globals"][f"dit2_x_k{k}"] = DIT_M * k * 9 // 8
@@ -421,6 +435,10 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             n, k = (int(x) for x in key.split("x"))
             b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{k}_n{d['npad'][str(n)]}",
                        "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(d["npad"][str(n)])}}
+        for lk, name in d.get("fa", {}).get("lk", {}).items():
+            b[name] = {"design": "dit_fa256/dit_fa256.py", "build_dir": f"dit_fa256/build_l{DIT_M}_lk{lk}",
+                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": str(int(lk) - DIT_M),
+                               "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
         if "down2" in d.get("ffn", {}):
             b[d["ffn"]["down2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{d['ffn']['ff']}_n{spec.hidden}",
                                     "env": {"DG_M": str(DIT_M), "DG_K": str(d["ffn"]["ff"]), "DG_N": str(spec.hidden)}}
@@ -452,6 +470,7 @@ KERNEL_SOURCES = [
     "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.cc", "designs/lm_head_q8/*.h",
     "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc", "designs/gemm_q4_prefill/*.h",
     "designs/dit_gemm/*.py", "designs/dit_gemm/*.cc", "designs/dit2/*.py", "designs/dit2/*.cc",
+    "designs/dit_fa256/*.py", "designs/dit_fa256/*.cc",
     "designs/attn_block/attn_gemm.py", "../npu_offload/gemm_rtp/gemm_pretiled.py", "../npu_offload/gemm_rtp/npue.py",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",
 ]
