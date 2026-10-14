@@ -85,6 +85,7 @@ def dit_gemm(
 
     flags = [f"-DDIM_M={m}", f"-DDIM_K={k}", f"-DDIM_N={n}", f"-I{_AIE_KERNELS_INC}"]
     flags += os.environ.get("DG_KFLAGS", "").split()   # timing / variant defines
+    flags += [f"-I{HERE.parent.parent / 'include'}"]       # vecmath.h (the epilogue's silu)
     zero_kernel = ExternalFunction("dit_zero_c", source_file=str(_KERNEL_SRC),
                                    arg_types=[C_l1_ty], compile_flags=flags + ["-DZERO_ONLY"])
     rtp_ty = np.ndarray[(RTP_LEN,), np.dtype[np.int32]]
