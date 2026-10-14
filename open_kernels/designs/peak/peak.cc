@@ -15,10 +15,19 @@
 #endif
 #define NACC 4
 
-#if defined(PEAK_HS) || defined(PEAK_HSREF) || defined(PEAK_HSCHK)
+#if defined(PEAK_B4HSDIAG)
+#define PEAK_B4HSCHK 1
+#endif
+#if defined(PEAK_HS) || defined(PEAK_HSREF) || defined(PEAK_HSCHK) || defined(PEAK_B4) || defined(PEAK_B4CHK) || defined(PEAK_B4HS) || defined(PEAK_B4HSCHK)
 // hand-scheduled dit call (hsgen.py -> hs_call.inc) and the stock 2x2 C++ kernel it must match
 // bit for bit: A [row pair][k][A0, A1], B [column pair][k][B0, B1], C [row block][column block][8][8]
+#if defined(PEAK_HS) || defined(PEAK_HSCHK)
 #include "hs_call.inc"
+#endif
+#if defined(PEAK_B4HS) || defined(PEAK_B4HSCHK)
+#include "hs_b4_call.inc"
+extern "C" void hs_b4_call(const bfp16ebs8 *pA, const uint8_t *pBn, bfloat16 *pC, const int8_t *pE);
+#endif
 extern "C" void hs_call(const bfp16ebs8 *pA, const bfp16ebs8 *pB, bfloat16 *pC);
 static void hs_ref(const bfp16ebs8 *__restrict pA, const bfp16ebs8 *__restrict pB, bfloat16 *__restrict pC) {
   constexpr unsigned rowA = 4, colA = 8, colB = 16, sizeC = 64;
@@ -54,6 +63,63 @@ static uint8_t *hs_base() { return HS_SPLIT ? (uint8_t *)(((uintptr_t)hs_pool + 
 #define hsC2 ((bfloat16 *)(hs_base() + (HS_SPLIT ? 0x8000 : 160 * 72 + 8192)))
 static uint32_t hs_seed;
 static float hs_rnd() { hs_seed = hs_seed * 1664525u + 1013904223u; return (float)((int)((hs_seed >> 8) & 0xFFFF) - 32768) * (1.0f / 32768.0f); }
+// int4-mantissa weights (b4): per weight block (8 columns x 8 k) 32 bytes of nibbles in
+// unpack order, and per column block one exponent byte per column for the call's 64 of K
+// (constant across its 8 k-steps). The block the MAC sees is {unpack(nibbles), exponents}.
+// B nibbles [column pair 8][k 8][2][32 B], exponents [column block 16][8 B].
+static void b4_call(const bfp16ebs8 *__restrict pA, const uint8_t *__restrict pBn, const int8_t *__restrict pBe,
+                    bfloat16 *__restrict pC) {
+  constexpr unsigned colB = 16, sizeC = 64;
+  for (unsigned z = 0; z < 4; z += 2) {
+    bfloat16 *__restrict pC1 = pC + (z * colB) * sizeC;
+    bfloat16 *__restrict pC2 = pC + ((z + 1) * colB) * sizeC;
+    for (unsigned j = 0; j < colB; j += 2) {
+      aie::block_vector_input_buffer_stream<bfp16ebs8, 64> sa(pA); sa.seek(z * 8);
+      const v8int8 e0 = *reinterpret_cast<const v8int8 *>(pBe + j * 8), e1 = *reinterpret_cast<const v8int8 *>(pBe + (j + 1) * 8);
+      aie::accum<accfloat, 64> c00(aie::load_v<64>(pC1)), c01(aie::load_v<64>(pC1 + sizeC));
+      aie::accum<accfloat, 64> c10(aie::load_v<64>(pC2)), c11(aie::load_v<64>(pC2 + sizeC));
+      for (unsigned i = 0; i < 8; ++i) {
+        const auto a0 = sa.pop(), a1 = sa.pop();
+        const uint8_t *nb = pBn + ((j / 2) * 8 + i) * 64;
+        v64bfp16ebs8 b0, b1;
+        b0.mantissa = unpack(*reinterpret_cast<const v64int4 *>(nb)); b0.exponent = e0;
+        b1.mantissa = unpack(*reinterpret_cast<const v64int4 *>(nb + 32)); b1.exponent = e1;
+        const aie::block_vector<bfp16ebs8, 64> B0(b0), B1(b1);
+        c00 = mac_8x8_8x8T(a0, B0, c00); c01 = mac_8x8_8x8T(a0, B1, c01);
+        c10 = mac_8x8_8x8T(a1, B0, c10); c11 = mac_8x8_8x8T(a1, B1, c11);
+      }
+      aie::store_v(pC1, c00.template to_vector<bfloat16>()); pC1 += sizeC;
+      aie::store_v(pC1, c01.template to_vector<bfloat16>()); pC1 += sizeC;
+      aie::store_v(pC2, c10.template to_vector<bfloat16>()); pC2 += sizeC;
+      aie::store_v(pC2, c11.template to_vector<bfloat16>()); pC2 += sizeC;
+    }
+  }
+}
+alignas(64) static uint8_t b4N[128 * 32];      // 128 blocks x 32 B of nibbles
+alignas(64) static uint8_t b4A[32 * 72];       // hsA as [row pair][A0 k 0..7][A1 k 0..7] (hs_b4_call's order)
+static void b4_reorder_a() {
+  for (unsigned z = 0; z < 2; ++z)
+    for (unsigned k = 0; k < 8; ++k)
+      for (unsigned r = 0; r < 2; ++r)
+        for (unsigned i = 0; i < 72; ++i) b4A[((z * 2 + r) * 8 + k) * 72 + i] = hsA[((z * 8 + k) * 2 + r) * 72 + i];
+}
+alignas(64) static int8_t b4E[16 * 8];
+// the same weights as ordinary bfp16 blocks in hs_ref's B order: per group [exponent][8 mantissas]
+static void b4_expand(uint8_t *dst) {
+  for (unsigned blk = 0; blk < 128; ++blk) {          // blk = (pair * 8 + k) * 2 + n2
+    const unsigned cb = (blk / 16) * 2 + blk % 2;
+    for (unsigned g = 0; g < 8; ++g) {
+      uint8_t *o = dst + (blk * 8 + g) * 9;
+      o[0] = static_cast<uint8_t>(b4E[cb * 8 + g]);
+      for (unsigned t = 0; t < 8; ++t) {
+        const unsigned i = g * 8 + t;
+        const uint8_t byte = b4N[blk * 32 + i / 2];
+        int v = (i & 1) ? (byte >> 4) : (byte & 15);
+        o[1 + t] = static_cast<uint8_t>(static_cast<int8_t>(v >= 8 ? v - 16 : v));
+      }
+    }
+  }
+}
 static void hs_fill(uint8_t *dst, unsigned nblk, bool rnd) {
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(reinterpret_cast<bfp16ebs8 *>(dst));
   for (unsigned b = 0; b < nblk; ++b) {
@@ -63,6 +129,19 @@ static void hs_fill(uint8_t *dst, unsigned nblk, bool rnd) {
     o << t.template to_vector<bfp16ebs8>();
   }
 }
+#endif
+#if defined(PEAK_B4PROBE2)
+#include "b4probe2.inc"
+alignas(64) static uint8_t b4qA[3 * 72 + 64];
+alignas(64) static uint8_t b4qN[64];
+alignas(64) static int32_t b4qE[2];
+alignas(64) static bfloat16 b4qC[128];
+#endif
+#if defined(PEAK_B4PROBE)
+#include "b4probe.inc"
+alignas(64) static uint8_t b4pN[96];
+alignas(64) static int32_t b4pE[6];
+alignas(64) static bfloat16 b4pC[64];
 #endif
 extern "C" {
 void peak_run(const int8_t *__restrict in, int32_t *__restrict out) {
@@ -764,6 +843,104 @@ void peak_run(const int8_t *__restrict in, int32_t *__restrict out) {
   out[0] = bad; out[1] = first; out[2] = first >= 0 ? r[first] : 0; out[3] = first >= 0 ? h[first] : 0; out[4] = nz;
   for (unsigned i = 0; i < 64; ++i) out[64 + i] = h[i];
   for (unsigned i = 0; i < 64; ++i) out[128 + i] = r[i];
+#elif defined(PEAK_B4) || defined(PEAK_B4HS)
+  hs_seed = 3; hs_fill(hsA, 32, false);
+  for (unsigned i = 0; i < sizeof(b4N); ++i) b4N[i] = (uint8_t)(i * 37 + 11);
+  for (unsigned i = 0; i < sizeof(b4E); ++i) b4E[i] = (int8_t)(120 + i % 5);
+  for (unsigned i = 0; i < 32 * 128; i += 64) aie::store_v(hsC + i, aie::zeros<bfloat16, 64>());
+  b4_reorder_a();
+  aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
+  for (unsigned call = 0; call < PEAK_ITERS / 512; ++call)
+#ifdef PEAK_B4HS
+    hs_b4_call(reinterpret_cast<const bfp16ebs8 *>(hsA), b4N, hsC, b4E);
+#else
+    b4_call(reinterpret_cast<const bfp16ebs8 *>(hsA), b4N, b4E, hsC);
+#endif
+  aie::set_rounding(saved);
+  aie::store_v(reinterpret_cast<bfloat16 *>(out), aie::load_v<64>(hsC));
+#elif defined(PEAK_B4CHK) || defined(PEAK_B4HSCHK)
+  // out[0] mismatches after 3 calls: b4_call vs hs_ref on the same weights as bfp16 blocks
+  hs_seed = 11 + in[0];
+  hs_fill(hsA, 32, true);
+  for (unsigned i = 0; i < sizeof(b4N); ++i) { hs_rnd(); b4N[i] = (uint8_t)(hs_seed >> 13); }
+  for (unsigned i = 0; i < sizeof(b4E); ++i) { hs_rnd(); b4E[i] = (int8_t)(118 + (hs_seed >> 20) % 8); }
+#ifdef PEAK_B4HSDIAG   // A block (pair, k) = 2^k, mantissas 1, one exponent, C = 0: an output / its
+  // reference x 255 is the bitmask of the k-steps that reached it
+  {
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(reinterpret_cast<bfp16ebs8 *>(hsA));
+    for (unsigned b = 0; b < 32; ++b) {
+      aie::vector<bfloat16, 64> v = aie::broadcast<bfloat16, 64>((bfloat16)(float)(1u << ((b / 2) % 8)));
+      aie::accum<accfloat, 64> t; t.from_vector(v);
+      o << t.template to_vector<bfp16ebs8>();
+    }
+  }
+  for (unsigned i = 0; i < sizeof(b4N); ++i) b4N[i] = 0x11;
+  for (unsigned i = 0; i < sizeof(b4E); ++i) b4E[i] = 120;
+#endif
+  b4_expand(hsB);
+  b4_reorder_a();
+  for (unsigned i = 0; i < 32 * 128; ++i) {
+#ifdef PEAK_B4HSDIAG
+    hsC[i] = (bfloat16)0.f;
+#else
+    hsC[i] = (bfloat16)hs_rnd();
+#endif
+    hsC2[i] = hsC[i];
+  }
+  aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
+  for (unsigned c = 0; c < 3; ++c) {
+    hs_ref(reinterpret_cast<const bfp16ebs8 *>(hsA), reinterpret_cast<const bfp16ebs8 *>(hsB), hsC);
+#ifdef PEAK_B4HSCHK
+    hs_b4_call(reinterpret_cast<const bfp16ebs8 *>(hsA), b4N, hsC2, b4E);
+#else
+    b4_call(reinterpret_cast<const bfp16ebs8 *>(hsA), b4N, b4E, hsC2);
+#endif
+  }
+  aie::set_rounding(saved);
+  const uint16_t *r = reinterpret_cast<const uint16_t *>(hsC), *h = reinterpret_cast<const uint16_t *>(hsC2);
+  int bad = 0, first = -1, nz = 0;
+  for (unsigned i = 0; i < 32 * 128; ++i) {
+    if (r[i] != h[i]) { if (first < 0) first = i; ++bad; }
+    if (h[i] != 0) ++nz;
+  }
+  out[0] = bad; out[1] = first; out[2] = first >= 0 ? r[first] : 0; out[3] = first >= 0 ? h[first] : 0; out[4] = nz;
+#ifdef PEAK_B4HSDIAG
+  for (unsigned i = 0; i < 64; ++i) { out[64 + i] = h[i * 64]; out[128 + i] = r[i * 64]; }   // one value per 8x8 block
+#else
+  for (unsigned i = 0; i < 64; ++i) { out[64 + i] = h[i]; out[128 + i] = r[i]; }
+#endif
+#elif defined(PEAK_B4PROBE)
+  // nibbles: A all 1, B old all 1, B new all 2; exponents: A 127+..., B old e0, B new e1 (each
+  // block's 8 groups the same). out[i] = c[0] of case i (bf16 bits)
+  for (unsigned i = 0; i < 32; ++i) { b4pN[i] = 0x11; b4pN[32 + i] = 0x11; b4pN[64 + i] = 0x22; }
+  const int32_t ea = 0x7a7a7a7a, eo = 0x76767676, en = 0x7e7e7e7e;
+  b4pE[0] = ea; b4pE[1] = ea; b4pE[2] = eo; b4pE[3] = eo; b4pE[4] = en; b4pE[5] = en;
+  aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
+  for (unsigned c = 0; c < b4p_n; ++c) {
+    for (unsigned i = 0; i < 64; ++i) b4pC[i] = (bfloat16)0.f;
+    b4p_cases[c](b4pN, b4pE, b4pC);
+    out[c] = reinterpret_cast<const uint16_t *>(b4pC)[0];
+  }
+  aie::set_rounding(saved);
+#elif defined(PEAK_B4PROBE2)
+  // A blocks 0 / 1 / 2 = 1, 2, 4 (bf16 -> bfp16); weights all mantissa 1; out[2 c] / out[2 c + 1] = c[0] / c[64]
+  {
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(reinterpret_cast<bfp16ebs8 *>(b4qA));
+    for (unsigned b = 0; b < 3; ++b) {
+      aie::accum<accfloat, 64> t; t.from_vector(aie::broadcast<bfloat16, 64>((bfloat16)(float)(1u << b)));
+      o << t.template to_vector<bfp16ebs8>();
+    }
+  }
+  for (unsigned i = 0; i < 64; ++i) b4qN[i] = 0x11;
+  b4qE[0] = 0x78787878; b4qE[1] = 0x78787878;
+  aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
+  for (unsigned c = 0; c < b4q_n; ++c) {
+    for (unsigned i = 0; i < 128; ++i) b4qC[i] = (bfloat16)0.f;
+    b4q_cases[c](reinterpret_cast<const bfp16ebs8 *>(b4qA), b4qN, b4qE, b4qC);
+    out[2 * c] = reinterpret_cast<const uint16_t *>(b4qC)[0];
+    out[2 * c + 1] = reinterpret_cast<const uint16_t *>(b4qC)[64];
+  }
+  aie::set_rounding(saved);
 #endif
 }
 }

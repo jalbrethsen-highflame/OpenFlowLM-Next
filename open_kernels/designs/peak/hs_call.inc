@@ -558,6 +558,6 @@ hs_call:
 	nop
 	nop
 	nop
-.Lhs_end:
-	.size	hs_call, .Lhs_end-hs_call
+.Lhs_call_end:
+	.size	hs_call, .Lhs_call_end-hs_call
 )hs");
