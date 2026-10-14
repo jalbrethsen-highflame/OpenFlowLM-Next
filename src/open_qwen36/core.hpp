@@ -294,6 +294,12 @@ public:
     /// The residual stream at the last prompt position of the last pipelined prompt, before the
     /// final norm (f32, hidden wide).
     const std::vector<float>& last_x() const { return last_x_; }
+    /// Packed decisions (noncausal only): the next pipelined prompt is several independent
+    /// prompts back to back, starting at these rows (the first 0). Each has its own positions
+    /// from 0, its own DeltaNet state and attends only to itself; seg_x() then holds each one's
+    /// last-position residual. Empty: one prompt. Cleared by the prompt that uses it.
+    void set_segments(std::vector<size_t> starts) { segs_ = std::move(starts); }
+    const std::vector<std::vector<float>>& seg_x() const { return seg_x_; }
 
 private:
     struct Kern {
@@ -381,6 +387,8 @@ private:
     void step_prompt_pipe(const std::vector<int>& ids, bool want_logits);
     bool noncausal_ = false;     ///< full-attention layers see the whole prompt (d3); set_noncausal
     std::vector<float> last_x_;  ///< the residual stream at the prompt's last position (before the final norm)
+    std::vector<size_t> segs_;   ///< set_segments: packed prompts' start rows
+    std::vector<std::vector<float>> seg_x_;   ///< each packed prompt's last-position residual
     bool pipe_ok() const;        ///< the block route's GEMMs on dit_gemm (layout.gemm_dit; OFLM_OPEN_GEMM_DIT=0 off)
     std::vector<float> dit_y_;   ///< dit C as f32, row-major, one dispatch
     bool stage_major_on_ = true; ///< each GEMM step over every block, overlapping the host (OFLM_OPEN_STAGE_MAJOR=0 off)
