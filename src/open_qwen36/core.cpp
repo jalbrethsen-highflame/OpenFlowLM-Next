@@ -171,6 +171,40 @@ void dit_encode(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, c
     }
 }
 
+// [n, k] f32 -> dit2's int4-mantissa B (manifest gemm_dit.b4; pack.py pack_b4, the same values):
+// per [128-column tile][64-k tile] 4096 bytes of nibbles, blocks [column pair 8][k-block 8][2] of
+// 8 columns x 8 k (value i = column * 8 + k, low nibble first), then one exponent byte per column:
+// a weight is mantissa (-8..7) x 2^(exponent - 133), the exponent the smallest that keeps the
+// column's 64 values within +-7. colmap as dit_encode.
+constexpr size_t kB4Tile = 4096 + 128;
+void dit_encode_b4(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, const int64_t* colmap = nullptr) {
+    const size_t KT = k / 64, NT = npad / 128;
+#pragma omp parallel for
+    for (long long tt = 0; tt < static_cast<long long>(NT * KT); ++tt) {
+        const size_t nt = static_cast<size_t>(tt) / KT, kt = static_cast<size_t>(tt) % KT;
+        uint8_t* tile = out + (nt * KT + kt) * kB4Tile;
+        std::memset(tile, 0, 4096);
+        for (size_t cl = 0; cl < 128; ++cl) {
+            const size_t c = nt * 128 + cl;
+            const int64_t src = colmap ? colmap[c] : static_cast<int64_t>(c);
+            const float* w = (src >= 0 && static_cast<size_t>(src) < n) ? W + static_cast<size_t>(src) * k + kt * 64 : nullptr;
+            float amax = 0.f;
+            if (w) for (size_t j = 0; j < 64; ++j) amax = std::max(amax, std::fabs(w[j]));
+            int e2 = amax > 0.f ? static_cast<int>(std::ceil(std::log2(static_cast<double>(amax) / 7.0))) : -133;
+            e2 = std::min(std::max(e2, -133), 122);
+            tile[4096 + cl] = static_cast<uint8_t>(e2 + 133);
+            const double inv = std::ldexp(1.0, -e2);
+            const size_t pair = cl / 16, n2 = (cl / 8) % 2, g = cl % 8;
+            for (size_t j = 0; j < 64; ++j) {
+                const int m = w ? static_cast<int>(std::min(7.0, std::max(-8.0, std::nearbyint(w[j] * inv)))) : 0;
+                const size_t kb = j / 8, t = j % 8;
+                const size_t i = (((pair * 8 + kb) * 2 + n2) * 64) + g * 8 + t;
+                tile[i / 2] |= static_cast<uint8_t>((m & 15) << ((i & 1) * 4));
+            }
+        }
+    }
+}
+
 void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8_t* out,
                      const int64_t* colmap = nullptr, bool hs = false) {
     std::vector<float> W(n * k);
@@ -636,6 +670,7 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (const char* env = std::getenv("OFLM_OPEN_STAGE_MAJOR")) stage_major_on_ = std::string(env) != "0";
     dit_on_ = !man_.gemm_dit.is_null();
     dit_hs_ = dit_on_ && man_.gemm_dit.value("hs", false);
+    dit_b4_ = dit_hs_ && man_.gemm_dit.value("b4", false);
     if (const char* env = std::getenv("OFLM_OPEN_PIPE")) pipe_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_GEMM_DIT"); env && std::string(env) == "0") dit_on_ = false;
     if (dit_on_ && !stage_major_on_)
@@ -856,7 +891,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                 if (!n || n * k / 8192 * w_->chunk_bytes != total || w_->chunk_bytes != 5120)
                     throw std::runtime_error("open_qwen36: dit GEMM: no [N, K] for weight " + name + " or not a 5120 B chunk pool");
                 const size_t npad = man_.gemm_dit["npad"][std::to_string(n)].get<size_t>();
-                xrt::bo w = xrt::ext::bo(*dev_, padup(k * npad / 8 * 9));
+                xrt::bo w = xrt::ext::bo(*dev_, padup(dit_b4_ ? npad / 128 * (k / 64) * kB4Tile : k * npad / 8 * 9));
                 // the FFN up|gate weight ([up ff | gate ff] rows) for the SwiGLU epilogue: every
                 // 128-column tile j is [gate 64j.. | up 64j..]
                 std::vector<int64_t> cm;
@@ -898,10 +933,17 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                         log("bf16 check: layer " + std::to_string(l) + " " + name + " [" + std::to_string(n) + ", " +
                             std::to_string(k) + "]: |q4 - bf16| / |bf16| = " + std::to_string(std::sqrt(num / den)));
                     }
-                    dit_encode(W.data(), n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data(), dit_hs_);
+                    if (dit_b4_) dit_encode_b4(W.data(), n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data());
+                    else dit_encode(W.data(), n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data(), dit_hs_);
                 } else {
                     if (!host) throw std::runtime_error("open_qwen36: prompt only: " + name + " is not in the bf16 source");
-                    dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data(), dit_hs_);
+                    if (dit_b4_) {
+                        std::vector<float> Wq(n * k);
+                        dit_decode_q4(host + off0, n, k, Wq.data());
+                        dit_encode_b4(Wq.data(), n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data());
+                    } else {
+                        dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data(), dit_hs_);
+                    }
                 }
                 w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 v[l] = std::move(w);
@@ -3676,8 +3718,16 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         xrt::bo& db = buffer("pp_d2_" + cs, 0);
                         dit2_pack_a(hf2.data(), M, M, ff, db.map<uint8_t*>(), dit_hs_);
                         db.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * ff * 9 / 8, 0);
-                        int same = 0;
-                        for (int i = 0; i < 9216; ++i) same += hu.map<const uint8_t*>()[i] == db.map<const uint8_t*>()[i];
+                        int same = 0, nz = 0;
+                        for (int i = 0; i < 9216; ++i) {
+                            same += hu.map<const uint8_t*>()[i] == db.map<const uint8_t*>()[i];
+                            nz += hu.map<const uint8_t*>()[i] != 0;
+                        }
+                        std::fprintf(stderr, "ffn_check: slot 0 nonzero %d/9216; dev %02x %02x %02x %02x %02x %02x %02x %02x %02x | host %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", nz,
+                                     hu.map<const uint8_t*>()[0], hu.map<const uint8_t*>()[1], hu.map<const uint8_t*>()[2], hu.map<const uint8_t*>()[3],
+                                     hu.map<const uint8_t*>()[4], hu.map<const uint8_t*>()[5], hu.map<const uint8_t*>()[6], hu.map<const uint8_t*>()[7], hu.map<const uint8_t*>()[8],
+                                     db.map<const uint8_t*>()[0], db.map<const uint8_t*>()[1], db.map<const uint8_t*>()[2], db.map<const uint8_t*>()[3],
+                                     db.map<const uint8_t*>()[4], db.map<const uint8_t*>()[5], db.map<const uint8_t*>()[6], db.map<const uint8_t*>()[7], db.map<const uint8_t*>()[8]);
                         run(D["ffn"]["down2"].get<std::string>(), {"pp_d2_" + cs, gb.ffn_program[1].args[0], "pp_y_" + cs});
                         read_back(yb, M * hid * 2, 0);
                         double num = 0, den = 0; size_t nans = 0;

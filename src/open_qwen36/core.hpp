@@ -373,7 +373,8 @@ private:
     bool attn_block_on_ = true;  ///< the attention products on the NPU where the set carries them (OFLM_OPEN_ATTN_BLOCK=0 off)
     bool layer_major_on_ = true; ///< the whole prompt through each layer before the next (OFLM_OPEN_LAYER_MAJOR=0 off)
     bool dit_on_ = false;
-    bool dit_hs_ = false;        ///< manifest gemm_dit.hs: dit2 runs the hand-scheduled 2x2 kernel (A / B in its orders)
+    bool dit_hs_ = false;
+    bool dit_b4_ = false;        ///< manifest gemm_dit.b4: dit2 B is int4 mantissas + a power-of-two scale per column per 64 of K        ///< manifest gemm_dit.hs: dit2 runs the hand-scheduled 2x2 kernel (A / B in its orders)
     bool pipe_on_ = true;        ///< step_prompt_pipe: host and NPU overlapped across chunks (OFLM_OPEN_PIPE=0 off)
     /// The Qwen3.5 dense prompt with dit GEMMs as a two-thread pipeline over (layer, 1024-token
     /// chunk) cells: an NPU thread runs every ready dispatch, this thread every ready host stage.

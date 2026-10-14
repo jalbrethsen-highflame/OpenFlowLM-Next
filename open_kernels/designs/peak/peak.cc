@@ -52,7 +52,7 @@ static void hs_ref(const bfp16ebs8 *__restrict pA, const bfp16ebs8 *__restrict p
   }
 }
 // buffers in separate 8 KB regions of the core's data memory (HS_SPLIT=1), or packed
-alignas(64) static uint8_t hs_pool[0xC000];
+alignas(64) static uint8_t hs_pool[0xE000];
 #ifndef HS_SPLIT
 #define HS_SPLIT 1
 #endif
@@ -95,7 +95,9 @@ static void b4_call(const bfp16ebs8 *__restrict pA, const uint8_t *__restrict pB
     }
   }
 }
-alignas(64) static uint8_t b4N[128 * 32];      // 128 blocks x 32 B of nibbles
+// b4 weights in their own 8 KB bank of hs_pool: nibbles at +0xA000, exponents at +0xB000
+#define b4N (hs_base() + 0xA000)
+#define b4E (reinterpret_cast<int8_t *>(hs_base() + 0xB000))
 alignas(64) static uint8_t b4A[32 * 72];       // hsA as [row pair][A0 k 0..7][A1 k 0..7] (hs_b4_call's order)
 static void b4_reorder_a() {
   for (unsigned z = 0; z < 2; ++z)
@@ -103,7 +105,6 @@ static void b4_reorder_a() {
       for (unsigned r = 0; r < 2; ++r)
         for (unsigned i = 0; i < 72; ++i) b4A[((z * 2 + r) * 8 + k) * 72 + i] = hsA[((z * 8 + k) * 2 + r) * 72 + i];
 }
-alignas(64) static int8_t b4E[16 * 8];
 // the same weights as ordinary bfp16 blocks in hs_ref's B order: per group [exponent][8 mantissas]
 static void b4_expand(uint8_t *dst) {
   for (unsigned blk = 0; blk < 128; ++blk) {          // blk = (pair * 8 + k) * 2 + n2
@@ -845,8 +846,8 @@ void peak_run(const int8_t *__restrict in, int32_t *__restrict out) {
   for (unsigned i = 0; i < 64; ++i) out[128 + i] = r[i];
 #elif defined(PEAK_B4) || defined(PEAK_B4HS)
   hs_seed = 3; hs_fill(hsA, 32, false);
-  for (unsigned i = 0; i < sizeof(b4N); ++i) b4N[i] = (uint8_t)(i * 37 + 11);
-  for (unsigned i = 0; i < sizeof(b4E); ++i) b4E[i] = (int8_t)(120 + i % 5);
+  for (unsigned i = 0; i < 128 * 32; ++i) b4N[i] = (uint8_t)(i * 37 + 11);
+  for (unsigned i = 0; i < 16 * 8; ++i) b4E[i] = (int8_t)(120 + i % 5);
   for (unsigned i = 0; i < 32 * 128; i += 64) aie::store_v(hsC + i, aie::zeros<bfloat16, 64>());
   b4_reorder_a();
   aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
@@ -862,8 +863,8 @@ void peak_run(const int8_t *__restrict in, int32_t *__restrict out) {
   // out[0] mismatches after 3 calls: b4_call vs hs_ref on the same weights as bfp16 blocks
   hs_seed = 11 + in[0];
   hs_fill(hsA, 32, true);
-  for (unsigned i = 0; i < sizeof(b4N); ++i) { hs_rnd(); b4N[i] = (uint8_t)(hs_seed >> 13); }
-  for (unsigned i = 0; i < sizeof(b4E); ++i) { hs_rnd(); b4E[i] = (int8_t)(118 + (hs_seed >> 20) % 8); }
+  for (unsigned i = 0; i < 128 * 32; ++i) { hs_rnd(); b4N[i] = (uint8_t)(hs_seed >> 13); }
+  for (unsigned i = 0; i < 16 * 8; ++i) { hs_rnd(); b4E[i] = (int8_t)(118 + (hs_seed >> 20) % 8); }
 #ifdef PEAK_B4HSDIAG   // A block (pair, k) = 2^k, mantissas 1, one exponent, C = 0: an output / its
   // reference x 255 is the bitmask of the k-steps that reached it
   {
@@ -874,8 +875,8 @@ void peak_run(const int8_t *__restrict in, int32_t *__restrict out) {
       o << t.template to_vector<bfp16ebs8>();
     }
   }
-  for (unsigned i = 0; i < sizeof(b4N); ++i) b4N[i] = 0x11;
-  for (unsigned i = 0; i < sizeof(b4E); ++i) b4E[i] = 120;
+  for (unsigned i = 0; i < 128 * 32; ++i) b4N[i] = 0x11;
+  for (unsigned i = 0; i < 16 * 8; ++i) b4E[i] = 120;
 #endif
   b4_expand(hsB);
   b4_reorder_a();
