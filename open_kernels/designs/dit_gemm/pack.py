@@ -57,6 +57,29 @@ def unlayout(flat: np.ndarray, K: int, N: int) -> np.ndarray:
     return t.transpose(1, 3, 5, 0, 2, 4).reshape(K, N)
 
 
+def layout2(b: np.ndarray) -> np.ndarray:
+    """[K, N] -> dit2's hand-scheduled 2x2 order (DIT_HS): per [N tile][K tile], column-block
+    pairs, each [k-block 8][the pair's 2 column blocks], blocks of 8 columns x 8 k as layout()."""
+    K, N = b.shape
+    assert K % K_T == 0 and N % N_T == 0, (K, N)
+    t = b.reshape(K // K_T, K_T // 8, 8, N // N_T, N_T // 16, 2, 8)
+    #          [K tile,   k-block,  kin, N tile,  n-pair,    n2, nin]
+    return t.transpose(3, 0, 4, 1, 5, 6, 2).reshape(-1)
+
+
+def unlayout2(flat: np.ndarray, K: int, N: int) -> np.ndarray:
+    t = np.asarray(flat).reshape(N // N_T, K // K_T, N_T // 16, K_T // 8, 2, 8, 8)
+    return t.transpose(1, 3, 6, 0, 2, 4, 5).reshape(K, N)
+
+
+def pack_b2(b: np.ndarray) -> np.ndarray:
+    return bfp16ebs8_encode(layout2(np.asarray(b, dtype=np.float32)))
+
+
+def unpack_b2(packed: np.ndarray, K: int, N: int) -> np.ndarray:
+    return unlayout2(bfp16ebs8_decode(packed), K, N)
+
+
 def pack_b(b: np.ndarray) -> np.ndarray:
     """B [K, N] (any float dtype) -> the uint8 buffer dit_gemm reads, K*N*9/8 bytes."""
     return bfp16ebs8_encode(layout(np.asarray(b, dtype=np.float32)))

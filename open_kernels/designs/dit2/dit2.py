@@ -217,4 +217,5 @@ DESIGN = dit_gemm
 SPECIALIZE = dict(M=int(os.environ.get("DG_M", 4096)),
                   K=int(os.environ.get("DG_K", 3072)),
                   N=int(os.environ.get("DG_N", 9216)),
-                  layout=os.environ.get("DG_LAYOUT", "{}"))
+                  layout=os.environ.get("DG_LAYOUT", "{}"),
+                  stack_size=int(os.environ.get("DG_STACK", "0xF00"), 0))
