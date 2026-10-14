@@ -151,6 +151,20 @@ def eb_ok(spec: ModelSpec) -> bool:
 
 
 PROMPT_T = 256              # tokens per prompt GEMM (gemm_q4_prefill's T; one image serves every shape)
+# The prompt GEMM. "dit": designs/dit_gemm (bf16 activations x bfp16 weights the engine packs
+# from the pool at load, bf16 out, row-major both ways; 15-19 TFLOPS at M >= 1024 against
+# gemm_q4_prefill's ~4.4), M = DIT_M tokens per dispatch, N padded to whole 1024 columns.
+# "q4": gemm_q4_prefill straight from the q4 pool (no second copy of the weights).
+PROMPT_GEMM = _os.environ.get("OPEN_LFM2MOE_PROMPT_GEMM", "dit")
+DIT_M = 1024
+
+
+def _npad(n: int) -> int:
+    return -(-n // 1024) * 1024 if PROMPT_GEMM == "dit" else n
+
+
+def _prompt_t() -> int:
+    return DIT_M if PROMPT_GEMM == "dit" else PROMPT_T
 
 
 def prompt_gemm(spec: ModelSpec) -> dict:
@@ -174,8 +188,12 @@ def prompt_gemm(spec: ModelSpec) -> dict:
         if off % 4096:
             raise OpRangeError(f"lfm2moe prompt GEMM {name}: pool offset {off} is not page aligned (sub-buffer)")
     shapes = sorted({(n, k) for _, n, k in regions.values()})
+    if PROMPT_GEMM == "dit" and any(k % 512 for _, k in shapes):
+        raise OpRangeError(f"lfm2moe prompt GEMM: dit_gemm needs K % 512 (shapes {shapes})")
     return {
-        "t": PROMPT_T,
+        "t": _prompt_t(),
+        "fmt": PROMPT_GEMM,
+        "npad": {str(n): _npad(n) for n in sorted({n for n, _ in shapes})},
         "regions": {k: list(v) for k, v in regions.items()},
         "kernels": {f"{n}x{k}": f"gemm_n{n}_k{k}" for n, k in shapes},
         "x": {str(k): f"gemm_x_k{k}" for k in sorted({k for _, k in shapes})},
@@ -428,8 +446,9 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             name = f"gemm_n{n}_k{k}"
             out["contexts"].setdefault("gemm", f"{name}/final.xclbin")
             out["kernels"][name] = {"context": "gemm", "insts": f"{name}/insts.bin", "build": name}
-            out["globals"][f"gemm_x_k{k}"] = k * PROMPT_T * 2
-            out["globals"][f"gemm_y_n{n}"] = n * PROMPT_T * 4
+            out["globals"][f"gemm_x_k{k}"] = k * _prompt_t() * 2
+            # dit: bf16 C over the padded width; q4: f32 C
+            out["globals"][f"gemm_y_n{n}"] = _npad(n) * _prompt_t() * (2 if PROMPT_GEMM == "dit" else 4)
     if eb_ok(spec):
         # the prompt route's token-batched experts: every stream on one image (the core
         # program does not depend on the slot count), x / h / y sized for the widest
@@ -491,6 +510,11 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
 def _with_eb(spec: ModelSpec, b: dict) -> dict:
     if eb_ok(spec):
         for n, k in prompt_gemm(spec)["_shapes"]:
+            if PROMPT_GEMM == "dit":
+                b[f"gemm_n{n}_k{k}"] = {"design": "dit_gemm/dit_gemm.py",
+                                        "build_dir": f"dit_gemm/build_m{DIT_M}_k{k}_n{_npad(n)}",
+                                        "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(_npad(n))}}
+                continue
             # GQP_BFP: mm.cc on the bfp16 MAC array (the bf16 mmul runs on the vector unit)
             b[f"gemm_n{n}_k{k}"] = {"design": "gemm_q4_prefill/gemm_q4_prefill.py",
                                     "build_dir": f"gemm_q4_prefill/build_n{n}_k{k}_t{PROMPT_T}_bfp_pipe",
@@ -538,6 +562,6 @@ def hf_config_check(spec: ModelSpec) -> dict:
 
 
 GEN_KERNELS = "designs/lfm2moe/gen_kernels.py"
-KERNEL_SOURCES = list(LF.KERNEL_SOURCES) + ["designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc",
+KERNEL_SOURCES = list(LF.KERNEL_SOURCES) + ["designs/dit_gemm/*.py", "designs/dit_gemm/*.cc", "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc",
                                            "designs/gemm_q4_prefill/*.h","designs/lfm2moe/*.py", "designs/lm_head_q8/*.py",
                                            "designs/lm_head_q8/*.cc", "designs/lm_head_q8/*.h"]
