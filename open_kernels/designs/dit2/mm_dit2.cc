@@ -192,7 +192,7 @@ void dit_swiglu_epi(bfloat16 *__restrict c, int32_t *__restrict rtp, int32_t t) 
     bfloat16 *__restrict g = c + run * 1024;
     const bfloat16 *__restrict u = g + 512;
     for (int i = 0; i < 512; i += 32) {
-#ifdef DIT_EPI_TANH
+#ifndef DIT_EPI_FP32
       using VB = aie::vector<bfloat16, 32>;
       VB h = aie::mul(aie::load_v<32>(g + i), (bfloat16)0.5f).to_vector<bfloat16>();
       aie::accum<accfloat, 32> ha;
@@ -204,8 +204,9 @@ void dit_swiglu_epi(bfloat16 *__restrict c, int32_t *__restrict rtp, int32_t t) 
       VB sg = aie::mac(ha, h, th).to_vector<bfloat16>();
       aie::store_v(g + i, aie::mul(sg, aie::load_v<32>(u + i)).to_vector<bfloat16>());
 #else
-      // silu(g) * up in fp32 (vecmath.h: exp to ~1e-7), rounded to bf16 once. The bf16 tanh
-      // form (DIT_EPI_TANH) cost the 27B +0.065 nats a token against host silu.
+      // DIT_EPI_FP32: silu(g) * up in fp32 (vecmath.h: exp to ~1e-7), rounded to bf16 once.
+      // About +12 % on the 27B's NPU time for an accuracy gain inside the measurement noise
+      // (median KL 0.0018 -> 0.0013 against token-by-token), so the bf16 tanh form is the default.
       aie::accum<accfloat, 32> ga, ua;
       ga.from_vector(aie::load_v<32>(g + i));
       ua.from_vector(aie::load_v<32>(u + i));
