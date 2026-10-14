@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -95,6 +96,8 @@ struct Args {
     int gap_ms = 0;
     int at_position = 0;
     bool gemm_block = false;        // 0167/#32: prefill via step_gemm_block()
+    bool noncausal = false;         // d3: full-attention layers see the whole prompt
+    bool serve_decision = false;    // one prompt per stdin line -> "X <last-position residual>" on stdout
     bool block_major = false;       // --block-major: force the old block-at-a-time schedule
     bool prefill_logits = false;    // 0167/#32: logits (dump_pos) at every prefill position reached
     std::string dump_act;           // bring-up: "<layer>:<off>:<bytes>:<path>"
@@ -178,6 +181,8 @@ Args parse(int argc, char** argv) {
         else if (k == "--dump-act") a.dump_act = val();            // "<layer>:<off>:<n>:<path>"
         else if (k == "--quiet") a.cfg.verbose = false;
         else if (k == "--gemm-block") a.gemm_block = true;
+        else if (k == "--noncausal") a.noncausal = true;
+        else if (k == "--serve-decision") a.serve_decision = a.cfg.prompt_only = true;
         else if (k == "--block-major") a.block_major = true;
         else if (k == "--prefill-logits") a.prefill_logits = true;
         else if (k == "--bench") {
@@ -202,7 +207,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--decode-schedule") a.decode_schedule = val();     // Stage 2.7
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
     }
-    if (a.cfg.model_dir.empty() || a.cfg.kernel_dir.empty() || a.ids.empty()) {
+    if (a.cfg.model_dir.empty() || a.cfg.kernel_dir.empty() || (a.ids.empty() && !a.serve_decision)) {
         std::fprintf(stderr, "usage: open_qwen36_cli --model <dir> --kernels <dir> --ids 1,2,3 [--max-tokens N] "
                              "[--layers N] [--max-ctx N] [--dump-logits <prefix>] [--twice] [--at-position P] "
                              "[--gemm-block] [--block-major] [--prefill-logits] [--bench N[:LAYER]] [--bench-decode N] "
@@ -400,6 +405,36 @@ int main(int argc, char** argv) {
         else if (!std::getenv("OFLM_OPEN_HOST_ATTN_DECODE")) core.set_decode_route("auto");
         std::fprintf(stderr, "resident after %.1f s\n",
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        core.set_noncausal(a.noncausal);
+        if (a.serve_decision) {
+            // A decision model kept resident: each stdin line is one prompt's token ids; stdout gets
+            // "X" and the last position's residual stream (before the final norm, f32 text), or
+            // "E <message>". The front end applies the final norm and the readout.
+            std::printf("READY\n");
+            std::fflush(stdout);
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                std::vector<int> ids = parse_ids(line);
+                if (ids.empty()) continue;
+                try {
+                    auto tq = std::chrono::steady_clock::now();
+                    core.reset();
+                    core.step_gemm_prompt(ids, false);
+                    const auto& x = core.last_x();
+                    std::string out = "X";
+                    char b[32];
+                    for (float v : x) { std::snprintf(b, sizeof b, " %.9g", v); out += b; }
+                    std::printf("%s\n", out.c_str());
+                    std::fflush(stdout);
+                    std::fprintf(stderr, "decision %zu tokens: %.0f ms\n", ids.size(),
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq).count());
+                } catch (const std::exception& e) {
+                    std::printf("E %s\n", e.what());
+                    std::fflush(stdout);
+                }
+            }
+            return 0;
+        }
         if (a.bench) {
             core.bench_dispatch(a.bench_layer, a.bench);
             std::printf("DONE\n");

@@ -374,12 +374,28 @@ class __Q4NX_Converter(ABC):
                 self.weight_map = {k: "model.safetensors" for k in f.keys()}
             shards = ["model.safetensors"]
         self.hf_shards = {s: self.hf_dir / s for s in shards}
+        self._alias_bare_language_model()
         print(f"[INFO] Loaded {len(self.weight_map)} HF tensors across {len(shards)} shards")
+
+    def _alias_bare_language_model(self):
+        """A bare Qwen3_5Model checkpoint (no ForConditionalGeneration wrapper, e.g.
+        vllm-sr/d3) names its tensors language_model.* / visual.*; alias them to the
+        model.-prefixed names the converters match. _load_tensor reads the real name."""
+        self.hf_real_name = {}
+        if not any(k.startswith("language_model.") for k in self.weight_map):
+            return
+        wm = {}
+        for k, v in self.weight_map.items():
+            nk = "model." + k if k.startswith(("language_model.", "visual.")) else k
+            wm[nk] = v
+            self.hf_real_name[nk] = k
+        self.weight_map = wm
 
     def _load_tensor(self, name: str) -> torch.Tensor:
         shard = self.weight_map[name]
+        real = getattr(self, "hf_real_name", {}).get(name, name)
         with safe_open(self.hf_shards[shard], framework="torch") as f:
-            return f.get_tensor(name).contiguous()
+            return f.get_tensor(real).contiguous()
 
     def _build_hf_name_map(self) -> Dict[str, str]:
         """Build HF tensor name -> Q4NX tensor name mapping from the config.

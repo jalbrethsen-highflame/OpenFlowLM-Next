@@ -1287,6 +1287,7 @@ def assemble_model_assets_hf(
     oflm_version: Optional[str] = None,
     source_file: Optional[str] = None,
     model_arch: Optional[ModelArch] = None,
+    prune_meta: Optional[dict] = None,   # accepted for cli.py; always empty on the HF path (no imatrix)
     packed_with: Optional[str] = None,
 ) -> None:
     """Build a complete model directory from an HF safetensors source.

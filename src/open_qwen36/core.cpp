@@ -120,11 +120,8 @@ void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out) 
     }
 }
 
-// colmap (optional, npad entries): packed column c takes source row colmap[c] (-1 = zeros), for
-// the SwiGLU epilogue's [gate 64 | up 64] tiles.
-void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8_t* out,
-                     const int64_t* colmap = nullptr) {
-    std::vector<float> W(n * k);
+// A dit weight as [n, k] f32 from its band-order q4_1 pool chunks (5120 B: 32 rows x 256 k).
+void dit_decode_q4(const uint8_t* pool, size_t n, size_t k, float* W) {
     const size_t per_band = 2 * k / 256, nch = n * k / (32 * 256);
 #pragma omp parallel for
     for (long long cc = 0; cc < static_cast<long long>(nch); ++cc) {
@@ -143,6 +140,12 @@ void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8
                     W[(r0 + r) * k + c0 + kk] = static_cast<float>(nib) * bf16_to_f32(d[si]) + bf16_to_f32(m[si]);
                 }
     }
+}
+
+// [n, k] f32 -> designs/dit2's B operand: bfp16 [Npad/128][K/64][16][8][8] blocks (9 bytes per 8).
+// colmap (optional, npad entries): packed column c takes source row colmap[c] (-1 = zeros), for
+// the SwiGLU epilogue's [gate 64 | up 64] tiles.
+void dit_encode(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, const int64_t* colmap = nullptr) {
     const size_t KT = k / 64, NT = npad / 128;
 #pragma omp parallel for
     for (long long tt = 0; tt < static_cast<long long>(NT * KT); ++tt) {
@@ -159,6 +162,13 @@ void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8
                     bfp_encode8_avx2(v8, blk);
                 }
     }
+}
+
+void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8_t* out,
+                     const int64_t* colmap = nullptr) {
+    std::vector<float> W(n * k);
+    dit_decode_q4(pool, n, k, W.data());
+    dit_encode(W.data(), n, k, npad, out, colmap);
 }
 
 
@@ -307,6 +317,83 @@ unsigned omp_thread_budget() {
 }
 
 }  // namespace
+
+// ---- exact bf16 prompt weights. q4nx-build writes bf16_map.json beside model.q4nx: for each
+// quantized tensor, the HF safetensors shard, tensor name and row order its rows came from.
+// The GEMM route then builds its bfp16 weights from those bf16 rows instead of the q4_1 / q8_0
+// codes (OFLM_OPEN_BF16_SRC=0 off). A std_perm op's pool chunks are exactly the tensor's row
+// range [32 chunk0 / ncol, + 64 nch / (in_dim / 128)) in the band law dit_decode_q4 undoes, so a
+// weight is its ops' row ranges stacked in op order.
+static std::string layer_tensor(const std::string& name, int layer) {
+    std::string s = name;
+    for (size_t p = s.find("{l}"); p != std::string::npos; p = s.find("{l}", p)) s.replace(p, 3, std::to_string(layer));
+    return s;
+}
+
+struct HfBf16 {
+    struct T { std::string file; uint64_t off = 0; size_t rows = 0, cols = 0; bool qproj = false; };
+    std::map<std::string, T> t;
+
+    explicit HfBf16(const fs::path& map_path) {
+        std::ifstream mf(map_path);
+        const nlohmann::json j = nlohmann::json::parse(mf);
+        const fs::path dir = j.at("hf_dir").get<std::string>();
+        std::map<std::string, std::pair<nlohmann::json, uint64_t>> hdr;   // shard -> (header, data base)
+        for (const auto& [name, e] : j.at("map").items()) {
+            const std::string shard = e.at("shard").get<std::string>();
+            auto it = hdr.find(shard);
+            if (it == hdr.end()) {
+                std::ifstream f(dir / shard, std::ios::binary);
+                uint64_t n = 0;
+                f.read(reinterpret_cast<char*>(&n), 8);
+                std::string h(n, '\0');
+                f.read(h.data(), static_cast<std::streamsize>(n));
+                if (!f) throw std::runtime_error("open_qwen36: bf16 source: cannot read the header of " + (dir / shard).string());
+                it = hdr.emplace(shard, std::make_pair(nlohmann::json::parse(h), 8 + n)).first;
+            }
+            const std::string hf = e.at("hf").get<std::string>();
+            const auto& te = it->second.first.at(hf);
+            T x;
+            x.file = (dir / shard).string();
+            x.rows = e.at("rows").get<size_t>();
+            x.cols = e.at("cols").get<size_t>();
+            x.qproj = e.at("row_order").get<std::string>() == "qproj_heads";
+            if (te.at("dtype").get<std::string>() != "BF16" || te.at("shape").size() != 2 ||
+                te.at("shape")[0].get<size_t>() != x.rows || te.at("shape")[1].get<size_t>() != x.cols)
+                throw std::runtime_error("open_qwen36: bf16 source: " + hf + " is not a BF16 [" + std::to_string(x.rows) +
+                                         ", " + std::to_string(x.cols) + "] tensor");
+            x.off = it->second.second + te.at("data_offsets")[0].get<uint64_t>();
+            t[name] = x;
+        }
+    }
+    bool has(const std::string& name) const { return t.count(name) != 0; }
+
+    // q4nx rows [r0, r0 + n) of `name` as f32 into out [n, cols]. q_proj's q4nx rows are all q
+    // heads then all gate heads ('(g p h) -> (p g h)', p = 2); HF interleaves them per head.
+    void rows(const std::string& name, size_t r0, size_t n, size_t hd, float* out) const {
+        const T& e = t.at(name);
+        if (r0 + n > e.rows) throw std::runtime_error("open_qwen36: bf16 source: " + name + " rows out of range");
+        std::ifstream f(e.file, std::ios::binary);
+        const size_t G = e.qproj ? e.rows / (2 * hd) : 0;
+        std::vector<uint16_t> buf;
+        for (size_t r = r0; r < r0 + n;) {
+            size_t hf_r = r, run = r0 + n - r;
+            if (e.qproj) {
+                const size_t p = r / (G * hd), g = (r % (G * hd)) / hd, h = r % hd;
+                hf_r = g * 2 * hd + p * hd + h;
+                run = std::min(run, hd - h);
+            }
+            buf.resize(run * e.cols);
+            f.seekg(static_cast<std::streamoff>(e.off + hf_r * e.cols * 2));
+            f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size() * 2));
+            if (!f) throw std::runtime_error("open_qwen36: bf16 source: short read of " + name);
+            float* o = out + (r - r0) * e.cols;
+#pragma omp parallel for
+            for (long long i = 0; i < static_cast<long long>(buf.size()); ++i) o[i] = bf16_to_f32(buf[static_cast<size_t>(i)]);
+            r += run;
+        }
+    }
+};
 
 void Core::apply_thread_budget() const {
     if (omp_threads_ > 0 && omp_get_max_threads() != omp_threads_) omp_set_num_threads(omp_threads_);
@@ -458,6 +545,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     }
     if (!gguf_ && !file_) {
         file_ = std::make_unique<Q4nxFile>((md / "model.q4nx").string());
+    }
+    if (const char* env = std::getenv("OFLM_OPEN_BF16_SRC"); fs::exists(md / "bf16_map.json") && !(env && std::string(env) == "0")) {
+        hf_bf16_ = std::make_shared<HfBf16>(md / "bf16_map.json");
+        log("bf16 source: " + std::to_string(hf_bf16_->t.size()) + " tensors (bf16_map.json); the prompt GEMMs use exact bf16");
     }
     int total = static_cast<int>(w_->layers.size());
     nl_ = cfg_.num_layers > 0 && cfg_.num_layers < total ? cfg_.num_layers : total;
@@ -769,25 +860,65 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                         cm[c] = static_cast<int64_t>(w < 64 ? ff + 64 * j + w : 64 * j + (w - 64));
                     }
                 }
-                dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data());
+                const auto& lops = from == "pool" ? lt.pool : lt.consts;
+                bool bf = hf_bf16_ != nullptr;
+                for (size_t i : gw.ops) bf = bf && hf_bf16_->has(layer_tensor(lops[i].tensor, l));
+                if (bf) {
+                    std::vector<float> W(n * k);
+                    const size_t hd = w_->hf_config_check.at("head_dim").get<size_t>();
+                    size_t row = 0;
+                    for (size_t i : gw.ops) {
+                        const PackOp& o = lops[i];
+                        const size_t ncol = o.in_dim / 256, rows_op = o.nch / (o.in_dim / 128) * 64;
+                        if (o.op != "std_perm" || o.in_dim != k || o.chunk0 % ncol || row + rows_op > n || !o.split.empty())
+                            throw std::runtime_error("open_qwen36: bf16 source: " + name + ": op " + std::to_string(i) +
+                                                     " is not a whole-row std_perm band of a [" + std::to_string(n) + ", " +
+                                                     std::to_string(k) + "] weight");
+                        hf_bf16_->rows(layer_tensor(o.tensor, l), 32 * (o.chunk0 / ncol), rows_op, hd, W.data() + row * k);
+                        row += rows_op;
+                    }
+                    if (row != n) throw std::runtime_error("open_qwen36: bf16 source: " + name + " covers " + std::to_string(row) +
+                                                           " of " + std::to_string(n) + " rows");
+                    if (const char* chk = std::getenv("OFLM_OPEN_BF16_CHECK"); host && chk && std::atoi(chk) > l) {
+                        // the q4 route's weight for comparison: relative Frobenius difference
+                        std::vector<float> Q(n * k);
+                        dit_decode_q4(host + off0, n, k, Q.data());
+                        double num = 0, den = 0;
+                        for (size_t i = 0; i < n * k; ++i) { const double d = Q[i] - W[i]; num += d * d; den += double(W[i]) * W[i]; }
+                        log("bf16 check: layer " + std::to_string(l) + " " + name + " [" + std::to_string(n) + ", " +
+                            std::to_string(k) + "]: |q4 - bf16| / |bf16| = " + std::to_string(std::sqrt(num / den)));
+                    }
+                    dit_encode(W.data(), n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data());
+                } else {
+                    if (!host) throw std::runtime_error("open_qwen36: prompt only: " + name + " is not in the bf16 source");
+                    dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data());
+                }
                 w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 v[l] = std::move(w);
                 continue;
             }
+            if (!host) throw std::runtime_error("open_qwen36: prompt only: " + name + " needs the q4 pool");
             xrt::bo w = xrt::ext::bo(*dev_, padup(total));
             std::memcpy(w.map<uint8_t*>(), host + off0, total);
             w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
             v[l] = std::move(w);
         }
     };
+    const bool skip_pools = cfg_.prompt_only && hf_bf16_ && dit_on_;
+    if (skip_pools) log("prompt only: no q4 pools, no lm_head (the GEMM weights come from the bf16 source)");
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];
-        xrt::bo pool = xrt::ext::bo(*dev_, w_->pool_bytes);
-        uint8_t* pool_host = pool.map<uint8_t*>();
-        pools::pack_pool(*w_, lt, *file_, l, pool_host);
-        build_weights(lt, l, "pool", pool_host);
-        pool.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        pools_.push_back(std::move(pool));
+        if (skip_pools) {
+            build_weights(lt, l, "pool", nullptr);
+            pools_.emplace_back();
+        } else {
+            xrt::bo pool = xrt::ext::bo(*dev_, w_->pool_bytes);
+            uint8_t* pool_host = pool.map<uint8_t*>();
+            pools::pack_pool(*w_, lt, *file_, l, pool_host);
+            build_weights(lt, l, "pool", pool_host);
+            pool.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            pools_.push_back(std::move(pool));
+        }
         xrt::bo c = xrt::ext::bo(*dev_, padup(lt.consts_bytes));
         std::memset(c.map<uint8_t*>(), 0, padup(lt.consts_bytes));
         uint8_t* c_host = c.map<uint8_t*>();
@@ -920,7 +1051,9 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     // ---- the globals: the lm_head pool and the final norm's weight from the file, the ptab
     // computed, everything else zero (xres, zero, xresf, hn, logits)
     for (const auto& [name, bytes] : w_->globals) {
-        if (name == "lmpool") {
+        if (name == "lmpool" && skip_pools) {
+            continue;
+        } else if (name == "lmpool") {
             xrt::bo lm = xrt::ext::bo(*dev_, bytes);
             pools::pack_lmhead(*w_, *file_, lm.map<uint8_t*>());
             lm.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -3393,7 +3526,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     for (size_t l = 0; l < L; ++l) {
         auto& o = ops[l];
         o = {PRE, QKV, MID};
-        if (types_[l]->gemm_block.kind == "full" && !FA.empty()) o.insert(o.end(), {FAT, GATE});
+        if (types_[l]->gemm_block.kind == "full" && (!FA.empty() || noncausal_)) o.insert(o.end(), {FAT, GATE});
         o.insert(o.end(), {OUT, TAIL, UP});
         if (down2) o.insert(o.end(), {HPACK, DOWN});
         o.push_back(RES);
@@ -3417,6 +3550,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         if (busy[cell(l, c)] || s >= nst(l) || ((s & 1) != 0) != npu) return false;
         if (s == 0) return l == 0 || stage[cell(l - 1, c)] >= nst(l - 1);
         if (ops[l][s] == MID) return c == 0 || stage[cell(l, c - 1)] > s;     // S / the KV rows chain
+        if (noncausal_ && ops[l][s] == FAT)                                     // every chunk's K / V rows first
+            for (size_t c2 = 0; c2 < C; ++c2)
+                if (stage[cell(l, c2)] < s) return false;
         return true;
     };
     // the NPU takes the lowest ready cell, preferring one in the hardware context it is in
@@ -3465,6 +3601,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     if (has2(nq, hid)) run(K2[std::to_string(nq) + "x" + std::to_string(hid)].get<std::string>(),
                                            {"pp_a2_" + cs, gb.program[0].args[0], "pp_q_" + cs});
                     else run(kname(nq, hid), {"pp_a_" + cs, gb.program[0].args[0], "pp_q_" + cs});
+                } else if (op == FAT && noncausal_) {
+                    // noncausal: the barrier only; GATE runs the attention on the host
                 } else if (op == FAT) {
                     auto tf = std::chrono::steady_clock::now();
                     run(fa_kernel(c), {"fa_q_" + cs, "state", "state", "fa_o_" + cs});
@@ -3517,6 +3655,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // prints the NPU output's error against it per (layer, chunk)
     static const bool fa_check = [] { const char* e = std::getenv("OFLM_OPEN_FA_CHECK"); return e && *e == '1'; }();
     std::map<size_t, std::vector<float>> fa_ref;
+    std::vector<std::vector<float>> qprep(C);      // noncausal: each chunk's prepped Q, MID -> GATE
+    if (noncausal_ && pos0 != 0) throw std::runtime_error("open_qwen36: noncausal attention needs a fresh prompt (position 0)");
     try {
         for (;;) {
             size_t l = 0, c = 0;
@@ -3596,7 +3736,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     g.T = M; g.t_real = t_real; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
                     g.pos0 = pos0 + r0; g.eps = gb.eps;
                     auto ta = std::chrono::steady_clock::now();
-                    if (fk.empty()) {
+                    if (noncausal_) {
+                        // Q prepped for GATE (after every chunk's K / V rows are in the cache)
+                        qprep[c].resize(M * qw);
+                        host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
+                                             man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, qprep[c].data());
+                        timing_.attn_ms += ms_since(ta);
+                    } else if (fk.empty()) {
                         host::attention_block(g, ya.data(), yb.data(), yc.data(), yd.data(), hc.qn.data(), hc.kn.data(),
                                               man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
                         timing_.attn_ms += ms_since(ta);
@@ -3622,6 +3768,24 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     }
                     st.sync(XCL_BO_SYNC_BO_TO_DEVICE, t_real * row, (pos0 + r0) * row);
                 }
+            } else if (op == GATE && noncausal_) {
+                // d3's noncausal full attention: this chunk's queries over the whole prompt's K / V
+                const size_t qw = gb.qw, kvw = gb.kvw, nq = 2 * qw + 2 * kvw, row = lt.state_row;
+                host::AttnGeom g;
+                g.T = M; g.t_real = t_real; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
+                g.pos0 = pos0 + r0; g.eps = gb.eps;
+                og.resize(M * qw);
+                auto ta = std::chrono::steady_clock::now();
+                host::attention_full(g, qprep[c].data(), state_[l].map<uint16_t*>(), row / 2, pos0 + N, og.data());
+                timing_.attn_ms += ms_since(ta);
+                const uint16_t* q16 = buffer("pp_q_" + cs, 0).map<const uint16_t*>();
+#pragma omp parallel for
+                for (long long t = 0; t < static_cast<long long>(M); ++t)
+                    for (size_t i = 0; i < qw; ++i)
+                        og[t * qw + i] = static_cast<size_t>(t) < t_real
+                                             ? og[t * qw + i] / (1.f + std::exp(-bf16_to_f32(q16[t * nq + qw + 2 * kvw + i]))) : 0.f;
+                if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs);
+                else to_bf16(og.data(), M, qw, "pp_m_" + cs);
             } else if (op == GATE) {
                 // og = O * sigmoid(gate), gate from the qkv GEMM's C (still this chunk's)
                 const size_t qw = gb.qw, kvw = gb.kvw, nq = 2 * qw + 2 * kvw;
@@ -3701,6 +3865,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     npu.join();
     if (err) std::rethrow_exception(err);
     pos_ += static_cast<int>(N);
+    last_x_.assign(xres.data() + (N - 1) * hid, xres.data() + N * hid);
     block_logits_.clear();
     if (block_logits_all_)
         for (size_t t = 0; t < N; ++t) {

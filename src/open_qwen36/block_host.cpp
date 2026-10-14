@@ -619,15 +619,15 @@ constexpr size_t kQT = 16;     // query tokens per work item
 constexpr size_t kKC = 64;     // key rows per chunk
 __attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void attention_tile(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
-                    const uint16_t* kv, size_t kv_row_elems, float* og, size_t g, size_t t0) {
+                    const uint16_t* kv, size_t kv_row_elems, float* og, size_t g, size_t t0, size_t kend) {
     const size_t grp = nh / kvh, qw = nh * hd, kvw = kvh * hd;
     const size_t nt = std::min(kQT, R - t0), M = grp * nt;
-    const size_t last = pos0 + t0 + nt - 1;               // the highest key row any query here sees
+    const size_t last = kend ? kend - 1 : pos0 + t0 + nt - 1;   // the highest key row any query here sees
     std::vector<float> q(M * hd), kt(hd * kKC), vc(kKC * hd), s(M * kKC), acc(M * hd, 0.f), m(M, -1e30f), l(M, 0.f);
     std::vector<size_t> qpos(M);
     for (size_t i = 0; i < M; ++i) {                      // row i = (head gi, token ti)
         const size_t gi = i / nt, ti = i % nt, h = g * grp + gi;
-        qpos[i] = pos0 + t0 + ti;
+        qpos[i] = kend ? kend - 1 : pos0 + t0 + ti;
         const float* src = Q + (t0 + ti) * qw + h * hd;
         for (size_t d = 0; d < hd; ++d) q[i * hd + d] = src[d] * scale;
     }
@@ -718,10 +718,10 @@ constexpr size_t kRB = 4;      // query rows per micro-kernel block
 
 __attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, size_t qt, float scale, const float* Q,
-                      const float* KT, const float* VF, size_t P, float* og, size_t g, size_t t0) {
+                      const float* KT, const float* VF, size_t P, float* og, size_t g, size_t t0, size_t kend) {
     const size_t grp = nh / kvh, qw = nh * hd;
     const size_t nt = std::min(qt, R - t0), M = grp * nt, Mp = (M + kRB - 1) / kRB * kRB;
-    const size_t first = pos0 + t0, last = first + nt - 1;
+    const size_t first = pos0 + t0, last = kend ? kend - 1 : first + nt - 1;   // kend: every query sees [0, kend)
     static thread_local std::vector<float> qb, sb, ab, mb, lb, cb;
     static thread_local std::vector<size_t> qp;
     qb.assign(Mp * hd, 0.f);
@@ -735,7 +735,7 @@ void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, s
     for (size_t i = 0; i < Mp; ++i) {                     // row i = (head gi, token ti); pad rows see all keys
         if (i >= M) { qp[i] = last; continue; }
         const size_t gi = i / nt, ti = i % nt;
-        qp[i] = first + ti;
+        qp[i] = kend ? last : first + ti;
         const float* src = Q + (t0 + ti) * qw + (g * grp + gi) * hd;
         for (size_t d = 0; d < hd; ++d) q[i * hd + d] = src[d] * scale;
     }
@@ -825,9 +825,9 @@ void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, s
 // (no pop: GCC reports -Wpsabi at the end of the file, for the clones)
 
 void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
-                     const uint16_t* kv, size_t kv_row_elems, float* og) {
+                     const uint16_t* kv, size_t kv_row_elems, float* og, size_t kend = 0) {
     if (hd % 64 == 0) {
-        const size_t rows = pos0 + R, P = (rows + 63) / 64 * 64, kvw = kvh * hd, grp = nh / kvh;
+        const size_t rows = kend ? kend : pos0 + R, P = (rows + 63) / 64 * 64, kvw = kvh * hd, grp = nh / kvh;
         static thread_local std::vector<float> KT, VF;
         KT.resize(kvh * hd * P);
         VF.resize(kvh * P * hd);
@@ -852,7 +852,7 @@ void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, fl
 #pragma omp parallel for schedule(dynamic, 1)
         for (long long it = items - 1; it >= 0; --it)
             attention_tile64(hd, nh, kvh, R, pos0, qt, scale, Q, kt, vf, P, og,
-                             static_cast<size_t>(it) % kvh, (static_cast<size_t>(it) / kvh) * qt);
+                             static_cast<size_t>(it) % kvh, (static_cast<size_t>(it) / kvh) * qt, kend);
         return;
     }
     const size_t chunks = (R + kQT - 1) / kQT;
@@ -861,7 +861,7 @@ void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, fl
 #pragma omp parallel for schedule(dynamic, 1)
     for (long long it = items - 1; it >= 0; --it)
         attention_tile(hd, nh, kvh, R, pos0, scale, Q, kv, kv_row_elems, og,
-                       static_cast<size_t>(it) % kvh, (static_cast<size_t>(it) / kvh) * kQT);
+                       static_cast<size_t>(it) % kvh, (static_cast<size_t>(it) / kvh) * kQT, kend);
 }
 }  // namespace
 
@@ -924,6 +924,13 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
     if (gate)                                       // Qwen3.6's output gate; LFM2 has none
         for (size_t i = 0; i < R * qw; ++i) og[i] *= sigmoid(gate[i]);
     (void)grp;
+}
+
+void attention_full(const AttnGeom& g, const float* Q, const uint16_t* kv, size_t kv_row_elems, size_t keys, float* og) {
+    if (g.nh % g.kvh || g.t_real > g.T || keys == 0)
+        throw std::runtime_error("open_qwen36: attention_full: inconsistent geometry");
+    std::fill(og, og + g.T * g.nh * g.hd, 0.f);
+    attention_tiles(g.hd, g.nh, g.kvh, g.t_real, g.pos0, 1.0f, Q, kv, kv_row_elems, og, keys);
 }
 
 void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
