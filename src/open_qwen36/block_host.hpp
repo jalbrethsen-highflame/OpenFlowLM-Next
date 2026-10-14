@@ -32,6 +32,8 @@ struct TransposePart {
 /// y [N, T] transposed straight into the ranges the caller is going to read it as, so a
 /// fused projection needs no [T, N] copy in between. The ranges may not overlap.
 void transpose_parts(const float* y, size_t T, const TransposePart* parts, size_t n_parts);
+/// The same ranges out of a ROW-major y [T, N] (dit_gemm's C): dst[t * width + i] = y[t * N + off + i].
+void split_cols(const float* y, size_t T, size_t N, const TransposePart* parts, size_t n_parts);
 /// x [T, K] fp32 -> the GEMM's tiled bf16 activation layout ([K, T] "k,n" order, 64 x 32
 /// tiles of 8 x 8 MAC sub-tiles, gemm_q4_prefill.py); out holds K * T bf16 bits.
 void tile_x(const float* x, size_t T, size_t K, uint16_t* out);

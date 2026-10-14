@@ -239,6 +239,9 @@ struct Manifest {
     /// layout.prompt_gemm: the prompt route's batched mixers (Core::prompt_mixers) -- GEMM
     /// regions of the pool, kernels per shape, x / y globals, the host weights' tensor names.
     nlohmann::json prompt_gemm;
+    /// layout.gemm_dit: the block route's GEMMs on dit_gemm (bf16 x bfp16, row-major A and C,
+    /// M tokens a dispatch): {m, kernels {NxK: name}, npad {N: Npad}, x {K: global}, y {Npad: global}}.
+    nlohmann::json gemm_dit;
     stream_patch::AttnGeometry attn;
     // the model and its programs
     std::vector<std::string> layers;         ///< per layer: a key of layer_types

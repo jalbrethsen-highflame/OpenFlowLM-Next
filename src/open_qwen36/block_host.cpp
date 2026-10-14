@@ -147,6 +147,13 @@ void transpose_parts(const float* y, size_t T, const TransposePart* parts, size_
     }
 }
 
+void split_cols(const float* y, size_t T, size_t N, const TransposePart* parts, size_t n_parts) {
+#pragma omp parallel for
+    for (long long t = 0; t < static_cast<long long>(T); ++t)
+        for (size_t p = 0; p < n_parts; ++p)
+            std::memcpy(parts[p].dst + t * parts[p].width, y + t * N + parts[p].off, parts[p].width * 4);
+}
+
 void tile_x(const float* x, size_t T, size_t K, uint16_t* out) {
     // [T,K] fp32 -> bf16, pre-tiled [K,T] in "k,n" order: K_TILE 64 x tile_n 32 tiles, each
     // tile in (8 x 8) MAC sub-tiles -- the layout gemm_q4_prefill.py streams its activation in
