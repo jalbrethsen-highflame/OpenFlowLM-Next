@@ -259,6 +259,10 @@ def gemm_route(spec: ModelSpec) -> dict | None:
 import os as _os
 GEMM_DIT = _os.environ.get("OPEN_QWEN35_GEMM_DIT", "1") != "0"
 DIT_M = 1024
+# designs/dit2: A host-packed bfp16 (pack_a order) and the 4x1 microkernel, 28 TFLOPS against
+# dit_gemm's 19.4 at 4096x5120x16384. Every shape but the FFN down (which reads the up GEMM's
+# gathered bf16 C on the device) runs on it. OPEN_QWEN35_GEMM_DIT2=0 keeps dit_gemm everywhere.
+GEMM_DIT2 = _os.environ.get("OPEN_QWEN35_GEMM_DIT2", "1") != "0"
 
 
 def gemm_dit(spec: ModelSpec) -> dict | None:
@@ -282,8 +286,15 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
     ffn = None
     if (2 * ff, hid) in shapes and (hid, ff) in shapes and (2 * ff) % 1024 == 0:
         ffn = {"up": f"dit_n{2 * ff}_k{hid}_epi", "down": f"dit_n{hid}_k{ff}_gat", "ff": ff}
+    k2 = {}
+    if GEMM_DIT2:
+        k2 = {f"{n}x{k}": f"dit2_n{npad[n]}_k{k}" for n, k in shapes if not (ffn and (n, k) == (hid, ff))}
+        if ffn:
+            ffn["up2"] = f"dit2_n{2 * ff}_k{hid}_epi"
+            k2.pop(f"{2 * ff}x{hid}", None)
     return {"m": DIT_M,
             **({"ffn": ffn} if ffn else {}),
+            **({"kernels2": k2} if k2 else {}),
             "kernels": {f"{n}x{k}": f"dit_n{npad[n]}_k{k}" for n, k in shapes},
             "npad": {str(n): p for n, p in npad.items()},
             "x": {str(k): f"dit_x_k{k}" for k in sorted({k for _, k in shapes})},
@@ -343,6 +354,12 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         if "ffn" in d:
             for name in (d["ffn"]["up"], d["ffn"]["down"]):
                 out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
+        names2 = list(d.get("kernels2", {}).values()) + ([d["ffn"]["up2"]] if "up2" in d.get("ffn", {}) else [])
+        for name in names2:
+            out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
+            out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
+        for k in sorted({int(x.split("x")[1]) for x in d.get("kernels2", {})} | ({spec.hidden} if names2 else set())):
+            out["globals"][f"dit2_x_k{k}"] = DIT_M * k * 9 // 8
     return out
 
 
@@ -397,6 +414,15 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             b[f"dit_n{npad}_k{k}"] = {"design": "dit_gemm/dit_gemm.py",
                                       "build_dir": f"dit_gemm/build_m{DIT_M}_k{k}_n{npad}",
                                       "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(npad)}}
+        for key, name in d.get("kernels2", {}).items():
+            n, k = (int(x) for x in key.split("x"))
+            b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{k}_n{d['npad'][str(n)]}",
+                       "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(d["npad"][str(n)])}}
+        if "up2" in d.get("ffn", {}):
+            ff2 = d["ffn"]["ff"]
+            b[d["ffn"]["up2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi",
+                                  "env": {"DG_M": str(DIT_M), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
+                                          "DG_LAYOUT": '{"epi": {"first_cb": 0}}'}}
         if "ffn" in d:
             ff, hid = d["ffn"]["ff"], spec.hidden
             b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",
@@ -419,7 +445,7 @@ KERNEL_SOURCES = [
     "designs/ln/ln.h", "designs/ln/*.cc", "designs/ln/ln.py", "designs/lin_layer/ln_nr.cc",
     "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.cc", "designs/lm_head_q8/*.h",
     "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc", "designs/gemm_q4_prefill/*.h",
-    "designs/dit_gemm/*.py", "designs/dit_gemm/*.cc",
+    "designs/dit_gemm/*.py", "designs/dit_gemm/*.cc", "designs/dit2/*.py", "designs/dit2/*.cc",
     "designs/attn_block/attn_gemm.py", "../npu_offload/gemm_rtp/gemm_pretiled.py", "../npu_offload/gemm_rtp/npue.py",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",
 ]
