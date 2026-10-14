@@ -360,7 +360,12 @@ private:
     bool moe_batch_on_ = true;   ///< the token-batched expert kernel where the set carries it (OFLM_OPEN_MOE_BATCH=0 off)
     bool attn_block_on_ = true;  ///< the attention products on the NPU where the set carries them (OFLM_OPEN_ATTN_BLOCK=0 off)
     bool layer_major_on_ = true; ///< the whole prompt through each layer before the next (OFLM_OPEN_LAYER_MAJOR=0 off)
-    bool dit_on_ = false;        ///< the block route's GEMMs on dit_gemm (layout.gemm_dit; OFLM_OPEN_GEMM_DIT=0 off)
+    bool dit_on_ = false;
+    bool pipe_on_ = true;        ///< step_prompt_pipe: host and NPU overlapped across chunks (OFLM_OPEN_PIPE=0 off)
+    /// The Qwen3.5 dense prompt with dit GEMMs as a two-thread pipeline over (layer, 1024-token
+    /// chunk) cells: an NPU thread runs every ready dispatch, this thread every ready host stage.
+    void step_prompt_pipe(const std::vector<int>& ids, bool want_logits);
+    bool pipe_ok() const;        ///< the block route's GEMMs on dit_gemm (layout.gemm_dit; OFLM_OPEN_GEMM_DIT=0 off)
     std::vector<float> dit_y_;   ///< dit C as f32, row-major, one dispatch
     bool stage_major_on_ = true; ///< each GEMM step over every block, overlapping the host (OFLM_OPEN_STAGE_MAJOR=0 off)
     bool dispatch_log_ = false;  ///< OFLM_OPEN_DISPATCH_LOG: keep per-kernel dispatch times
