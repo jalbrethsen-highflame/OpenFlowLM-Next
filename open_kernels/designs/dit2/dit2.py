@@ -77,14 +77,18 @@ def dit_gemm(
     r, s, t = 8, 8, 8
 
     A_l2_ty = np.ndarray[(m * MTK // 8,), np.dtype[v8bfp16ebs8]]
-    B_l2_ty = np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
+    b4 = bool(json.loads(layout).get("b4"))   # int4-mantissa weights (pack.py pack_b4, DIT_B4)
+    B4_TILE = 4096 + 128
+    B_l2_ty = np.ndarray[(B4_TILE,), np.dtype[np.uint8]] if b4 else np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
     C_l2_ty = np.ndarray[(N_ROWS * m, n), np.dtype[bfloat16]]
     A_l1_ty = np.ndarray[(m // 4 * k // 8,), np.dtype[v8bfp16ebs8]]
-    B_l1_ty = np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
+    B_l1_ty = np.ndarray[(B4_TILE,), np.dtype[np.uint8]] if b4 else np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
     C_l1_ty = np.ndarray[(m, n), np.dtype[bfloat16]]
 
     flags = [f"-DDIM_M={m}", f"-DDIM_K={k}", f"-DDIM_N={n}", f"-I{_AIE_KERNELS_INC}"]
     flags += os.environ.get("DG_KFLAGS", "").split()   # timing / variant defines
+    if b4:
+        flags += ["-DDIT_B4"]
     flags += [f"-I{HERE.parent.parent / 'include'}"]       # vecmath.h (the epilogue's silu)
     zero_kernel = ExternalFunction("dit_zero_c", source_file=str(_KERNEL_SRC),
                                    arg_types=[C_l1_ty], compile_flags=flags + ["-DZERO_ONLY"])
@@ -165,7 +169,7 @@ def dit_gemm(
          zero_kernel, matmul_kernel, epi_kernel, rtp[row][col], barriers[row][col]],
         stack_size=stack_size))
 
-    assert set(lay) <= {"epi", "pack_h", "a_units"}, f"dit2 takes the epi / pack_h / a_units layout options, not {sorted(lay)}"
+    assert set(lay) <= {"epi", "pack_h", "a_units", "b4"}, f"dit2 takes the epi / pack_h / a_units / b4 layout options, not {sorted(lay)}"
     a_units = bool(lay.get("a_units"))
     epi = lay.get("epi")
     assert not pack_h or (epi and epi["first_cb"] == 0), "pack_h needs the epilogue on every column group"
@@ -175,11 +179,13 @@ def dit_gemm(
     # a_units: A in pack_h's unit slots, 4096 v8 blocks (36864 bytes) apart, 1024 used
     A_ty = np.ndarray[(M // m * (K // 64) * 4096 if a_units else M * K // 8,), np.dtype[v8bfp16ebs8]]
     A_taps = TensorTiler2D.group_tiler((1, M * K // 8), (1, m * K // 8), (1, 1))
-    B_ty = np.ndarray[(K * N // 8,), np.dtype[v8bfp16ebs8]]
+    B_ty = (np.ndarray[(N // n * (K // k) * B4_TILE,), np.dtype[np.uint8]] if b4
+            else np.ndarray[(K * N // 8,), np.dtype[v8bfp16ebs8]])
     c_size = lay.get("c_size", M // m * KS * USTRIDE if pack_h else c_off + M * ldc)
     assert pack_h or c_off + (M - 1) * ldc + N + gap <= c_size, "C layout overruns the argument"
     C_ty = np.ndarray[(c_size,), np.dtype[bfloat16]]
-    B_taps = TensorTiler2D.group_tiler((1, N * K // 8), (1, n * K // 8), (1, 1))
+    B_taps = (TensorTiler2D.group_tiler((1, N // n * (K // k) * B4_TILE), (1, K // k * B4_TILE), (1, 1)) if b4
+              else TensorTiler2D.group_tiler((1, N * K // 8), (1, n * K // 8), (1, 1)))
 
     n_row_groups = M // m // N_ROWS
     n_col_groups = N // n // N_COLS
