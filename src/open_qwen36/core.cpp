@@ -48,6 +48,13 @@ namespace {
 // nearest exactly as pack.py's bfp16ebs8_encode).
 // One bfp16ebs8 block from 8 floats: exponent byte = the largest IEEE exponent, 8 int8
 // mantissas rounded to nearest exactly as designs/dit_gemm/pack.py's bfp16ebs8_encode.
+// OFLM_OPEN_DIT_FFN=0: the dense FFN as two plain dit GEMMs with silu on the host (an A/B
+// against the device SwiGLU epilogue, whose tanh is approximate)
+bool dit_ffn_on() {
+    static const bool on = [] { const char* e = std::getenv("OFLM_OPEN_DIT_FFN"); return !(e && *e == '0'); }();
+    return on;
+}
+
 inline void bfp_encode8(const float* v, uint8_t* blk) {
     uint32_t bits[8];
     std::memcpy(bits, v, 32);
@@ -724,7 +731,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                 // the FFN up|gate weight ([up ff | gate ff] rows) for the SwiGLU epilogue: every
                 // 128-column tile j is [gate 64j.. | up 64j..]
                 std::vector<int64_t> cm;
-                if (man_.gemm_dit.contains("ffn") && !lt.gemm_block.ffn_program.empty() &&
+                if (man_.gemm_dit.contains("ffn") && dit_ffn_on() && !lt.gemm_block.ffn_program.empty() &&
                     lt.gemm_block.ffn_program[0].args[0] == name) {
                     const size_t ff = man_.gemm_dit["ffn"]["ff"].get<size_t>();
                     if (n != 2 * ff || npad != n) throw std::runtime_error("open_qwen36: dit FFN: up|gate is not [2 ff]");
@@ -3283,7 +3290,7 @@ void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
 // gathered middle) is the NPU thread's alone.
 // ============================================================================
 bool Core::pipe_ok() const {
-    if (!dit_on_ || !pipe_on_ || !man_.gemm_dit.contains("ffn") || !gemm_block_t_) return false;
+    if (!dit_on_ || !pipe_on_ || !man_.gemm_dit.contains("ffn") || !dit_ffn_on() || !gemm_block_t_) return false;
     for (int l = 0; l < nl_; ++l) {
         const GemmBlockProgram& gb = types_[l]->gemm_block;
         if ((gb.kind != "linear" && gb.kind != "full") || !gb.has_dense_ffn() || gb.program.size() < 2 ||
@@ -4127,7 +4134,7 @@ void Core::staged_tail(int l, size_t b, size_t T, size_t N, const float* y, cons
 void Core::ffn_staged(int l, const std::vector<Step>& prog, size_t ff, float* xres, size_t B, size_t T, size_t N,
                       const std::vector<float>* gate_w) {
     const size_t hid = man_.hidden;
-    if (dit_on_ && !gate_w && man_.gemm_dit.contains("ffn")) {
+    if (dit_on_ && !gate_w && man_.gemm_dit.contains("ffn") && dit_ffn_on()) {
         // The dense FFN on the device end to end: up|gate with the SwiGLU epilogue writes h into
         // the first 64 of every 128 columns of H, down reads H gathered. The host only converts
         // xm in and adds y onto the residual, both overlapped with the other dispatch.

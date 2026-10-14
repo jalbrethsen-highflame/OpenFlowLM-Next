@@ -28,6 +28,9 @@
 
 #include "aie_kernel_utils.h"
 #include <aie_api/aie.hpp>
+#ifdef EPI_ONLY
+#include "vecmath.h"
+#endif
 
 template <typename T, int M, int N>
 void zero_vectorized(T *__restrict c) {
@@ -185,11 +188,12 @@ void dit_swiglu_epi(bfloat16 *__restrict c, int32_t *__restrict rtp, int32_t t) 
   if (t % rtp[2] < rtp[3])
     return;
   aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
-  using VB = aie::vector<bfloat16, 32>;
   for (int run = 0; run < DIM_M * DIM_N / 1024; run++) {
     bfloat16 *__restrict g = c + run * 1024;
     const bfloat16 *__restrict u = g + 512;
     for (int i = 0; i < 512; i += 32) {
+#ifdef DIT_EPI_TANH
+      using VB = aie::vector<bfloat16, 32>;
       VB h = aie::mul(aie::load_v<32>(g + i), (bfloat16)0.5f).to_vector<bfloat16>();
       aie::accum<accfloat, 32> ha;
       ha.from_vector(h);
@@ -199,6 +203,17 @@ void dit_swiglu_epi(bfloat16 *__restrict c, int32_t *__restrict rtp, int32_t t) 
       th.insert(1, aie::tanh<bfloat16>(hf.extract<16>(1)));
       VB sg = aie::mac(ha, h, th).to_vector<bfloat16>();
       aie::store_v(g + i, aie::mul(sg, aie::load_v<32>(u + i)).to_vector<bfloat16>());
+#else
+      // silu(g) * up in fp32 (vecmath.h: exp to ~1e-7), rounded to bf16 once. The bf16 tanh
+      // form (DIT_EPI_TANH) cost the 27B +0.065 nats a token against host silu.
+      aie::accum<accfloat, 32> ga, ua;
+      ga.from_vector(aie::load_v<32>(g + i));
+      ua.from_vector(aie::load_v<32>(u + i));
+      const v32f hf = fmulN<32>(vsiluN<32>(ga.to_vector<float>()), ua.to_vector<float>());
+      aie::accum<accfloat, 32> ho;
+      ho.from_vector(hf);
+      aie::store_v(g + i, ho.to_vector<bfloat16>());
+#endif
     }
   }
   aie::set_rounding(saved);
