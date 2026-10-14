@@ -142,7 +142,12 @@ each layer over the whole prompt before the next layer. LFM2-MoE 24B went 19 -> 
 - **Find what bounds a kernel before you optimize it.** Build a variant with the arithmetic
   removed (`EB_NULL_MM`, `GQP_NULL_DEQUANT`) and compare with `--bench-kernel`. eb: 8.33 of
   8.47 ms was the weight stream, so more tokens per weight stream was the fix, not faster
-  math. The GEMM: removing the dequant changed nothing; a barrier per row block did.
+  math. The GEMM: with a barrier per row block, removing the dequant changed nothing; after
+  `GQP_PIPE` removed the barrier, the dequant was 19 % of NPU GEMM time (1.28 -> 1.04 s).
+  Re-run an ablation after every structural change: the bound moves.
+- **XDNA2 matrix modes (aie_api `detail/mmul.hpp`):** native int8 x int8 (8x8x8), bfp16 x bfp16
+  (8x8x8) and int8 x int4 (4x16x16). Every bf16 x bf16 mode is emulated (several intrinsics);
+  the fast bf16 path is the bfp16 emulation. No mx4 on XDNA2.
 - **No barrier per block in a runtime sequence.** `TaskGroup(); ...; tg.finish()` per output
   block serializes DMA and compute. `ironutil.Pipeline(3)` with drains issued first overlaps
   them (`gemm_q4_prefill` `GQP_PIPE=1`: NPU GEMM time -23 %).
