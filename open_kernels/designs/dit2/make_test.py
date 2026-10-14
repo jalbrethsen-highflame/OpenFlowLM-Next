@@ -40,7 +40,7 @@ if a.epi:   # columns 0..63 of every 128 become silu(gate) * up; compare those o
     np.save(out / "mask.npy", np.tile(np.r_[np.ones(64), np.zeros(64)], N // 128).astype(bool))
 if a.pack_h:   # h = the first 64 of every 128 columns, the comparison decodes the packed C
     ref = ref.reshape(M, N // 128, 128)[:, :, :64].reshape(M, N // 2)
-    (out / "pack_h").write_text("hs" if a.hs else "4x1")
+    (out / "pack_h").write_text("hs" if a.hs or a.b4 else "4x1")
 np.save(out / "ref.npy", ref.astype(np.float32))
 b = Path(a.build)
 cb = M // 128 * (N // 128) * 36864 if a.pack_h else M * N * 2

@@ -250,11 +250,11 @@ void dit_swiglu_epi(bfloat16 *__restrict c, int32_t *__restrict rtp, int32_t t) 
   // stream out of the memtile; the drain writes the whole tile to a unit slot and the down
   // GEMM reads those bytes (a_units). Quarter by quarter through a scratch: quarter q's 2304 bytes land on
   // quarters <= q, which are done.
-  alignas(64) static bfp16ebs8 scr[32 * 64 / 64];
+  alignas(64) static uint8_t scr[32 * 72];   // one quarter's 32 blocks (a bfp16ebs8 is one byte)
   for (int q = 0; q < 4 && rtp[4]; q++) {
-    aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(scr);
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(reinterpret_cast<bfp16ebs8 *>(scr));
     for (int j = 0; j < 32; j++) {
-#ifdef DIT_HS
+#if defined(DIT_HS) || defined(DIT_B4)   // the 2x2 A order both hand kernels read
       const int kb = (j / 2) % 8, rb = (j / 16) * 2 + j % 2;
 #else
       const int kb = j / 4, rb = j % 4;

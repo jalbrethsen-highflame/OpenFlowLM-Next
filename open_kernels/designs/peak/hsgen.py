@@ -47,7 +47,8 @@ NAME = "hs_b4_call" if B4 else "hs_call"
 UNP_W, LDS_W, MOVE_W = 8, 7, 3   # results readable from issue (def + 1): vldb.unpack, scalar lda (as latency), mov el/eh
 EPERBLK = os.environ.get("HSGEN_B4_EPERBLK", "0") == "1"   # debug: exponents after every unpack
 POP_EARLY = int(os.environ.get("HSGEN_POP_EARLY", POP_W))
-ONCE = os.environ.get("HSGEN_B4_ONCE", "0") == "1"   # debug: pool exponents set for units 0 / 1 only   # debug: a pop's register busy from this cycle
+ONCE = os.environ.get("HSGEN_B4_ONCE", "0") == "1"
+UNP_GAP = int(os.environ.get("HSGEN_UNP_GAP", 0))   # idle ldb cycles between two unpacks (stall probe)   # debug: pool exponents set for units 0 / 1 only   # debug: a pop's register busy from this cycle
 # EX registers per class: the A pops; under B4 the block pools [unit parity][column block]
 POOLS = {"b00": [6, 7], "b01": [8, 9], "b10": [10, 11], "b11": [4, 5]}
 if os.environ.get("HSGEN_B4_EPERBLK", "0") == "1":   # exponents travel with each block: pools by column block
@@ -187,7 +188,7 @@ def build(T0: int) -> Sched:
             for k in reversed(range(8)):
                 for n2 in reversed(range(2)):
                     key = ("B", u, k, n2)
-                    t, _ = s.latest(min(bound, min(mac(u, k, n2), mac(u, k, n2 + 2)) + MAC_RS - UNP_W
+                    t, _ = s.latest(min(bound - UNP_GAP, min(mac(u, k, n2), mac(u, k, n2 + 2)) + MAC_RS - UNP_W
                                         - (6 if EPERBLK else 0)), ["ldb"])
                     s.put(t, "ldb", f"vldb.unpack {{X:{key}}}, unpacksign1, [p1], #32")
                     s.slots[t - 1].add("no_ldb_pop")   # a vldb.pop here would lose its exponents

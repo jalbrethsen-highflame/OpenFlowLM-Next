@@ -256,6 +256,7 @@ def gemm_route(spec: ModelSpec) -> dict | None:
 # ---- the prompt GEMMs on dit_gemm (designs/dit_gemm: bf16 activations x bfp16 weights the
 # engine repacks from the q4_1 bytes at load, 15-19 TFLOPS against gemm_q4_prefill's 2.5-4.4).
 # OPEN_QWEN35_GEMM_DIT=0 keeps gemm_q4_prefill. DIT_M tokens per dispatch (4 route blocks).
+import json as _json
 import os as _os
 GEMM_DIT = _os.environ.get("OPEN_QWEN35_GEMM_DIT", "1") != "0"
 DIT_M = 1024
@@ -269,6 +270,19 @@ GEMM_DIT2 = _os.environ.get("OPEN_QWEN35_GEMM_DIT2", "1") != "0"
 GEMM_HS = GEMM_DIT2 and _os.environ.get("OPEN_QWEN35_GEMM_HS", "1") != "0"
 _HS_ENV = {"DG_KFLAGS": "-DDIT_HS"} if GEMM_HS else {}
 _HS_SFX = "_hs" if GEMM_HS else ""
+# OPEN_QWEN35_GEMM_B4=1: every dit2 GEMM on int4-mantissa weights (pack.py pack_b4, hsgen
+# HSGEN_B4; a power-of-two scale per column per 64 of K), manifest "b4". 38-41 TFLOPS on the
+# 27B shapes against 31-33, at an accuracy cost (utilities/d3-npu/d3_quant_sim.py). The 0x2800
+# stack moves the L1 buffers off each other's banks (35.5 -> 39.6 TFLOPS at 1024x5120x16384).
+GEMM_B4 = GEMM_HS and _os.environ.get("OPEN_QWEN35_GEMM_B4", "0") == "1"
+if GEMM_B4:
+    _HS_ENV = {"DG_STACK": "0x2800"}
+    _HS_SFX = "_b4"
+
+
+def _lay(**kw) -> str:
+    """dit2's DG_LAYOUT json, with b4 under OPEN_QWEN35_GEMM_B4."""
+    return _json.dumps({**kw, **({"b4": True} if GEMM_B4 else {})})
 # designs/dit_fa256: causal GQA flash attention at head dim 256 for the full-attention layers,
 # one instruction stream per key length (q_off = lk - DIT_M) up to FA_MAX_LK, one image.
 FA_MAX_LK = int(_os.environ.get("OPEN_QWEN35_FA_MAX_LK", 32768))
@@ -322,6 +336,7 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             fa["nc_valid"] = FA_NC_VALID
     return {"m": DIT_M,
             **({"hs": True} if GEMM_HS and k2 else {}),
+            **({"b4": True} if GEMM_B4 and k2 else {}),
             **({"fa": fa} if fa else {}),
             **({"ffn": ffn} if ffn else {}),
             **({"kernels2": k2} if k2 else {}),
@@ -456,7 +471,7 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
         for key, name in d.get("kernels2", {}).items():
             n, k = (int(x) for x in key.split("x"))
             b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{k}_n{d['npad'][str(n)]}{_HS_SFX}",
-                       "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), **_HS_ENV}}
+                       "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), "DG_LAYOUT": _lay(), **_HS_ENV}}
         for lk, name in d.get("fa", {}).get("lk", {}).items():
             # DF_EXP_FIX: the corrected exp2 (+9 % kernel time); against host attention on 4K tokens
             # of docs prose the whole fast path is within noise (NLL -0.0002 +- 0.0016)
@@ -470,20 +485,20 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                                "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
         if "down2" in d.get("ffn", {}):
             b[d["ffn"]["down2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{d['ffn']['ff']}_n{spec.hidden}{_HS_SFX}",
-                                    "env": {"DG_M": str(DIT_M), "DG_K": str(d["ffn"]["ff"]), "DG_N": str(spec.hidden), **_HS_ENV}}
+                                    "env": {"DG_M": str(DIT_M), "DG_K": str(d["ffn"]["ff"]), "DG_N": str(spec.hidden), "DG_LAYOUT": _lay(), **_HS_ENV}}
         if "up2" in d.get("ffn", {}):
             ff2 = d["ffn"]["ff"]
             b[d["ffn"]["up2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi{_HS_SFX}",
                                   "env": {"DG_M": str(DIT_M), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
-                                          "DG_LAYOUT": '{"epi": {"first_cb": 0}}', **_HS_ENV}}
+                                          "DG_LAYOUT": _lay(epi={"first_cb": 0}), **_HS_ENV}}
         if "up2p" in d.get("ffn", {}):
             ff2 = d["ffn"]["ff"]
             b[d["ffn"]["up2p"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi_ph{_HS_SFX}",
                                    "env": {"DG_M": str(DIT_M), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
-                                           "DG_LAYOUT": '{"epi": {"first_cb": 0}, "pack_h": true}', **_HS_ENV}}
+                                           "DG_LAYOUT": _lay(epi={"first_cb": 0}, pack_h=True), **_HS_ENV}}
             b[d["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{ff2}_n{spec.hidden}_au{_HS_SFX}",
                                      "env": {"DG_M": str(DIT_M), "DG_K": str(ff2), "DG_N": str(spec.hidden),
-                                             "DG_LAYOUT": '{"a_units": true}', **_HS_ENV}}
+                                             "DG_LAYOUT": _lay(a_units=True), **_HS_ENV}}
         if "ffn" in d:
             ff, hid = d["ffn"]["ff"], spec.hidden
             b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",
