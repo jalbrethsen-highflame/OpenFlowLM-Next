@@ -291,6 +291,8 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
         k2 = {f"{n}x{k}": f"dit2_n{npad[n]}_k{k}" for n, k in shapes if not (ffn and (n, k) == (hid, ff))}
         if ffn:
             ffn["up2"] = f"dit2_n{2 * ff}_k{hid}_epi"
+            # the down GEMM on dit2 too: the host packs h (the up GEMM's gathered C) as bfp16
+            ffn["down2"] = f"dit2_n{hid}_k{ff}"
             k2.pop(f"{2 * ff}x{hid}", None)
     return {"m": DIT_M,
             **({"ffn": ffn} if ffn else {}),
@@ -354,11 +356,12 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         if "ffn" in d:
             for name in (d["ffn"]["up"], d["ffn"]["down"]):
                 out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
-        names2 = list(d.get("kernels2", {}).values()) + ([d["ffn"]["up2"]] if "up2" in d.get("ffn", {}) else [])
+        names2 = list(d.get("kernels2", {}).values()) + [d["ffn"][x] for x in ("up2", "down2") if x in d.get("ffn", {})]
         for name in names2:
             out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
             out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
-        for k in sorted({int(x.split("x")[1]) for x in d.get("kernels2", {})} | ({spec.hidden} if names2 else set())):
+        for k in sorted({int(x.split("x")[1]) for x in d.get("kernels2", {})} | ({spec.hidden} if names2 else set())
+                        | ({d["ffn"]["ff"]} if "down2" in d.get("ffn", {}) else set())):
             out["globals"][f"dit2_x_k{k}"] = DIT_M * k * 9 // 8
     return out
 
@@ -418,6 +421,9 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             n, k = (int(x) for x in key.split("x"))
             b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{k}_n{d['npad'][str(n)]}",
                        "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(d["npad"][str(n)])}}
+        if "down2" in d.get("ffn", {}):
+            b[d["ffn"]["down2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{d['ffn']['ff']}_n{spec.hidden}",
+                                    "env": {"DG_M": str(DIT_M), "DG_K": str(d["ffn"]["ff"]), "DG_N": str(spec.hidden)}}
         if "up2" in d.get("ffn", {}):
             ff2 = d["ffn"]["ff"]
             b[d["ffn"]["up2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi",
