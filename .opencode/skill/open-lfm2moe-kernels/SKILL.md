@@ -29,8 +29,10 @@ Read `npu-model-porting` first for the general rules. Source: `open_kernels/reci
 
 Engine `step_prompt_lfm2` (core.cpp), selected by `--gemm-block` on the CLI and by default in
 the engine's prefill. Layer-major over the whole prompt:
-- Mixers (`prompt_mixers`): projections on `gemm_n{N}_k{K}` (gemm_q4_prefill, T = 256,
-  `GQP_BFP=1 GQP_PIPE=1`, host-side double-buffered); short conv and attention on the host
+- Mixers (`prompt_mixers`): projections on `gemm_n{N}_k{K}` -- by default `dit_gemm`
+  (`OPEN_LFM2MOE_PROMPT_GEMM=dit`: M = 1024 tokens per dispatch, N padded to 1024, weights
+  repacked from the pool as bfp16 at load by `dit_pack_region`, +0.85 GB; 15-19 TFLOPS), or
+  `=q4` for gemm_q4_prefill (T = 256, `GQP_BFP=1 GQP_PIPE=1`, ~4.4 TFLOPS); short conv and attention on the host
   (`attention_tile64`, block_host.cpp); standalone `short_conv_mix` / `dx_mix` images.
 - Router: host, same math as decode.
 - Experts (`experts_batch`): `eb64` / `eb16` (designs/lfm2moe/eb.py, `EB_BFP=1`), 32 token
@@ -82,14 +84,24 @@ manifest points the context at `lm_cm/final.xclbin`.
 | 24B, one context, f32 scales | 49 ms/token (20.3 tok/s) | 19 GB |
 | 24B, three images | 106 ms/token | 19 GB |
 | 8B, three images, bf16 scales | 57 ms/token (17.6 tok/s) | ~6.5 GB |
-| 24B prompt, 4009 tokens | 595 tok/s (6.7 s) | |
+| 24B prompt, 4009 tokens | 660 tok/s (6.1 s) | |
 | 24B decode after a 4K prompt | 63 ms/token (15.8 tok/s) | |
 
 
 Prompt history: 19.5 (token by token) -> 35 (batched experts) -> 130 (batched mixers) ->
 186 (overlap, pipelining) -> 209 (persistent scratch) -> 273 (bfp16 experts) -> 311 (bfp16 GEMMs)
 -> 346 (parallel rope) -> 359 (NT 32) -> ~405 (GEMM pipe) -> ~470 (attention micro-GEMMs)
--> 595 (16 host threads instead of 32).
+-> 595 (16 host threads instead of 32) -> 660 (dit_gemm).
+
+By prompt length (dit_gemm, 16 threads): 1K 492, 2K 604, 4K 662, 8K 574, 16K 329, 32K 195
+tok/s. Host attention grows faster than T^2 past 4K (0.59 / 4.2 / 31 / 130 s at 4/8/16/32K):
+the f32 K/V window of 8 kv heads outgrows the L3 at 8K. Decode after the prompt: 49 / 54 /
+64 / 84 / 124 / 207 ms per token at 1/2/4/8/16/32K.
+
+Accuracy: the three NPU paths (token by token, q4 GEMM, dit) differ from each other by a mean
+KL of ~0.10 and 86 % top-1 agreement over a 4K prompt, with equal prompt NLL. dit adds nothing
+measurable. Whether that ~0.10 floor is the bfp16 / MoE-routing noise or a defect is not
+checked against the fp64 replica at long context yet.
 
 24B step (one context): ex 38 x 0.64 ms, mixers ~0.95 ms (includes the queued ex wait),
 cx 2 x 2.1, head 5.9, router 0.8.
