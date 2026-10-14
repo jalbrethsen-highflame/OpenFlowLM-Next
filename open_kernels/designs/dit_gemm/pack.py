@@ -88,7 +88,8 @@ def pack_b4(b: np.ndarray) -> np.ndarray:
     4096 bytes of nibbles, blocks [column pair 8][k-block 8][2] of 8 columns x 8 k (column-major
     inside: value i = column * 8 + k, low nibble first), then 128 exponent bytes, one per column for
     the tile's 64 of K. A weight is mantissa (-8..7) x 2^(exponent - 133), bfp16ebs8's scale, the
-    exponent the smallest that keeps the column's 64 values within +-7 before rounding."""
+    exponent the smallest that keeps the column's 64 values within +-7 before rounding, or one less
+    when clipping to -8..7 there gives a lower squared error (dit_encode_b4's rule)."""
     b = np.asarray(b, dtype=np.float64)
     K, N = b.shape
     assert K % K_T == 0 and N % N_T == 0, (K, N)
@@ -96,7 +97,13 @@ def pack_b4(b: np.ndarray) -> np.ndarray:
     amax = np.abs(t).max(-1)                                                  # [nt, kt, 128]
     e2 = np.where(amax > 0, np.ceil(np.log2(np.maximum(amax, 1e-300) / 7.0)), -133).astype(np.int64)
     e2 = np.clip(e2, -133, 122)
-    m = np.clip(np.rint(t / np.ldexp(1.0, e2)[..., None]), -8, 7).astype(np.int64)
+
+    def q(e):
+        return np.clip(np.rint(t / np.ldexp(1.0, e)[..., None]), -8, 7)
+
+    err = [((q(e) * np.ldexp(1.0, e)[..., None] - t) ** 2).sum(-1) for e in (e2, e2 - 1)]
+    e2 = np.where((amax > 0) & (e2 > -133) & (err[1] < err[0]), e2 - 1, e2)
+    m = q(e2).astype(np.int64)
     # blocks [pair 8][kb 8][n2 2][col-in-block 8][k-in-block 8]
     m = m.reshape(N // N_T, K // K_T, 8, 2, 8, 8, 8).transpose(0, 1, 2, 5, 3, 4, 6)
     nib = (m & 15).reshape(N // N_T, K // K_T, -1)

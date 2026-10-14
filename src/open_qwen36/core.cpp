@@ -175,7 +175,8 @@ void dit_encode(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, c
 // per [128-column tile][64-k tile] 4096 bytes of nibbles, blocks [column pair 8][k-block 8][2] of
 // 8 columns x 8 k (value i = column * 8 + k, low nibble first), then one exponent byte per column:
 // a weight is mantissa (-8..7) x 2^(exponent - 133), the exponent the smallest that keeps the
-// column's 64 values within +-7. colmap as dit_encode.
+// column's 64 values within +-7, or one less when clipping to -8..7 there gives a lower squared
+// error. colmap as dit_encode.
 constexpr size_t kB4Tile = 4096 + 128;
 void dit_encode_b4(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, const int64_t* colmap = nullptr) {
     const size_t KT = k / 64, NT = npad / 128;
@@ -192,11 +193,23 @@ void dit_encode_b4(const float* W, size_t n, size_t k, size_t npad, uint8_t* out
             if (w) for (size_t j = 0; j < 64; ++j) amax = std::max(amax, std::fabs(w[j]));
             int e2 = amax > 0.f ? static_cast<int>(std::ceil(std::log2(static_cast<double>(amax) / 7.0))) : -133;
             e2 = std::min(std::max(e2, -133), 122);
+            auto q = [](float x, double inv) { return std::min(7.0, std::max(-8.0, std::nearbyint(x * inv))); };
+            if (w && e2 > -133) {
+                double err[2] = {0.0, 0.0};
+                for (int d = 0; d < 2; ++d) {
+                    const double inv = std::ldexp(1.0, -(e2 - d)), s = std::ldexp(1.0, e2 - d);
+                    for (size_t j = 0; j < 64; ++j) {
+                        const double r = q(w[j], inv) * s - static_cast<double>(w[j]);
+                        err[d] += r * r;
+                    }
+                }
+                if (err[1] < err[0]) --e2;
+            }
             tile[4096 + cl] = static_cast<uint8_t>(e2 + 133);
             const double inv = std::ldexp(1.0, -e2);
             const size_t pair = cl / 16, n2 = (cl / 8) % 2, g = cl % 8;
             for (size_t j = 0; j < 64; ++j) {
-                const int m = w ? static_cast<int>(std::min(7.0, std::max(-8.0, std::nearbyint(w[j] * inv)))) : 0;
+                const int m = w ? static_cast<int>(q(w[j], inv)) : 0;
                 const size_t kb = j / 8, t = j % 8;
                 const size_t i = (((pair * 8 + kb) * 2 + n2) * 64) + g * 8 + t;
                 tile[i / 2] |= static_cast<uint8_t>((m & 15) << ((i & 1) * 4));
