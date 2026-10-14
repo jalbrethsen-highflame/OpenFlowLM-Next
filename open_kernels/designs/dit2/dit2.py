@@ -30,7 +30,7 @@ from ml_dtypes import bfloat16
 
 import aie.iron as iron
 from aie.dialects.aiex import v8bfp16ebs8
-from aie.helpers.taplib import TensorTiler2D
+from aie.helpers.taplib import TensorAccessPattern, TensorTiler2D
 from aie.iron import (
     Buffer, CompileTime, ExternalFunction, In, ObjectFifo, Out, Program, Runtime,
     StreamDims, TaskGroup, Worker, WorkerRuntimeBarrier,
@@ -48,8 +48,8 @@ N_COLS, N_ROWS = 8, 4
 MAX_INFLIGHT = 4                  # tile groups in flight (upstream's rotation depth)
 
 
-RTP_TILES, RTP_KB, RTP_COL_GROUPS, RTP_EPI_FIRST = range(4)
-RTP_LEN = 4
+RTP_TILES, RTP_KB, RTP_COL_GROUPS, RTP_EPI_FIRST, RTP_PACK = range(5)
+RTP_LEN = 5
 
 
 def check_shape(M: int, K: int, N: int) -> str | None:
@@ -111,7 +111,16 @@ def dit_gemm(
         B_l3l2.append(f)
         B_l2l1.append(f.cons().forward(obj_type=B_l1_ty, name=f"B_L2L1_{col}", depth=2))
 
-    # C: the 4 cores of a column join at the memtile, which writes row-major out.
+    # C: the 4 cores of a column join at the memtile, which writes row-major out -- or, with
+    # pack_h, each core's tile (h packed at the start of its stream by the epilogue, RTP_PACK: a 128 x 64 unit
+    # of the FFN down GEMM's A) to a unit slot USTRIDE elements apart, slots [row group][k step]
+    # [core row]; the down GEMM reads the units' first 9216 bytes ("a_units"). A slot is 36864
+    # bytes, a whole number of bfp16 rows.
+    lay = json.loads(layout)
+    pack_h = bool(lay.get("pack_h"))
+    USTRIDE = 36864 // 2                         # bf16 elements per unit slot
+    # the memtile dims are part of the image every dit2 kernel shares, so pack_h keeps them:
+    # the epilogue places the packed bytes where the row-major stream reads first
     c_l2l3_dims: StreamDims = [(m // r, r * n), (r, t), (n // t, r * t), (t, 1)]
     C_l1l2 = [[] for _ in range(N_ROWS)]
     C_l2l3 = []
@@ -156,15 +165,19 @@ def dit_gemm(
          zero_kernel, matmul_kernel, epi_kernel, rtp[row][col], barriers[row][col]],
         stack_size=stack_size))
 
-    assert set(lay) <= {"epi"}, f"dit2 takes only the epi layout option, not {sorted(lay)}"
+    assert set(lay) <= {"epi", "pack_h", "a_units"}, f"dit2 takes the epi / pack_h / a_units layout options, not {sorted(lay)}"
+    a_units = bool(lay.get("a_units"))
     epi = lay.get("epi")
+    assert not pack_h or (epi and epi["first_cb"] == 0), "pack_h needs the epilogue on every column group"
+    KS = N // 128                                # the down GEMM's k steps (h width / 64)
     ldc, c_off, gap = N, 0, 0
     first_cb = epi["first_cb"] if epi else 1 << 30
-    A_ty = np.ndarray[(M * K // 8,), np.dtype[v8bfp16ebs8]]
+    # a_units: A in pack_h's unit slots, 4096 v8 blocks (36864 bytes) apart, 1024 used
+    A_ty = np.ndarray[(M // m * (K // 64) * 4096 if a_units else M * K // 8,), np.dtype[v8bfp16ebs8]]
     A_taps = TensorTiler2D.group_tiler((1, M * K // 8), (1, m * K // 8), (1, 1))
     B_ty = np.ndarray[(K * N // 8,), np.dtype[v8bfp16ebs8]]
-    c_size = lay.get("c_size", c_off + M * ldc)
-    assert c_off + (M - 1) * ldc + N + gap <= c_size, "C layout overruns the argument"
+    c_size = lay.get("c_size", M // m * KS * USTRIDE if pack_h else c_off + M * ldc)
+    assert pack_h or c_off + (M - 1) * ldc + N + gap <= c_size, "C layout overruns the argument"
     C_ty = np.ndarray[(c_size,), np.dtype[bfloat16]]
     B_taps = TensorTiler2D.group_tiler((1, N * K // 8), (1, n * K // 8), (1, 1))
 
@@ -180,6 +193,7 @@ def dit_gemm(
                 rtp[row][col][RTP_KB] = K // k
                 rtp[row][col][RTP_COL_GROUPS] = n_col_groups
                 rtp[row][col][RTP_EPI_FIRST] = min(first_cb, n_col_groups)
+                rtp[row][col][RTP_PACK] = int(pack_h)
         for row in range(N_ROWS):
             for col in range(N_COLS):
                 barriers[row][col].set(1)
@@ -190,10 +204,21 @@ def dit_gemm(
             tg = TaskGroup()
             rb, cb = divmod(g, n_col_groups)
             for row in range(N_ROWS):
-                A_prods[row].fill(a, tap=A_taps[rb * N_ROWS + row], group=tg, wait=False)
+                if a_units:
+                    A_prods[row].fill(a, tap=TensorAccessPattern(
+                        (M // m * (K // 64) * 4096,), (rb * (K // 64) * N_ROWS + row) * 4096,
+                        [K // 64, 4, 256], [N_ROWS * 4096, 256, 1]), group=tg, wait=False)   # 256 x 9 B = 576 words
+                else:
+                    A_prods[row].fill(a, tap=A_taps[rb * N_ROWS + row], group=tg, wait=False)
             for col in range(N_COLS):
                 B_prods[col].fill(b, tap=B_taps[cb * N_COLS + col], group=tg, wait=False)
             for col in range(N_COLS):
+                if pack_h:   # slots [row group rb][k step cb * 8 + col][core row 0..3]: a column's 4
+                    # tiles are adjacent slots, so one drain with small strides
+                    C_conses[col].drain(c, offset=(rb * KS + cb * N_COLS + col) * N_ROWS * USTRIDE,
+                                        sizes=[N_ROWS, m * n // 512, 512], strides=[USTRIDE, 512, 1],
+                                        group=tg, wait=True)
+                    continue
                 col0 = (cb * N_COLS + col) * n + (gap if cb >= first_cb else 0)
                 C_conses[col].drain(c, offset=c_off + rb * N_ROWS * m * ldc + col0,
                                     sizes=[N_ROWS * m, n], strides=[ldc, 1],

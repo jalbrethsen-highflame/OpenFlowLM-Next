@@ -3316,6 +3316,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     const nlohmann::json& K2 = D.contains("kernels2") ? D["kernels2"] : kEmpty;
     const bool up2 = D["ffn"].contains("up2");
     const bool down2 = up2 && D["ffn"].contains("down2");
+    // the FFN as one NPU step: up|gate writes h packed as the down GEMM's A unit slots on the
+    // device (dit2 pack_h), down reads them (a_units) -- no HPACK readback / repack on the host
+    static const bool ffn_dev_on = [] { const char* e = std::getenv("OFLM_OPEN_FFN_DEVICE"); return !(e && *e == '0'); }();
+    const bool ffn_dev = down2 && dit_hs_ && ffn_dev_on && D["ffn"].contains("up2p") && D["ffn"].contains("down2u");
     auto has2 = [&](size_t n, size_t k) { return K2.contains(std::to_string(n) + "x" + std::to_string(k)); };
     // designs/dit_fa256: NPU attention for a full layer's chunk when a stream exists for its key
     // length (pos0 + chunk end) and that length is at least OFLM_OPEN_FA_MIN_LK (default 3072:
@@ -3372,6 +3376,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         }
     }
     need("pp_h", M * 2 * ff * 2);
+    if (ffn_dev) need("pp_hu", M / 128 * (ff / 64) * 36864);   // h unit slots, one NPU step uses and frees them
     // Each layer's cells walk a list of operations, host (even index) and NPU (odd) alternating.
     enum Op { PRE, QKV, MID, FAT, GATE, OUT, TAIL, UP, HPACK, DOWN, RES };
     std::vector<std::vector<int>> ops(L);
@@ -3380,7 +3385,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         o = {PRE, QKV, MID};
         if (types_[l]->gemm_block.kind == "full" && (!FA.empty() || noncausal_)) o.insert(o.end(), {FAT, GATE});
         o.insert(o.end(), {OUT, TAIL, UP});
-        if (down2) o.insert(o.end(), {HPACK, DOWN});
+        if (down2 && !ffn_dev) o.insert(o.end(), {HPACK, DOWN});
         o.push_back(RES);
     }
     // host rows
@@ -3473,6 +3478,40 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     if (has2(hid, km)) run(K2[std::to_string(hid) + "x" + std::to_string(km)].get<std::string>(),
                                            {"pp_m2_" + cs, gb.program[1].args[0], "pp_y_" + cs});
                     else run(kname(hid, km), {"pp_m_" + cs, gb.program[1].args[0], "pp_y_" + cs});
+                } else if (op == UP && ffn_dev) {
+                    run(D["ffn"]["up2p"].get<std::string>(), {"pp_a2_" + cs, gb.ffn_program[0].args[0], "pp_hu"});
+                    run(D["ffn"]["down2u"].get<std::string>(), {"pp_hu", gb.ffn_program[1].args[0], "pp_y_" + cs});
+                    static const bool ffn_check = [] { const char* e = std::getenv("OFLM_OPEN_FFN_CHECK"); return e && *e == '1'; }();
+                    if (ffn_check && c == 0 && l < 2) {
+                        // debug: the host-repack route on the same input, compared
+                        xrt::bo& yb = buffer("pp_y_" + cs, 0);
+                        read_back(yb, M * hid * 2, 0);
+                        std::vector<float> ydev(M * hid);
+                        for (size_t i = 0; i < M * hid; ++i) ydev[i] = bf16_to_f32(yb.map<const uint16_t*>()[i]);
+                        xrt::bo& hu = buffer("pp_hu", 0);
+                        read_back(hu, 36864, 0);
+                        run(D["ffn"]["up2"].get<std::string>(), {"pp_a2_" + cs, gb.ffn_program[0].args[0], "pp_h_" + cs});
+                        xrt::bo& hb = buffer("pp_h_" + cs, 0);
+                        read_back(hb, M * 2 * ff * 2, 0);
+                        std::vector<float> hf2(M * ff);
+                        for (size_t r = 0; r < M; ++r)
+                            for (size_t j = 0; j < ff; ++j) hf2[r * ff + j] = bf16_to_f32(hb.map<const uint16_t*>()[r * 2 * ff + (j / 64) * 128 + j % 64]);
+                        xrt::bo& db = buffer("pp_d2_" + cs, 0);
+                        dit2_pack_a(hf2.data(), M, M, ff, db.map<uint8_t*>(), dit_hs_);
+                        db.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * ff * 9 / 8, 0);
+                        int same = 0;
+                        for (int i = 0; i < 9216; ++i) same += hu.map<const uint8_t*>()[i] == db.map<const uint8_t*>()[i];
+                        run(D["ffn"]["down2"].get<std::string>(), {"pp_d2_" + cs, gb.ffn_program[1].args[0], "pp_y_" + cs});
+                        read_back(yb, M * hid * 2, 0);
+                        double num = 0, den = 0; size_t nans = 0;
+                        for (size_t i = 0; i < M * hid; ++i) {
+                            const double r = bf16_to_f32(yb.map<const uint16_t*>()[i]), d = ydev[i] - r;
+                            if (!std::isfinite(ydev[i])) ++nans;
+                            num += d * d; den += r * r;
+                        }
+                        std::fprintf(stderr, "ffn_check layer %zu: |y_dev - y_host| / |y_host| = %.3e, %zu non-finite; unit 0 bytes equal %d/9216\n",
+                                     l, std::sqrt(num / den), nans, same);
+                    }
                 } else if (op == UP && down2) {
                     run(D["ffn"]["up2"].get<std::string>(), {"pp_a2_" + cs, gb.ffn_program[0].args[0], "pp_h_" + cs});
                 } else if (op == UP) {
