@@ -10,6 +10,7 @@ from einops import rearrange, repeat
 import numpy as np
 import torch
 import json
+from pathlib import Path
 
 # Tensors whose last dimension is the hidden size (hidden as INPUT):
 # zero-padding appends inert columns. --pad-to-fit uses these so a finetune
@@ -606,6 +607,14 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
 
     _Q8_0_NAMES = {"lm_head", "ssm_out_proj", "ssm_alpha_proj", "ssm_beta_proj"}
 
+    def _note_bf16(self, q4nx_name: str, hf_name: str, rows: int, cols: int, qproj: bool):
+        """bf16_map.json: where each quantized q4nx tensor's exact bf16 rows live in the HF
+        checkpoint, so the engine can build its bfp16 prompt weights from them instead of
+        the q4_1 / q8_0 codes (open_qwen36 OFLM_OPEN_BF16_SRC)."""
+        real = getattr(self, "hf_real_name", {}).get(hf_name, hf_name)
+        self.bf16_map[q4nx_name] = {"hf": real, "shard": self.weight_map[hf_name], "rows": rows,
+                                    "cols": cols, "row_order": "qproj_heads" if qproj else "same"}
+
     def _store_q(self, q4nx_name: str, w: torch.Tensor):
         """Quantize + pack a 2D weight into the Q4NX block layout.
 
@@ -646,6 +655,7 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
     def _convert_hf_language(self, q4nx_path: str):
         import re
         self.q4nx_tensors = {}
+        self.bf16_map = {}
         # Explicit HF -> Q4NX name mapping for linear_attn tensors whose
         # HF names (in_proj_*, out_proj, A_log, dt_bias, norm) differ from
         # the Q4NX config names (qkv_proj, ssm_*, etc.)
@@ -822,14 +832,27 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
 
             if w.dim() < 2:
                 raise RuntimeError(f"1D tensor reached _store_q: {q4nx_name} key={key} shape={w.shape}")
+            if not reorder_linear:
+                self._note_bf16(q4nx_name, name, w.shape[0], w.shape[1],
+                                "self_attn.q_proj" in q4nx_name and self.head_dim is not None)
             self._store_q(q4nx_name, w)
 
+        if "lm_head.weight" not in self.q4nx_tensors and "embed_tokens.weight" in hf_name_map:
+            # no LM head (a decision model's readout replaces it, e.g. vllm-sr/d3): the engine
+            # still loads one, so give it the embedding, as the GGUF path does
+            print("[INFO] No lm_head in the checkpoint; storing the embedding as lm_head")
+            self._store_q("lm_head.weight", self._load_tensor(
+                next(n for n in self.weight_map if n.replace("model.language_model.", "") == "embed_tokens.weight")))
         print(f"[INFO] Produced {len(self.q4nx_tensors)} Q4NX tensors")
         self._export_weights(q4nx_path, "language")
+        out = (Path(q4nx_path) if Path(q4nx_path).is_dir() else Path(q4nx_path).parent) / "bf16_map.json"
+        out.write_text(json.dumps({"hf_dir": str(self.hf_dir), "map": self.bf16_map}, indent=1))
+        print(f"[INFO] Wrote {out} ({len(self.bf16_map)} tensors)")
 
     def _convert_hf_vision(self, q4nx_path: str):
         import re
         self.q4nx_tensors = {}
+        self.bf16_map = {}
         # Build a proper HF name map with {bid} expanded to actual layer numbers.
         hf_name_map = {}
         for param_info in self.q4nx_config["name_map"].values():

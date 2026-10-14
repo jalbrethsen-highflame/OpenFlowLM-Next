@@ -77,6 +77,11 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
 /// normed and roped with 1/sqrt(hd) folded in (a power of two at every head dim here, so the
 /// bf16 the kernel sees rounds exactly as the unscaled value would); the block's k / v normed,
 /// roped and written to the cache rows [pos0, pos0 + t_real) in bf16. Rows of Q past t_real are zero.
+/// Attention of the t_real queries of attention_prep's Q (normed, roped, already scaled) over
+/// the cache rows [0, keys), with no causal mask: d3's noncausal full attention, where every
+/// prompt token sees the whole prompt. og [T, nh * hd]; rows past t_real are zero.
+void attention_full(const AttnGeom& g, const float* Q, const uint16_t* kv, size_t kv_row_elems, size_t keys, float* og);
+
 void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
                     const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems, float* Q);
 

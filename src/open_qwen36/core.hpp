@@ -59,6 +59,9 @@ struct CoreConfig {
     unsigned timeout_ms = 60000;  ///< per dispatch; 0 blocks
     bool verbose = true;
     std::string prefill_mode = "fast";  ///< OPEN-PREFILL-MODE: fast | lean
+    /// Prompts only, never logits or decode (a decision model's readout runs outside): with a bf16
+    /// source covering the GEMM weights, no q4 pools and no LM head are loaded (~16 GB on the 27B).
+    bool prompt_only = false;
 };
 
 /// Everything a request needs to be resumed later (the app's checkpoint/restore).
@@ -117,6 +120,8 @@ struct StepTiming {
 /// carry is refused by name; families whose config carries GGUF-invisible
 /// fields (Granite's folded multipliers) need their config.json.
 nlohmann::json derive_config(const GgufFile& g);
+
+struct HfBf16;
 
 class Core {
 public:
@@ -283,6 +288,12 @@ public:
     void kv_row(int layer, int row, bool value, uint16_t* out);
 
     const WeightFile& file() const { return *file_; }
+    /// d3-style decision models: the full-attention layers attend over the whole prompt (no
+    /// causal mask; the DeltaNet layers stay causal). Prompt pipeline only, fresh prompts only.
+    void set_noncausal(bool on) { noncausal_ = on; }
+    /// The residual stream at the last prompt position of the last pipelined prompt, before the
+    /// final norm (f32, hidden wide).
+    const std::vector<float>& last_x() const { return last_x_; }
 
 private:
     struct Kern {
@@ -304,6 +315,7 @@ private:
     const Manifest* w_ = nullptr;              ///< the weights view (man_ or man_.gguf.get())
     bool gguf_ = false;                        ///< the weights are a GGUF (model.gguf)
     std::unique_ptr<WeightFile> file_;
+    std::shared_ptr<HfBf16> hf_bf16_;   ///< exact bf16 rows for the prompt GEMMs (bf16_map.json), or null
     int nl_ = 0;
     std::vector<const LayerType*> types_;      ///< per layer
 
@@ -365,6 +377,8 @@ private:
     /// The Qwen3.5 dense prompt with dit GEMMs as a two-thread pipeline over (layer, 1024-token
     /// chunk) cells: an NPU thread runs every ready dispatch, this thread every ready host stage.
     void step_prompt_pipe(const std::vector<int>& ids, bool want_logits);
+    bool noncausal_ = false;     ///< full-attention layers see the whole prompt (d3); set_noncausal
+    std::vector<float> last_x_;  ///< the residual stream at the prompt's last position (before the final norm)
     bool pipe_ok() const;        ///< the block route's GEMMs on dit_gemm (layout.gemm_dit; OFLM_OPEN_GEMM_DIT=0 off)
     std::vector<float> dit_y_;   ///< dit C as f32, row-major, one dispatch
     bool stage_major_on_ = true; ///< each GEMM step over every block, overlapping the host (OFLM_OPEN_STAGE_MAJOR=0 off)

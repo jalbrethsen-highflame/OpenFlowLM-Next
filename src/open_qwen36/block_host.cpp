@@ -609,6 +609,262 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
     }
 }
 
+namespace {
+// The tiled attention behind attention_block (OFLM: LFM2-MoE's prompt route spends most of
+// its host time here). Loops are laid out so the innermost one runs over contiguous floats
+// with no reduction, which vectorises without -ffast-math: S over the chunk's key rows (K
+// transposed into the chunk scratch), acc over the head dims. Two clones picked at load by the
+// CPU: x86-64-v4 (AVX-512; Zen 5 Strix parts) and x86-64-v3 (AVX2 + FMA; every Ryzen AI part).
+constexpr size_t kQT = 16;     // query tokens per work item
+constexpr size_t kKC = 64;     // key rows per chunk
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
+void attention_tile(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
+                    const uint16_t* kv, size_t kv_row_elems, float* og, size_t g, size_t t0, size_t kend) {
+    const size_t grp = nh / kvh, qw = nh * hd, kvw = kvh * hd;
+    const size_t nt = std::min(kQT, R - t0), M = grp * nt;
+    const size_t last = kend ? kend - 1 : pos0 + t0 + nt - 1;   // the highest key row any query here sees
+    std::vector<float> q(M * hd), kt(hd * kKC), vc(kKC * hd), s(M * kKC), acc(M * hd, 0.f), m(M, -1e30f), l(M, 0.f);
+    std::vector<size_t> qpos(M);
+    for (size_t i = 0; i < M; ++i) {                      // row i = (head gi, token ti)
+        const size_t gi = i / nt, ti = i % nt, h = g * grp + gi;
+        qpos[i] = kend ? kend - 1 : pos0 + t0 + ti;
+        const float* src = Q + (t0 + ti) * qw + h * hd;
+        for (size_t d = 0; d < hd; ++d) q[i * hd + d] = src[d] * scale;
+    }
+    for (size_t c0 = 0; c0 <= last; c0 += kKC) {
+        const size_t kc = std::min(kKC, last + 1 - c0);
+        for (size_t j = 0; j < kc; ++j) {
+            const uint16_t* row = kv + (c0 + j) * kv_row_elems + g * hd;
+            for (size_t d = 0; d < hd; ++d) {
+                kt[d * kKC + j] = bf16_to_f32(row[d]);
+                vc[j * hd + d] = bf16_to_f32(row[kvw + d]);
+            }
+        }
+        for (size_t i = 0; i < M; ++i) {
+            float* si = s.data() + i * kKC;
+            for (size_t j = 0; j < kKC; ++j) si[j] = 0.f;
+            const float* qi = q.data() + i * hd;
+            for (size_t d = 0; d < hd; ++d) {
+                const float a = qi[d];
+                const float* kd = kt.data() + d * kKC;
+                for (size_t j = 0; j < kKC; ++j) si[j] += a * kd[j];
+            }
+            // causal mask, then the online softmax update for this row
+            const size_t valid = qpos[i] < c0 ? 0 : std::min(kc, qpos[i] - c0 + 1);
+            if (!valid) continue;
+            float mx = m[i];
+            for (size_t j = 0; j < valid; ++j) mx = std::max(mx, si[j]);
+            const float corr = std::exp(m[i] - mx);
+            float sum = 0.f;
+            for (size_t j = 0; j < valid; ++j) sum += (si[j] = std::exp(si[j] - mx));
+            for (size_t j = valid; j < kKC; ++j) si[j] = 0.f;
+            l[i] = l[i] * corr + sum;
+            m[i] = mx;
+            float* ai = acc.data() + i * hd;
+            for (size_t d = 0; d < hd; ++d) ai[d] *= corr;
+            for (size_t j = 0; j < valid; ++j) {
+                const float p = si[j];
+                const float* vj = vc.data() + j * hd;
+                for (size_t d = 0; d < hd; ++d) ai[d] += p * vj[d];
+            }
+        }
+    }
+    for (size_t i = 0; i < M; ++i) {
+        const size_t gi = i / nt, ti = i % nt, h = g * grp + gi;
+        float* out = og + (t0 + ti) * qw + h * hd;
+        const float inv = 1.f / l[i];
+        for (size_t d = 0; d < hd; ++d) out[d] = acc[i * hd + d] * inv;
+    }
+}
+
+// ---- the fast path (hd a multiple of 64): the window's K and V converted from bf16 ONCE per
+// call, K transposed per 64-key chunk to KT[g][chunk][d][64] and V to VF[g][pos][d] (a chunk
+// of either is one contiguous 16 KB block: KT[g][d][pos] put a chunk's 64 rows P floats
+// apart, a power-of-two stride from 8K keys on that aliased one cache set -- 4.5x the 4K
+// time at 8K, 9.8x more at 16K) (pos padded to whole 64-key
+// chunks with zeros), then per work item (kv head, query tile) S = Q K^T and acc += P V as
+// register-blocked micro-GEMMs over 64-key chunks (4 query rows x 64 keys / 64 dims), the
+// online softmax in between with a vector exp (Cephes expf's polynomial, ~1 ulp on the range
+// it sees). Masking only on the chunks that cross the diagonal. GCC vector types, so one body
+// serves the AVX-512 and AVX2 clones.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpsabi"
+typedef float v16f __attribute__((vector_size(64)));
+typedef int32_t v16i __attribute__((vector_size(64)));
+typedef float v16u __attribute__((vector_size(64), aligned(4)));   // unaligned loads / stores
+
+__attribute__((always_inline)) inline v16f ld(const float* p) { return *reinterpret_cast<const v16u*>(p); }
+__attribute__((always_inline)) inline void st(float* p, v16f v) { *reinterpret_cast<v16u*>(p) = v; }
+__attribute__((always_inline)) inline v16f bc(float c) { return v16f{} + c; }
+
+__attribute__((always_inline)) inline v16f vexp(v16f x) {           // x <= 0 here
+    x = x < bc(-86.f) ? bc(-86.f) : x;
+    const v16f t = x * 1.44269504088896341f + 12582912.f;            // round(x log2 e) by the 1.5*2^23 trick
+    const v16f n = t - 12582912.f;
+    const v16i ni = reinterpret_cast<v16i>(t) - 0x4B400000;
+    v16f r = x - n * 0.693359375f;
+    r = r - n * -2.12194440e-4f;
+    v16f p = bc(1.9875691500e-4f);
+    p = p * r + 1.3981999507e-3f;
+    p = p * r + 8.3334519073e-3f;
+    p = p * r + 4.1665795894e-2f;
+    p = p * r + 1.6666665459e-1f;
+    p = p * r + 5.0000001201e-1f;
+    const v16f y = p * r * r + r + 1.f;
+    return reinterpret_cast<v16f>(reinterpret_cast<v16i>(y) + (ni << 23));
+}
+
+constexpr size_t kRB = 4;      // query rows per micro-kernel block
+
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
+void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, size_t qt, float scale, const float* Q,
+                      const float* KT, const float* VF, size_t P, float* og, size_t g, size_t t0, size_t kend) {
+    const size_t grp = nh / kvh, qw = nh * hd;
+    const size_t nt = std::min(qt, R - t0), M = grp * nt, Mp = (M + kRB - 1) / kRB * kRB;
+    const size_t first = pos0 + t0, last = kend ? kend - 1 : first + nt - 1;   // kend: every query sees [0, kend)
+    static thread_local std::vector<float> qb, sb, ab, mb, lb, cb;
+    static thread_local std::vector<size_t> qp;
+    qb.assign(Mp * hd, 0.f);
+    sb.resize(Mp * 64);
+    ab.assign(Mp * hd, 0.f);
+    mb.assign(Mp, -1e30f);
+    lb.assign(Mp, 0.f);
+    cb.resize(Mp);
+    qp.resize(Mp);
+    float *q = qb.data(), *s = sb.data(), *acc = ab.data(), *m = mb.data(), *l = lb.data(), *cr = cb.data();
+    for (size_t i = 0; i < Mp; ++i) {                     // row i = (head gi, token ti); pad rows see all keys
+        if (i >= M) { qp[i] = last; continue; }
+        const size_t gi = i / nt, ti = i % nt;
+        qp[i] = kend ? last : first + ti;
+        const float* src = Q + (t0 + ti) * qw + (g * grp + gi) * hd;
+        for (size_t d = 0; d < hd; ++d) q[i * hd + d] = src[d] * scale;
+    }
+    const float* kt = KT + g * hd * P;
+    const float* vf = VF + g * P * hd;
+    for (size_t c0 = 0; c0 <= last; c0 += 64) {
+        const size_t kc = std::min<size_t>(64, last + 1 - c0);
+        // S = Q K^T over the chunk's 64 keys
+        for (size_t i0 = 0; i0 < Mp; i0 += kRB) {
+            v16f a00{}, a01{}, a02{}, a03{}, a10{}, a11{}, a12{}, a13{}, a20{}, a21{}, a22{}, a23{}, a30{}, a31{}, a32{}, a33{};
+            const float *q0 = q + i0 * hd, *q1 = q0 + hd, *q2 = q1 + hd, *q3 = q2 + hd;
+            for (size_t d = 0; d < hd; ++d) {
+                const float* kd = kt + (c0 / 64 * hd + d) * 64;
+                const v16f k0 = ld(kd), k1 = ld(kd + 16), k2 = ld(kd + 32), k3 = ld(kd + 48);
+                const v16f b0 = bc(q0[d]), b1 = bc(q1[d]), b2 = bc(q2[d]), b3 = bc(q3[d]);
+                a00 += b0 * k0; a01 += b0 * k1; a02 += b0 * k2; a03 += b0 * k3;
+                a10 += b1 * k0; a11 += b1 * k1; a12 += b1 * k2; a13 += b1 * k3;
+                a20 += b2 * k0; a21 += b2 * k1; a22 += b2 * k2; a23 += b2 * k3;
+                a30 += b3 * k0; a31 += b3 * k1; a32 += b3 * k2; a33 += b3 * k3;
+            }
+            float* sr = s + i0 * 64;
+            st(sr, a00); st(sr + 16, a01); st(sr + 32, a02); st(sr + 48, a03);
+            st(sr + 64, a10); st(sr + 80, a11); st(sr + 96, a12); st(sr + 112, a13);
+            st(sr + 128, a20); st(sr + 144, a21); st(sr + 160, a22); st(sr + 176, a23);
+            st(sr + 192, a30); st(sr + 208, a31); st(sr + 224, a32); st(sr + 240, a33);
+        }
+        // causal mask (the diagonal chunks only), then the online softmax update per row
+        for (size_t i = 0; i < Mp; ++i) {
+            float* si = s + i * 64;
+            const size_t valid = qp[i] < c0 ? 0 : std::min(kc, qp[i] - c0 + 1);
+            if (!valid) {
+                for (size_t j = 0; j < 64; ++j) si[j] = 0.f;
+                cr[i] = 1.f;
+                continue;
+            }
+            for (size_t j = valid; j < 64; ++j) si[j] = -1e30f;
+            const v16f x0 = ld(si), x1 = ld(si + 16), x2 = ld(si + 32), x3 = ld(si + 48);
+            v16f vm = x0 > x1 ? x0 : x1;
+            const v16f vm2 = x2 > x3 ? x2 : x3;
+            vm = vm > vm2 ? vm : vm2;
+            float mx = m[i];
+            for (int e = 0; e < 16; ++e) mx = std::max(mx, vm[e]);
+            const v16f bm = bc(mx);
+            const v16f p0 = vexp(x0 - bm), p1 = vexp(x1 - bm), p2 = vexp(x2 - bm), p3 = vexp(x3 - bm);
+            st(si, p0); st(si + 16, p1); st(si + 32, p2); st(si + 48, p3);
+            for (size_t j = valid; j < 64; ++j) si[j] = 0.f;
+            const v16f ps = (ld(si) + ld(si + 16)) + (ld(si + 32) + ld(si + 48));
+            float sum = 0.f;
+            for (int e = 0; e < 16; ++e) sum += ps[e];
+            const float corr = vexp(bc(m[i] - mx))[0];
+            l[i] = l[i] * corr + sum;
+            m[i] = mx;
+            cr[i] = corr;
+        }
+        // acc = acc * corr + P V
+        for (size_t dg = 0; dg < hd; dg += 64)
+            for (size_t i0 = 0; i0 < Mp; i0 += kRB) {
+                float *c0r = acc + i0 * hd + dg, *c1r = c0r + hd, *c2r = c1r + hd, *c3r = c2r + hd;
+                const v16f r0 = bc(cr[i0]), r1 = bc(cr[i0 + 1]), r2 = bc(cr[i0 + 2]), r3 = bc(cr[i0 + 3]);
+                v16f a00 = ld(c0r) * r0, a01 = ld(c0r + 16) * r0, a02 = ld(c0r + 32) * r0, a03 = ld(c0r + 48) * r0;
+                v16f a10 = ld(c1r) * r1, a11 = ld(c1r + 16) * r1, a12 = ld(c1r + 32) * r1, a13 = ld(c1r + 48) * r1;
+                v16f a20 = ld(c2r) * r2, a21 = ld(c2r + 16) * r2, a22 = ld(c2r + 32) * r2, a23 = ld(c2r + 48) * r2;
+                v16f a30 = ld(c3r) * r3, a31 = ld(c3r + 16) * r3, a32 = ld(c3r + 32) * r3, a33 = ld(c3r + 48) * r3;
+                const float *p0 = s + i0 * 64, *p1 = p0 + 64, *p2 = p1 + 64, *p3 = p2 + 64;
+                for (size_t j = 0; j < kc; ++j) {
+                    const float* vj = vf + (c0 + j) * hd + dg;
+                    const v16f v0 = ld(vj), v1 = ld(vj + 16), v2 = ld(vj + 32), v3 = ld(vj + 48);
+                    const v16f b0 = bc(p0[j]), b1 = bc(p1[j]), b2 = bc(p2[j]), b3 = bc(p3[j]);
+                    a00 += b0 * v0; a01 += b0 * v1; a02 += b0 * v2; a03 += b0 * v3;
+                    a10 += b1 * v0; a11 += b1 * v1; a12 += b1 * v2; a13 += b1 * v3;
+                    a20 += b2 * v0; a21 += b2 * v1; a22 += b2 * v2; a23 += b2 * v3;
+                    a30 += b3 * v0; a31 += b3 * v1; a32 += b3 * v2; a33 += b3 * v3;
+                }
+                st(c0r, a00); st(c0r + 16, a01); st(c0r + 32, a02); st(c0r + 48, a03);
+                st(c1r, a10); st(c1r + 16, a11); st(c1r + 32, a12); st(c1r + 48, a13);
+                st(c2r, a20); st(c2r + 16, a21); st(c2r + 32, a22); st(c2r + 48, a23);
+                st(c3r, a30); st(c3r + 16, a31); st(c3r + 32, a32); st(c3r + 48, a33);
+            }
+    }
+    for (size_t i = 0; i < M; ++i) {
+        const size_t gi = i / nt, ti = i % nt;
+        float* out = og + (t0 + ti) * qw + (g * grp + gi) * hd;
+        const float inv = 1.f / l[i];
+        for (size_t d = 0; d < hd; ++d) out[d] = acc[i * hd + d] * inv;
+    }
+}
+// (no pop: GCC reports -Wpsabi at the end of the file, for the clones)
+
+void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
+                     const uint16_t* kv, size_t kv_row_elems, float* og, size_t kend = 0) {
+    if (hd % 64 == 0) {
+        const size_t rows = kend ? kend : pos0 + R, P = (rows + 63) / 64 * 64, kvw = kvh * hd, grp = nh / kvh;
+        static thread_local std::vector<float> KT, VF;
+        KT.resize(kvh * hd * P);
+        VF.resize(kvh * P * hd);
+        float *const kt = KT.data(), *const vf = VF.data();   // thread_local: the workers need the caller's
+        // the window once, in 64-row blocks per thread; the pad rows zero
+#pragma omp parallel for
+        for (long long pb = 0; pb < static_cast<long long>(P / 64); ++pb)
+            for (size_t p = static_cast<size_t>(pb) * 64; p < static_cast<size_t>(pb) * 64 + 64; ++p) {
+                const uint16_t* row = kv + p * kv_row_elems;
+                for (size_t gh = 0; gh < kvh; ++gh) {
+                    float* kd = kt + gh * hd * P + (p / 64 * hd) * 64 + p % 64;
+                    float* vd = vf + (gh * P + p) * hd;
+                    for (size_t d = 0; d < hd; ++d) {
+                        kd[d * 64] = p < rows ? bf16_to_f32(row[gh * hd + d]) : 0.f;
+                        vd[d] = p < rows ? bf16_to_f32(row[kvw + gh * hd + d]) : 0.f;
+                    }
+                }
+            }
+        const size_t qt = std::max<size_t>(8, 128 / grp);   // ~128 query rows per work item
+        const size_t chunks = (R + qt - 1) / qt;
+        const long long items = static_cast<long long>(kvh * chunks);
+#pragma omp parallel for schedule(dynamic, 1)
+        for (long long it = items - 1; it >= 0; --it)
+            attention_tile64(hd, nh, kvh, R, pos0, qt, scale, Q, kt, vf, P, og,
+                             static_cast<size_t>(it) % kvh, (static_cast<size_t>(it) / kvh) * qt, kend);
+        return;
+    }
+    const size_t chunks = (R + kQT - 1) / kQT;
+    const long long items = static_cast<long long>(kvh * chunks);
+    // the later chunks see longer windows: hand them out first
+#pragma omp parallel for schedule(dynamic, 1)
+    for (long long it = items - 1; it >= 0; --it)
+        attention_tile(hd, nh, kvh, R, pos0, scale, Q, kv, kv_row_elems, og,
+                       static_cast<size_t>(it) % kvh, (static_cast<size_t>(it) / kvh) * kQT, kend);
+}
+}  // namespace
+
 void attention_block(const AttnGeom& g, const float* q, const float* k, const float* v, const float* gate,
                      const float* qn, const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
                      float* og) {
@@ -680,6 +936,13 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
         const float* gt = gate + t * qw + h * g.hd;
         for (size_t j = 0; j < g.hd; ++j) out[j] = o[j] * sigmoid(gt[j]);
     }
+}
+
+void attention_full(const AttnGeom& g, const float* Q, const uint16_t* kv, size_t kv_row_elems, size_t keys, float* og) {
+    if (g.nh % g.kvh || g.t_real > g.T || keys == 0)
+        throw std::runtime_error("open_qwen36: attention_full: inconsistent geometry");
+    std::fill(og, og + g.T * g.nh * g.hd, 0.f);
+    attention_tiles(g.hd, g.nh, g.kvh, g.t_real, g.pos0, 1.0f, Q, kv, kv_row_elems, og, keys);
 }
 
 void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
