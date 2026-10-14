@@ -152,7 +152,14 @@ extern "C" {
 extern int oflm_dit_quarter;
 
 #ifdef MATMUL_ONLY
-#ifdef DIT_HS
+#if defined(DIT_B4)
+// int4-mantissa weights (pack.py pack_b4): the hand-scheduled call (hsgen HSGEN_B4 ->
+// hs_b4_call.inc); B is one tile of 4096 bytes of nibbles then 128 exponent bytes.
+}
+#include "hs_b4_call.inc"
+extern "C" {
+void hs_b4_call(const bfp16ebs8 *pA, const uint8_t *pBn, bfloat16 *pC, const int8_t *pE);
+#elif defined(DIT_HS)
 // The hand-scheduled 2x2 call (designs/peak/hsgen.py -> hs_call.inc): bit-exact with
 // matmul_vectorized_2x2_bfp16_bf16 on the 2x2 orders (pack_a.py order2, pack.py layout2).
 }
@@ -162,6 +169,16 @@ void hs_call(const bfp16ebs8 *pA, const bfp16ebs8 *pB, bfloat16 *pC);
 #endif
 __attribute__((section(".data"))) int oflm_dit_quarter = 0;
 
+#ifdef DIT_B4
+void dit_matmul_quarter(bfp16ebs8 *__restrict pA, uint8_t *__restrict pB, bfloat16 *__restrict pC) {
+  constexpr int m = DIM_M / 4, n = DIM_N;
+  bfloat16 *pCq = pC + oflm_dit_quarter * m * n;
+  oflm_dit_quarter = (oflm_dit_quarter + 1) & 3;
+  aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
+  hs_b4_call(pA, pB, pCq, reinterpret_cast<const int8_t *>(pB + 4096));
+  aie::set_rounding(saved);
+}
+#else
 void dit_matmul_quarter(bfp16ebs8 *__restrict pA, bfp16ebs8 *__restrict pB,
                       bfloat16 *__restrict pC) {
   constexpr int r = 8, s = 8, t = 8;
@@ -182,6 +199,7 @@ void dit_matmul_quarter(bfp16ebs8 *__restrict pA, bfp16ebs8 *__restrict pB,
 #endif
   aie::set_rounding(saved);
 }
+#endif
 #endif
 
 #ifdef EPI_ONLY

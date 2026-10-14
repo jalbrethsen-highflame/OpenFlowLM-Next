@@ -80,6 +80,42 @@ def unpack_b2(packed: np.ndarray, K: int, N: int) -> np.ndarray:
     return unlayout2(bfp16ebs8_decode(packed), K, N)
 
 
+B4_TILE = 4096 + 128   # bytes per [128 columns x 64 k] tile: nibbles, then exponents
+
+
+def pack_b4(b: np.ndarray) -> np.ndarray:
+    """B [K, N] -> dit2's int4-mantissa weights (DIT_B4, hsgen HSGEN_B4): per [N tile][K tile]
+    4096 bytes of nibbles, blocks [column pair 8][k-block 8][2] of 8 columns x 8 k (column-major
+    inside: value i = column * 8 + k, low nibble first), then 128 exponent bytes, one per column for
+    the tile's 64 of K. A weight is mantissa (-8..7) x 2^(exponent - 133), bfp16ebs8's scale, the
+    exponent the smallest that keeps the column's 64 values within +-7 before rounding."""
+    b = np.asarray(b, dtype=np.float64)
+    K, N = b.shape
+    assert K % K_T == 0 and N % N_T == 0, (K, N)
+    t = b.reshape(K // K_T, K_T, N // N_T, N_T).transpose(2, 0, 3, 1)       # [nt, kt, col 128, k 64]
+    amax = np.abs(t).max(-1)                                                  # [nt, kt, 128]
+    e2 = np.where(amax > 0, np.ceil(np.log2(np.maximum(amax, 1e-300) / 7.0)), -133).astype(np.int64)
+    e2 = np.clip(e2, -133, 122)
+    m = np.clip(np.rint(t / np.ldexp(1.0, e2)[..., None]), -8, 7).astype(np.int64)
+    # blocks [pair 8][kb 8][n2 2][col-in-block 8][k-in-block 8]
+    m = m.reshape(N // N_T, K // K_T, 8, 2, 8, 8, 8).transpose(0, 1, 2, 5, 3, 4, 6)
+    nib = (m & 15).reshape(N // N_T, K // K_T, -1)
+    packed = (nib[..., 0::2] | (nib[..., 1::2] << 4)).astype(np.uint8)       # [nt, kt, 4096]
+    ex = (e2 + 133).astype(np.uint8)                                          # [nt, kt, 128]
+    return np.concatenate([packed, ex], axis=-1).reshape(-1)
+
+
+def unpack_b4(packed: np.ndarray, K: int, N: int) -> np.ndarray:
+    """The B dit2 multiplies by under DIT_B4, as float64 [K, N]."""
+    t = np.asarray(packed, dtype=np.uint8).reshape(N // N_T, K // K_T, B4_TILE)
+    nb, ex = t[..., :4096], t[..., 4096:].astype(np.int64)
+    v = np.stack([nb & 15, nb >> 4], -1).reshape(N // N_T, K // K_T, 8192).astype(np.int64)
+    v = np.where(v >= 8, v - 16, v)
+    m = v.reshape(N // N_T, K // K_T, 8, 8, 2, 8, 8).transpose(0, 1, 2, 4, 5, 3, 6).reshape(N // N_T, K // K_T, 128, 64)
+    w = m * np.ldexp(1.0, ex - 133)[..., None]                                # [nt, kt, col, k]
+    return w.transpose(1, 3, 0, 2).reshape(K, N)
+
+
 def pack_b(b: np.ndarray) -> np.ndarray:
     """B [K, N] (any float dtype) -> the uint8 buffer dit_gemm reads, K*N*9/8 bytes."""
     return bfp16ebs8_encode(layout(np.asarray(b, dtype=np.float32)))

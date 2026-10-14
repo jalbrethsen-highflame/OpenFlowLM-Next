@@ -5,11 +5,12 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent / "dit_gemm"))
 from pack_a import pack_a, unpack_a, pack_a2, unpack_a2
-from pack import pack_b, unpack_b, pack_b2, unpack_b2
+from pack import pack_b, unpack_b, pack_b2, unpack_b2, pack_b4, unpack_b4
 ap = argparse.ArgumentParser(); ap.add_argument("--build"); ap.add_argument("--M", type=int); ap.add_argument("--K", type=int)
 ap.add_argument("--N", type=int); ap.add_argument("--out"); ap.add_argument("--epi", action="store_true")
 ap.add_argument("--hs", action="store_true", help="the 2x2 orders of the hand-scheduled kernel (DIT_HS)")
 ap.add_argument("--pack-h", action="store_true", help="C is h packed as the down GEMM's A unit slots (needs --epi)")
+ap.add_argument("--b4", action="store_true", help="int4-mantissa weights (pack_b4); A in the 2x2 order")
 ap.add_argument("--a-units", action="store_true", help="A in pack_h's unit slots (36864 B apart, 9216 used)")
 a = ap.parse_args(); M, K, N = a.M, a.K, a.N; out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
 rng = np.random.default_rng(0)
@@ -18,7 +19,10 @@ B = (rng.standard_normal((K, N)) * 0.02).astype(np.float32)
 if a.epi:
     from pack import interleave_swiglu
     B = interleave_swiglu(B)
-if a.hs:
+if a.b4:
+    pa, pb = pack_a2(A), pack_b4(B)
+    ref = unpack_a2(pa, M, K) @ unpack_b4(pb, K, N)
+elif a.hs:
     pa, pb = pack_a2(A), pack_b2(B)
     ref = unpack_a2(pa, M, K) @ unpack_b2(pb, K, N)
 else:
