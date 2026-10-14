@@ -14,8 +14,20 @@ A MAC may write a different accumulator than it reads, so each value between MAC
 gets its own register.
 
     python3 hsgen.py [GAP [LAG]] > hs_call.inc     (GAP: idle cycles between units, debug)
+
+HSGEN_B4=1: hs_b4_call(pA, pBn, pC, pE) with int4-mantissa weights instead of bfp16 B:
+each 8 x 8 weight block is 32 bytes of nibbles ([column pair][k][2]), unpacked into the
+mantissa (x) part of an EX register by vldb.unpack, and every column block has one exponent
+byte per column for the call's 64 of K (pE: [column pair][2][8 B]), moved into the E part
+of the block registers once per unit. Block registers come in two pools per column block,
+alternating by unit, so a pool's exponents change while the other pool is in use.
+A vldb.unpack must not follow a vldb.pop in the next cycle: it corrupts that pop's exponents
+(measured, peak.cc PEAK_B4PROBE2, unless the pop directly follows a fill); A pops on the ldb
+slot keep clear of the cycle before every unpack.
 """
 from __future__ import annotations
+
+import os
 
 import collections
 import re
@@ -30,6 +42,20 @@ NDM, NEX = 5, 12
 GAP = 0                          # idle cycles between units (debug)
 LAG = (0, 0, 1, 1)               # k-steps chain i trails chain 0: spreads the unit switches
                                  # so 5 accumulators suffice ((0,1,2,3) runs out of ex registers)
+B4 = os.environ.get("HSGEN_B4", "0") == "1"
+NAME = "hs_b4_call" if B4 else "hs_call"
+UNP_W, LDS_W, MOVE_W = 8, 7, 3   # results readable from issue (def + 1): vldb.unpack, scalar lda (as latency), mov el/eh
+EPERBLK = os.environ.get("HSGEN_B4_EPERBLK", "0") == "1"   # debug: exponents after every unpack
+POP_EARLY = int(os.environ.get("HSGEN_POP_EARLY", POP_W))
+ONCE = os.environ.get("HSGEN_B4_ONCE", "0") == "1"   # debug: pool exponents set for units 0 / 1 only   # debug: a pop's register busy from this cycle
+# EX registers per class: the A pops; under B4 the block pools [unit parity][column block]
+POOLS = {"b00": [6, 7], "b01": [8, 9], "b10": [10, 11], "b11": [4, 5]}
+if os.environ.get("HSGEN_B4_EPERBLK", "0") == "1":   # exponents travel with each block: pools by column block
+    POOLS = {"b0": [4, 5, 6, 7], "b1": [8, 9, 10, 11]}
+if os.environ.get("HSGEN_B4_POOLS2", "0") == "1":    # debug (with HSGEN_B4_ONCE): pools by column block, A gets 8
+    POOLS = {"b0": [6, 7], "b1": [8, 9]}
+bcls = lambda u, n2: f"b{n2}" if len(POOLS) == 2 else f"b{u % 2}{n2}"
+EXA = [r for r in range(NEX) if not B4 or all(r not in v for v in POOLS.values())]
 
 
 class Sched:
@@ -51,6 +77,16 @@ class Sched:
             for s in slots:
                 if self.free(t, s) and all(self.free(t, a) for a in also):
                     return t, s
+            t -= 1
+            assert t >= 0, "no free slot"
+
+    def latest_pop(self, t):
+        """A FIFO pop: ldb unless that cycle precedes an unpack (B4 rule), else lda."""
+        while True:
+            if self.free(t, "ldb") and self.free(t, "no_ldb_pop"):
+                return t, "ldb"
+            if self.free(t, "lda"):
+                return t, "lda"
             t -= 1
             assert t >= 0, "no free slot"
 
@@ -77,11 +113,14 @@ def build(T0: int) -> Sched:
     # setup, one op per cycle (r3: vmac config; r4/r5 A bases per row pair, r6 B base;
     # r18/r19 C rows 2/3 for the second row pair; p3/p5 C row 1 for loads/stores). Only
     # caller-saved registers: r8-r15, p6, p7 and lr are callee-saved (AIE2PCallingConv.td).
-    setup = [("alu", "movx r24, #0"), ("alu", "movx r25, #0"), ("lda", "mova r3, #780"),
+    pre = [("lng", "paddxm [sp], #64"), ("st", "st p6, [sp, #-64]"),
+           ("mv", "mov p6, p3"), ("mv", "mov r31, p3"), ("mv", "mov crunpacksize, #0")] if B4 else []
+    setup = pre + [("alu", "movx r24, #0"), ("alu", "movx r25, #0"), ("lda", "mova r3, #780"),
              ("lng", "movxm r17, #2048"), ("lng", "movxm r7, #1152"), ("mv", "mov r4, p0"),
              ("mv", "mov r6, p1"), ("mv", "mov r16, p2"), ("alu", "add r5, r4, r7"),
              ("alu", "add r20, r16, r17"), ("alu", "add r18, r20, r17"), ("alu", "add r19, r18, r17"),
              ("mv", "mov p3, r20"), ("mv", "mov p4, r16"), ("mv", "mov p5, r20")]
+
     t = 0
     for slot, text in setup:
         s.put(t, slot, text)
@@ -140,6 +179,57 @@ def build(T0: int) -> Sched:
             bound = t1 - 1
     assert min(first_conv.values()) >= setup_end, "conv before setup"
 
+    if B4:
+        # the weight blocks: vldb.unpack (ldb only) from p1, [column pair][k][2] in order, ALAP;
+        # the second row pair re-reads them from the start (mov p1, r6)
+        bound = 10 ** 9
+        for u in reversed(range(NU)):
+            for k in reversed(range(8)):
+                for n2 in reversed(range(2)):
+                    key = ("B", u, k, n2)
+                    t, _ = s.latest(min(bound, min(mac(u, k, n2), mac(u, k, n2 + 2)) + MAC_RS - UNP_W
+                                        - (6 if EPERBLK else 0)), ["ldb"])
+                    s.put(t, "ldb", f"vldb.unpack {{X:{key}}}, unpacksign1, [p1], #32")
+                    s.slots[t - 1].add("no_ldb_pop")   # a vldb.pop here would lose its exponents
+                    s.write(key, bcls(u, n2), t + UNP_W)
+                    if EPERBLK:   # this block's exponents, after the unpack has written the register
+                        sl, sh = f"r{(21, 23, 27, 29)[(u % 2) * 2 + n2]}", f"r{(22, 26, 28, 30)[(u % 2) * 2 + n2]}"
+                        m0, _ = s.earliest(t + UNP_W - 1, ["mv"]); s.put(m0, "mv", f"mov el{{X:{key}}}, {sl}".replace("el{X", "{EL"))
+                        m1, _ = s.earliest(m0 + 1, ["mv"]); s.put(m1, "mv", f"mov eh{{X:{key}}}, {sh}".replace("eh{X", "{EH"))
+                        assert m1 + MOVE_W <= min(mac(u, k, n2), mac(u, k, n2 + 2)) + MAC_RS, "late exponents"
+                    bound = t - 1
+            if u == 8:
+                t0, _ = s.latest(bound, ["mv"]); s.put(t0, "mv", "mov p1, r6")
+                bound = t0 - 1
+        assert bound + 1 >= setup_end, "B before setup"
+        # exponents: unit u's pool [u % 2][n2] gets them after unit u - 2 is done with it and
+        # before its first MAC; one scalar word per half (el / eh) from p6, [pair][2][8 B]
+        last_read = {}
+        for (cls, a, b), v in [((x[0], x[1], x[3]), y) for x, y in s.iv.items() if x[0] == "B"]:
+            last_read[(a, b)] = max(last_read.get((a, b), -1), v[2])
+        lbound = 10 ** 9
+        for u in reversed(range(NU)):
+            for n2 in reversed(range(2)):
+                pool = POOLS[bcls(u, n2)]
+                lo = last_read.get((u - 2, n2), -1) + 1 if u >= 2 else setup_end
+                hi = mac(u, 0, n2) + MAC_RS - MOVE_W - (20 if EPERBLK else 0)   # EPERBLK: the words before any block move
+                for half in ("h", "l"):
+                    sreg = f"r{(21, 22, 23, 26, 27, 28, 29, 30)[(u % 2) * 4 + n2 * 2 + (half == 'h')]}"
+                    tm = hi
+                    for r in ([] if EPERBLK or (ONCE and u >= 2) else reversed(pool)):
+                        tm, _ = s.latest(tm, ["mv"])
+                        assert tm >= lo, f"no room for unit {u}'s exponents"
+                        s.put(tm, "mv", f"mov e{half}{r}, {sreg}")
+                        hi = tm - 1
+                        tm -= 1
+                    tl, _ = s.latest(min(tm + 1 - LDS_W, lbound), ["lda"])
+                    s.put(tl, "lda", f"lda {sreg}, [p6], #4")
+                    lbound = tl - 1
+            if u == 8:
+                t0, _ = s.latest(lbound, ["mv"]); s.put(t0, "mv", "mov p6, r31")
+                lbound = t0 - 1
+        assert lbound + 1 >= setup_end, "exponents before setup"
+
     # FIFO streams, ALAP: A on p0/lf0/r24 (restart every unit), B on p1/lf1/r25 (restart at
     # the second row pair). Pattern per 16-block stream: fill, 8 pops, fill, 8 pops.
     def stream(name, ptr, lf, pos, deadline, restart):
@@ -153,13 +243,13 @@ def build(T0: int) -> Sched:
                         seq.append(("pop", (name, u, k, r)))
             for kind, key in reversed(seq):
                 lim = bound if kind == "fill" else min(bound, deadline(u, key))
-                t, sl = s.latest(lim, ["ldb", "lda"])
+                t, sl = s.latest_pop(lim)
                 ins = "vlda" if sl == "lda" else "vldb"
                 if kind == "fill":
                     s.put(t, sl, f"{ins}.fill.512 [{ptr}, {lf}, {pos}]")
                 else:
                     s.put(t, sl, f"{ins}.pop.576 {{E:{key}}}, [{ptr}, {lf}, {pos}]")
-                    s.write(key, "ex", t + POP_W)
+                    s.write(key, "ex", t + (POP_EARLY if B4 else POP_W))
                 bound = t - 1
             src = restart(u)
             if src:
@@ -171,19 +261,21 @@ def build(T0: int) -> Sched:
 
     stream("A", "p0", "lf0", "r24", lambda u, key: min(mac(u, key[2], 2 * key[3]), mac(u, key[2], 2 * key[3] + 1)) + MAC_RS - POP_W,
            lambda u: (None if u == 0 else ("r4" if u < 8 else "r5")))
-    stream("B", "p1", "lf1", "r25", lambda u, key: min(mac(u, key[2], key[3]), mac(u, key[2], key[3] + 2)) + MAC_RS - POP_W,
-           lambda u: ("r6" if u == 8 else None))
+    if not B4:
+        stream("B", "p1", "lf1", "r25", lambda u, key: min(mac(u, key[2], key[3]), mac(u, key[2], key[3] + 2)) + MAC_RS - POP_W,
+               lambda u: ("r6" if u == 8 else None))
     return s
 
 
 def color(s: Sched) -> dict:
     regs = {}
-    for cls, n, name in (("dm", NDM, "dm"), ("ex", NEX, "ex")):
+    classes = {"dm": list(range(NDM)), "ex": EXA, **(POOLS if B4 else {})}
+    for cls, phys in classes.items():
         ivs = sorted((v[1], v[2], k) for k, v in s.iv.items() if v[0] == cls)
-        busy = [-1] * n
+        busy = {r: -1 for r in phys}
         for st, en, k in ivs:
             assert en >= st, (k, st, en)
-            cands = [r for r in range(n) if busy[r] < st]
+            cands = [r for r in phys if busy[r] < st]
             if not cands:
                 live = [(kk, v[1], v[2]) for kk, v in s.iv.items() if v[0] == cls and v[1] <= st <= v[2]]
                 raise SystemExit(f"{cls}: no register at cycle {st} for {k}; live: {live}")
@@ -197,16 +289,20 @@ def emit(s: Sched, regs: dict) -> str:
     def sub(m):
         kind, key = m.group(1), eval(m.group(2))
         r = regs[key]
-        return {"D": f"dm{r}", "L": f"cml{r}", "H": f"cmh{r}", "E": f"ex{r}"}[kind]
+        return {"D": f"dm{r}", "L": f"cml{r}", "H": f"cmh{r}", "E": f"ex{r}", "X": f"x{r}", "EL": f"el{r}", "EH": f"eh{r}"}[kind]
     by_t = collections.defaultdict(list)
     for t, slot, text in s.ops:
-        by_t[t].append(re.sub(r"\{([DLHE]):(\([^)]*\))\}", sub, text))
+        by_t[t].append(re.sub(r"\{(EL|EH|[DLHEX]):(\([^)]*\))\}", sub, text))
     tmax = max(by_t)
-    lines = ["\t.text", "\t.globl\ths_call", "\t.p2align\t4", "\t.type\ths_call,@function", "hs_call:"]
+    lines = ["\t.text", f"\t.globl\t{NAME}", "\t.p2align\t4", f"\t.type\t{NAME},@function", f"{NAME}:"]
     for t in range(tmax + 1):
         lines.append("\t" + (";\t\t".join(by_t[t]) if by_t[t] else "nop"))
-    lines += ["\tret lr"] + ["\tnop"] * 5
-    lines += [".Lhs_end:", "\t.size\ths_call, .Lhs_end-hs_call"]
+    if B4:   # p6 back (callee-saved), the load's latency inside the return's delay slots
+        lines += ["\tlda p6, [sp, #-64]", "\tnop", "\tnop"]
+        lines += ["\tret lr", "\tnop", "\tnop", "\tnop", "\tpaddxm [sp], #-64", "\tnop"]
+    else:
+        lines += ["\tret lr"] + ["\tnop"] * 5
+    lines += [f".L{NAME}_end:", f"\t.size\t{NAME}, .L{NAME}_end-{NAME}"]
     return "\n".join(lines) + "\n", tmax + 1
 
 
@@ -221,7 +317,7 @@ def main():
             s = build(T0)
             break
         except AssertionError as e:
-            if "before setup" not in str(e) and "no free slot" not in str(e):
+            if not any(m in str(e) for m in ("before setup", "no free slot", "no room for unit 0", "no room for unit 1")):
                 raise
             T0 += 1
     regs = color(s)
