@@ -324,7 +324,7 @@ DECODE_NPU_FRAC = float(_os.environ.get("OPEN_QWEN35_DECODE_NPU_FRAC", "0.2"))
 # kt K steps (the CPU completes the rest of K for those columns). Up to 32 rows a pass: decode
 # fills row 0, an MTP verify pass rows 0..k. OPEN_QWEN35_DECODE2=0 off.
 DECODE2 = _os.environ.get("OPEN_QWEN35_DECODE2", "1") != "0"
-DECODE2_FRAC = float(_os.environ.get("OPEN_QWEN35_DECODE2_FRAC", "0.26"))
+DECODE2_FRAC = float(_os.environ.get("OPEN_QWEN35_DECODE2_FRAC", "0.28"))
 DECODE2_MIN_KT = int(_os.environ.get("OPEN_QWEN35_DECODE2_MIN_KT", 16))
 
 

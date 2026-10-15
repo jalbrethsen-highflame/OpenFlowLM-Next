@@ -57,12 +57,31 @@ Tried and left off (switches kept):
       `~/models/hf-qwen38-27b-shard1`).
 
 ### Prompt speed
-- [ ] Causal dit_fa256b: the fast attention kernel (31 TFLOPS) is noncausal only; the causal
-      prompt still uses dit_fa256 (~3.4x slower). Add the diagonal-chunk mask and skip the
-      key chunks past it (also halves the work).
-- [ ] Re-tune OFLM_OPEN_SMALL_MAX (2048 for d3): causal host attention does about half of
-      d3's work, so the crossover to 1024-row chunks is probably higher.
-- [ ] OMP_WAIT_POLICY=ACTIVE in the causal runner (d3: -7 % on a short prompt, -9 % at 1K).
+
+Causal prefill, warm, int4, quiet CPU (2026-10-15):
+
+| Prompt | Before | Now |
+|---|---|---|
+| 256 | 359 tok/s | 365 tok/s |
+| 512 | 404 | 427 |
+| 1024 | 473 | 547 |
+| 2048 | 587 | 627 |
+| 4096 | 602 | 719 |
+| 8192 | 631 | 737 |
+
+- [x] Causal dit_fa256b (fa.cb, 1024 query rows; fa.cbs, 512 rows for the small tier): diagonal
+      chunk masked, chunks past a core's rows skipped, K / V as [chunk][kv head] (DF_KV_INTER)
+      so one buffer per full layer serves every chunk. From 1024 keys (OFLM_OPEN_FA_CB_MIN) and
+      512 (OFLM_OPEN_FA_CBS_MIN). NLL against host attention: 4K +0.0011 +- 0.0011 (the old
+      dit_fa256 path +0.0010), 2K +0.0046 +- 0.0019. OFLM_OPEN_FA_CB=0 off.
+- [ ] Image switches: each switch between the attention image (fab) and the GEMM image (dit2)
+      costs ~2.5 ms (512 tokens: 32 switches, ~80 ms of 1.2 s). One combined image would remove
+      them.
+- [ ] Host / NPU overlap in a one-chunk prompt (<= 512 tokens): the chunk's GEMMs and host
+      stages run in turn. Two 256-row chunks gain nothing on a quiet CPU (1196 vs 1199 ms at
+      512: the second pass reads the weights again). A head-group split inside each layer
+      (qkv by column groups, out by K halves) would overlap without reading the weights twice.
+- [ ] Re-tune OFLM_OPEN_SMALL_MAX (2048) now that the small tier has NPU attention.
 
 ### Decode (target 10 tok/s) -- met with MTP
 
@@ -94,8 +113,11 @@ near-ties over 64 layers.
       ~80 us per dispatch and the sync after every product keep the NPU near 20 % of the bytes
       (it finishes before the CPU: wait 0.1 ms). Rows 1..31 are free on the NPU -- MTP's verify
       pass is where it pays.
-- [ ] dit2_dec with the K steps as a runtime parameter (RTP), so one image can take any K range:
-      finer NPU shares per product and the out projection (K = 6144) too. ~4 % more.
+- [x] dit2_dec with the K steps as a run-time parameter: one image takes every product and K
+      range, the out projection included; OPEN_QWEN35_DECODE2_FRAC (default 0.28) sets the share
+      (full-K chunks plus one partial-K chunk). No measurable gain: at 0.28 the NPU's time a token
+      (~118 ms with its ~80 us a dispatch) equals the CPU's, and verify passes at 0.26 / 0.28 /
+      0.30 are 183 / 180 / 178 ms against 178 before. MTP stays exact.
 - [ ] Per-dispatch cost: A flush 184 KB and C read-back 256 KB per dispatch (pre 3.2 ms + post
       1.4 ms a token); read back only the rows used.
 - [ ] The load peak (17.7 GB): the q8 head pool and its CPU repack are both alive for a moment.
