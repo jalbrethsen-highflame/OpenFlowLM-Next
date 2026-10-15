@@ -230,7 +230,10 @@ static __attribute__((noinline)) void scale_o(bfloat16 *__restrict o, const bflo
 // banks (376 -> ~301 cycles a call), but in the kernel the K / V fifos' DMA writes share those
 // banks; the allocator's bank-aware scheme measured best (dit_fa256b.py DF_ALLOC).
 alignas(64) static bfloat16 s_rep[TQ * 8];   // a per-row bf16 value, replicated
-alignas(64) static float s_nuc[TQ * 8];      // -m, replicated
+extern "C" {
+alignas(64) float fa_nuc[TQ * 8];             // -m, replicated (a global: fa_qkpv addresses it)
+}
+#define s_nuc fa_nuc
 alignas(64) static bfloat16 s_newmax[TQ];
 alignas(64) static bfloat16 s_resc[TQ];
 
@@ -343,6 +346,64 @@ static inline uint32_t prof_now() { return 0; }   // (no readable cycle counter 
 #endif
 #if FA_HS
 #include "fa_hs.inc"
+// fa_qkpv(q, kp, g, p, ve, o, j): the pipelined loop's step without a C wrapper (one cost ~70
+// cycles: register saves, rtp checks, two calls): fa_qk_call on K piece j into G's columns
+// 16j.., then a tail call of fa_pv_call on V element j into O's columns 64j.. (pv returns to
+// our caller). No dead-chunk checks: sm_all zeroes P on a chunk past valid_len, so the pv of
+// that chunk adds nothing whatever V holds. r27-r31 hold what fa_qk_call must not clobber (it
+// uses r3-r7, r16-r20, r24, r25, p0-p5, m0 is reloaded).
+asm(R"fq(
+	.text
+	.globl	fa_qkpv
+	.p2align	4
+	.type	fa_qkpv,@function
+fa_qkpv:
+	mov r27, lr
+	mova r1, #10
+	nop
+	nop
+	nop
+	nop
+	lshl r31, r0, r1
+	nop
+	nop
+	mov r28, p3
+	mov r29, p4
+	mov r30, p5
+	mov m0, r31
+	nop
+	nop
+	padda [p2], m0
+	movxm p3, #fa_nuc
+	nop
+	nop
+	jl #fa_qk_call
+	nop
+	nop
+	nop
+	nop
+	nop
+	mov p0, r28
+	mov p1, r29
+	mov p2, r30
+	mov m0, r31
+	nop
+	nop
+	padda [p2], m0
+	mov lr, r27
+	nop
+	nop
+	nop
+	j #fa_pv_call
+	nop
+	nop
+	nop
+	nop
+	nop
+.Lfa_qkpv_end:
+	.size	fa_qkpv, .Lfa_qkpv_end-fa_qkpv
+)fq");
+extern "C" void fa_qkpv(const uint8_t *q, const uint8_t *kp, bfloat16 *g, const uint8_t *p, const uint8_t *ve, bfloat16 *o, int32_t j);
 #endif
 
 extern "C" {
@@ -428,10 +489,18 @@ void qkpv(uint8_t *__restrict q, uint8_t *__restrict kp, bfloat16 *__restrict g,
 #if FA_HS
   // noncausal only (no fa_skip); the rounding mode is sm_exp's (set every chunk)
   const int32_t valid = rtp[3];
-  if (chunk * LKP < valid)
+  if (chunk * LKP < valid) {
     fa_qk_call(q, kp, g + j * 2 * (TQ / 8) * 64, s_nuc);
-  if ((chunk - 1) * LKP < valid)
+#ifdef FA_X_X2QK   // debug: the call twice (its in-kernel cost = the time added)
+    fa_qk_call(q, kp, g + j * 2 * (TQ / 8) * 64, s_nuc);
+#endif
+  }
+  if ((chunk - 1) * LKP < valid) {
+#ifdef FA_X_X2PV   // debug: twice on a copy of O's tiles would change O; run it on the same O and
+    fa_pv_call(p, ve, o + j * 2 * VPAIRS_PER_ELEM * 64);   // accept the wrong result (timing only)
+#endif
     fa_pv_call(p, ve, o + j * 2 * VPAIRS_PER_ELEM * 64);
+  }
 #else
   qk(q, kp, g, j, rtp, pass, chunk);
   pv(p, ve, o, j, rtp, pass, chunk - 1);
@@ -541,6 +610,10 @@ void sm_exp(bfloat16 *__restrict g, uint8_t *__restrict p, int32_t *__restrict r
   PROF_BEGIN
   for (int zp = 0; zp < TQ / 16; zp++)        // one call per row pair (its own FIFO stream)
     fa_exp_call(g + 2 * zp * 64, s_ones, p + zp * (LKP / 8) * 2 * TILE_B, s_rs + 2 * zp * 64);
+#ifdef FA_X_X2EXP  // debug: twice (same result)
+  for (int zp = 0; zp < TQ / 16; zp++)
+    fa_exp_call(g + 2 * zp * 64, s_ones, p + zp * (LKP / 8) * 2 * TILE_B, s_rs + 2 * zp * 64);
+#endif
   PROF_END(2)
 #else
   exp_p_rowsum(g, p, s_rs);
@@ -628,8 +701,33 @@ void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
 void sm_all(bfloat16 *__restrict g, bfloat16 *__restrict up, float *__restrict sp,
             bfloat16 *__restrict gp, uint8_t *__restrict p, int32_t *__restrict rtp, int32_t pass,
             int32_t chunk) {
+  if (fa_dead(rtp, chunk)) {   // fa_qkpv runs pv on it unchecked: P zero adds nothing
+    for (int i = 0; i < TQ * LKP * 9 / 8; i += 64)
+      aie::store_v(p + i, aie::zeros<uint8_t, 64>());
+    return;
+  }
+#if FA_HS
+  // flat (one frame, no nested calls but the asm and the rare path): sm_exp + softmax_step
+  const int32_t valid = rtp[3];
+  if ((chunk + 1) * LKP > valid)          // the chunk valid_len cuts: mask its tail keys
+    apply_mask(g, rtp, pass, chunk);
+  SET_ROUNDING();
+  fa_exp_call(g, s_ones, p, s_rs);
+  fa_exp_call(g + 2 * 64, s_ones, p + (LKP / 8) * 2 * TILE_B, s_rs + 2 * 64);
+  aie::vector<float, 64> m0 = aie::max(aie::load_v<64>(s_rs), aie::load_v<64>(s_rs + 128));
+  aie::vector<float, 64> m1 = aie::max(aie::load_v<64>(s_rs + 64), aie::load_v<64>(s_rs + 192));
+  m0 = aie::max(m0, m1);
+  aie::vector<float, 16> mx = aie::max(aie::max(m0.extract<16>(0), m0.extract<16>(1)),
+                                       aie::max(m0.extract<16>(2), m0.extract<16>(3)));
+  if (chunk == 0 || !aie::ge(mx, aie::broadcast<float, 16>(float(1ull << FA_TAU))).empty())
+    softmax_rescale(g, sp, gp, p, chunk);
+#pragma clang loop unroll(full)
+  for (int i = 0; i < TQ * 8; i += 64)                          // l += this chunk's row sums
+    aie::store_v(sp + i, aie::add(aie::load_v<64>(sp + i), aie::load_v<64>(s_rs + i)));
+#else
   sm_exp(g, p, rtp, pass, chunk);
   softmax_step(g, up, sp, gp, p, rtp, pass, chunk);
+#endif
 }
 
 // End of a pass: O /= l (l replicated, so its bf16 inverse is scale_rows' table).
