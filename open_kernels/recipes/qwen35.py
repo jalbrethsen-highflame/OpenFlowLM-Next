@@ -310,6 +310,13 @@ _TINY_MT = 64
 # 64-row-tile dit2 GEMM (the tiny tier's image; row 0 real) while the CPU does the rest from the
 # same int4 buffer. Plain kernels (the FFN up|gate without its epilogue, down without a_units).
 DECODE_NPU_FRAC = float(_os.environ.get("OPEN_QWEN35_DECODE_NPU_FRAC", "0.2"))
+# designs/dit2/dec.py (gemm_dit.decode2, preferred over decode): the NPU share as a 32-row int4
+# GEMM with B split over the 32 cores (no padding rows past 32, each weight byte read once): ~80 us
+# a dispatch then ~55 GB/s. Its core code depends on K, so one image at the hidden width: the qkv
+# GEMVs' first 4096 columns and the FFN up|gate's first 8192 (two dispatches); out and down stay
+# on the CPU. Up to 32 rows a pass: decode fills row 0, an MTP verify pass rows 0..k.
+# OPEN_QWEN35_DECODE2=0 off.
+DECODE2 = _os.environ.get("OPEN_QWEN35_DECODE2", "1") != "0"
 
 
 def gemm_dit(spec: ModelSpec) -> dict | None:
@@ -370,6 +377,25 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
                               "kernels": {str(c): f"dit2_n{c}_k{k}_m{GEMM_TINY_M}_dec" for c in opts}}
         if split:
             decode = {"m": GEMM_TINY_M, "mt": _TINY_MT, "split": split}
+    decode2 = None
+    if DECODE2 and tiny and GEMM_B4 and ffn:
+        hid, k2n = spec.hidden, f"dit2dec_k{spec.hidden}_n4096"
+        split = {}
+        for key in list(k2) + [f"{2 * spec.intermediate}x{hid}"]:
+            n, k = (int(x) for x in key.split("x"))
+            if k != hid or n <= 4096:
+                continue
+            chunks = [[off, 4096, f"{k2n}_off{off}"] for off in range(0, min(n - 4096, 8192 if n > 2 * 4096 * 2 else 4096), 4096)]
+            split[key] = {"chunks": chunks}
+        # the FFN down (K = ff): split along K instead -- the first 4096 columns over the first
+        # `hid` of K on the NPU (the same core code, B's strips ff / 64 tiles apart), a partial
+        # sum the CPU completes; the 5th chunk field is the NPU's K steps
+        ffk = spec.intermediate
+        if ffk > hid and spec.hidden > 4096:
+            split[f"{spec.hidden}x{ffk}"] = {"chunks": [[0, 4096, f"{k2n}_off0_kr{ffk}", hid // 64]]}
+        if split:
+            b_size = max(int(x.split("x")[0]) for x in split if int(x.split("x")[1]) == hid) // 128 * (hid // 64) * 4224
+            decode2 = {"m": 32, "k": hid, "b_size": b_size, "split": split}
     fa = None
     if GEMM_DIT2 and FA_MAX_LK >= DIT_M and spec.has_full and spec.head_dim == 256:
         fa = {"lk": {str(lk): f"fa256_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)},
@@ -388,6 +414,7 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             **({"small": small} if small else {}),
             **({"tiny": tiny} if tiny else {}),
             **({"decode": decode} if decode else {}),
+            **({"decode2": decode2} if decode2 else {}),
             **({"kernels2": k2} if k2 else {}),
             "kernels": {f"{n}x{k}": f"dit_n{npad[n]}_k{k}" for n, k in shapes},
             "npad": {str(n): p for n, p in npad.items()},
@@ -458,6 +485,9 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
                      + [k for v in d.get("decode", {}).get("split", {}).values() for k in v["kernels"].values()]):
             out["contexts"].setdefault("dit2t", f"{name}/final.xclbin")     # 64-row tiles: its own image
             out["kernels"][name] = {"context": "dit2t", "insts": f"{name}/insts.bin", "build": name}
+        for name in sorted({c[2] for v in d.get("decode2", {}).get("split", {}).values() for c in v["chunks"]}):
+            out["contexts"].setdefault("dec", f"{name}/final.xclbin")         # dit2/dec.py: its own image
+            out["kernels"][name] = {"context": "dec", "insts": f"{name}/insts.bin", "build": name}
         for key in ("lk", "nc"):      # the noncausal streams share the causal ones' image
             for lk, name in d.get("fa", {}).get(key, {}).items():
                 out["contexts"].setdefault("fa", f"{name}/final.xclbin")
@@ -597,6 +627,18 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                     b[name] = {"design": "dit2/dit2.py",
                                "build_dir": f"dit2/build_m{T['m']}_k{k}_n{c}_mt{T['mt']}{_HS_SFX}_dec",
                                "env": {"DG_M": str(T["m"]), "DG_K": str(k), "DG_N": c, "DG_LAYOUT": _lay(), **tenv}}
+        if "decode2" in d:
+            T = d["decode2"]
+            for key, v in T["split"].items():
+                kr = int(key.split("x")[1])
+                for c in v["chunks"]:
+                    name, off = c[2], c[0]
+                    env = {"DD_K": str(T["k"]), "DD_N": "4096", "DD_OFF": str(off)}
+                    if kr != T["k"]:
+                        env["DD_KROW"] = str(kr)
+                    else:
+                        env["DD_B_SIZE"] = str(T["b_size"])
+                    b[name] = {"design": "dit2/dec.py", "build_dir": f"dit2/build_{name}", "env": env}
         if "ffn" in d:
             ff, hid = d["ffn"]["ff"], spec.hidden
             b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",

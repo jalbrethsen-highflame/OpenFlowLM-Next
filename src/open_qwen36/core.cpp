@@ -704,6 +704,9 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
             if (v.is_string()) wanted[v.get<std::string>()] = true;
     if (man_.gemm_dit.contains("kernels2"))
         for (const auto& [shape, k] : man_.gemm_dit["kernels2"].items()) wanted[k.get<std::string>()] = true;
+    if (man_.gemm_dit.contains("decode2"))
+        for (const auto& [shape, v] : man_.gemm_dit["decode2"]["split"].items())
+            for (const auto& ch : v["chunks"]) wanted[ch[2].get<std::string>()] = true;
     if (man_.gemm_dit.contains("decode"))
         for (const auto& [shape, v] : man_.gemm_dit["decode"]["split"].items()) {
             wanted[v["kernel"].get<std::string>()] = true;
@@ -2790,6 +2793,12 @@ void Core::step_cpu_decode(int token, bool want_logits) {
     // same int4 buffer; the NPU's row 0 read back as bf16
     static const bool split_on = [] { const char* e = std::getenv("OFLM_OPEN_DECODE_SPLIT"); return !(e && *e == '0'); }();
     const nlohmann::json* SP = split_on && D.contains("decode") ? &D["decode"] : nullptr;
+    // OFLM_OPEN_DECODE2 (default on): gemm_dit.decode2's 32-row kernels where they exist
+    static const bool d2_on = [] { const char* e = std::getenv("OFLM_OPEN_DECODE2"); return !(e && *e == '0'); }();
+    const nlohmann::json* S2 = split_on && d2_on && D.contains("decode2") ? &D["decode2"] : nullptr;
+    // one NPU image a step: with decode2, the shapes it does not cover stay on the CPU rather than
+    // switching to the 256-row kernels' image and back
+    if (S2) SP = nullptr;
     auto gemv = [&](const Step& st, int l, const float* in, std::vector<float>& out) {
         size_t n, k, npad;
         shape(st, n, k, npad);
@@ -2797,6 +2806,62 @@ void Core::step_cpu_decode(int token, bool want_logits) {
         auto tg = std::chrono::steady_clock::now();
         const uint8_t* B = gemm_w_.at(st.args[0])[l].map<const uint8_t*>();
         const std::string key = std::to_string(n) + "x" + std::to_string(k);
+        if (S2 && (*S2)["split"].contains(key)) {
+            // gemm_dit.decode2 (designs/dit2/dec.py): the first columns as 4096-column NPU chunks of
+            // a 32-row int4 GEMM, B split over the cores; rows [0, R) of A real (R = 1 here; an MTP
+            // verify pass would pack k + 1)
+            const size_t R = 1, KT = k / 64;
+            const nlohmann::json& chunks = (*S2)["split"][key]["chunks"];
+            // a 5th chunk field: the NPU's K steps (a K split; the CPU completes the sum)
+            const size_t KN = chunks[0].size() > 3 ? chunks[0][3].get<size_t>() : KT;
+            if (!globals_.count("dec2_a")) globals_["dec2_a"] = alloc((*S2)["k"].get<size_t>() / 64 * 2304);
+            xrt::bo& ab = globals_.at("dec2_a");
+            uint8_t* a = ab.map<uint8_t*>();
+            // row r into pack_a.py's order2 at mt = 32: per 64-K step 2304 B, block (j, i) with
+            // row block rb = r / 8 at j = (rb / 2) * 16 + 2 kb + rb % 2, i = r % 8
+            for (size_t r = 0; r < R; ++r) {
+                const size_t rb = r / 8, i = r % 8;
+                for (size_t ks = 0; ks < KN; ++ks)
+                    for (size_t kb = 0; kb < 8; ++kb)
+                        bfp_encode8_avx2(in + r * k + ks * 64 + kb * 8, a + ks * 2304 + (((rb / 2) * 16 + 2 * kb + rb % 2) * 8 + i) * 9);
+            }
+            ab.sync(XCL_BO_SYNC_BO_TO_DEVICE, KN * 2304, 0);
+            std::vector<Inflight> fl;
+            size_t nnpu = 0;
+            for (size_t ci = 0; ci < chunks.size(); ++ci) {
+                const std::string cn = "dec2_c" + std::to_string(ci);
+                if (!globals_.count(cn)) globals_[cn] = alloc(32 * 32 * 128 * 2);
+                fl.push_back(start_run(kerns_.at(chunks[ci][2].get<std::string>()), {"dec2_a", st.args[0], cn}, l));
+                nnpu = std::max(nnpu, chunks[ci][0].get<size_t>() + chunks[ci][1].get<size_t>());
+            }
+            timing_.moe_prep_ms += ms_since(tg);
+            const double t_cpu0 = ms_since(tg);
+            host::gemv_b4(B + nnpu / 128 * KT * 4224, npad - nnpu, k, in, out.data() + nnpu);
+            if (KN < KT) host::gemv_b4(B, nnpu, k, in, out.data(), nullptr, KN, KT);   // the NPU columns' other K
+            const double cpu_ms = ms_since(tg) - t_cpu0;
+            auto tw = std::chrono::steady_clock::now();
+            for (Inflight& f : fl) wait_run(f);
+            timing_.attn_ms += ms_since(tw);
+            // each chunk's tiles: tile t = column strip off / 128 + t, [row block 4][column block 16][8][8]
+            auto tr = std::chrono::steady_clock::now();
+            for (size_t ci = 0; ci < chunks.size(); ++ci) {
+                xrt::bo& cb = globals_.at("dec2_c" + std::to_string(ci));
+                read_back(cb, 32 * 32 * 128 * 2, 0);
+                const uint16_t* c16 = cb.map<const uint16_t*>();
+                const size_t off = chunks[ci][0].get<size_t>(), nc = chunks[ci][1].get<size_t>();
+                for (size_t t = 0; t < nc / 128; ++t)
+                    for (size_t cbk = 0; cbk < 16; ++cbk)
+                        for (size_t j = 0; j < 8; ++j) {
+                            const float v = bf16_to_f32(c16[t * 4096 + cbk * 64 + j]);
+                            float& o = out[off + t * 128 + cbk * 8 + j];
+                            o = KN < KT ? o + v : v;
+                        }
+            }
+            (void)cpu_ms;
+            timing_.moe_read_ms += ms_since(tr);
+            timing_.part0_ms += ms_since(tg);
+            return;
+        }
         if (!SP || !(*SP)["split"].contains(key)) {
             host::gemv_b4(B, npad, k, in, out.data());
             timing_.part0_ms += ms_since(tg);

@@ -68,8 +68,18 @@ Tried and left off (switches kept):
 - [ ] MTP: draft with the model's MTP layer, verify k + 1 tokens in one pass. Needs the HF MTP
       weights (only shard 1 of 18 is on disk), a multi-token verify pass (the CPU kernel's math
       grows k + 1 times), DeltaNet state rollback.
-- [ ] An NPU decode kernel without the 255 padding rows (a real GEMV on the int4 blocks), so the
-      NPU share can grow past 20 %.
+- [x] An NPU decode kernel without the 255 padding rows: designs/dit2/dec.py (gemm_dit.decode2),
+      32 rows, B split over the 32 cores, ~80 us a dispatch then ~55 GB/s, verified against numpy
+      (dec_test.py). One image (K = 5120 core loop): qkv's first 4096 columns, the FFN up|gate's
+      first 8192, and the FFN down split along K (its first 4096 columns over K [0, 5120)).
+      145 ms/token (6.9 tok/s) against 149-150 with the 256-row kernels: at one row a pass the
+      ~80 us per dispatch and the sync after every product keep the NPU near 20 % of the bytes
+      (it finishes before the CPU: wait 0.1 ms). Rows 1..31 are free on the NPU -- MTP's verify
+      pass is where it pays.
+- [ ] dit2_dec with the K steps as a runtime parameter (RTP), so one image can take any K range:
+      finer NPU shares per product and the out projection (K = 6144) too. ~4 % more.
+- [ ] Per-dispatch cost: A flush 184 KB and C read-back 256 KB per dispatch (pre 3.2 ms + post
+      1.4 ms a token); read back only the rows used.
 - [ ] The load peak (17.7 GB): the q8 head pool and its CPU repack are both alive for a moment.
 - [ ] Server use: the threads spin (ACTIVE) and are pinned; a server must let them sleep
       between requests.

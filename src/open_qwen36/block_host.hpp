@@ -122,7 +122,8 @@ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, 
 /// x 8 k, then 128 exponent bytes, scale 2^(e - 133)) -- the bytes dit2 reads, on the CPU. x is
 /// rounded to bf16 (the products and sums are fp32). OpenMP over 128-column strips and K ranges.
 void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y,
-             const std::function<void()>& side = nullptr);
+             const std::function<void()>& side = nullptr, size_t kt0 = 0, size_t kt1 = 0);
+/// (kt0, kt1: only those 64-K tiles of every strip, a partial sum; kt1 = 0 means all)
 /// The dit FFN's up|gate output to h: every 128 columns of `ug` are [gate 64 | up 64]; h [ff] =
 /// silu(gate) * up. Parallel and 16 lanes wide (ff % 64 == 0).
 void swiglu_tiles(const float* ug, size_t ff, float* h);

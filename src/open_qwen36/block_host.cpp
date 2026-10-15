@@ -1305,7 +1305,8 @@ void b4_strip_vnni(const uint8_t* st, const B4XQ& q, size_t t0, size_t t1, float
 }
 }  // namespace
 
-void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y, const std::function<void()>& side) {
+void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y, const std::function<void()>& side, size_t kt0,
+             size_t kt1) {
     if (npad % 128 || K % 64) throw std::runtime_error("open_qwen36: gemv_b4: N % 128 or K % 64");
     static const bool avx = __builtin_cpu_supports("avx512bf16") && __builtin_cpu_supports("avx512bw");
     static const bool int8 = [] {
@@ -1320,9 +1321,11 @@ void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y, 
     if (int8) b4_xq_size(K, xq);
     else xp.resize(K / 8 * 16);
     const size_t S = npad / 128, KT = K / 64;
+    if (!kt1) kt1 = KT;
+    const size_t KR = kt1 - kt0;
     const size_t T = static_cast<size_t>(omp_get_max_threads());
     // enough work items to balance the threads: K split in ranges when there are few strips
-    const size_t ks = std::min(KT, std::max<size_t>(1, (4 * T + S - 1) / S));
+    const size_t ks = std::min(KR, std::max<size_t>(1, (4 * T + S - 1) / S));
     std::vector<float>& part = part_tl;
     if (ks > 1) part.resize(ks * npad);
     const uint32_t* xpp = xp.data();
@@ -1331,7 +1334,7 @@ void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y, 
     // x rounded to int8 over the threads, one 64-K tile each (bf16 path: one thread)
     if (int8) {
 #pragma omp for schedule(static)
-        for (long long kt = 0; kt < static_cast<long long>(KT); ++kt)
+        for (long long kt = static_cast<long long>(kt0); kt < static_cast<long long>(kt1); ++kt)
             b4_prep_xq_tiles(x, static_cast<size_t>(kt), static_cast<size_t>(kt) + 1, xq);
     } else {
 #pragma omp single
@@ -1346,7 +1349,7 @@ void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y, 
 #pragma omp for schedule(dynamic, 1)
     for (long long w = 0; w < static_cast<long long>(S * ks); ++w) {
         const size_t s = static_cast<size_t>(w) / ks, r = static_cast<size_t>(w) % ks;
-        const size_t t0 = KT * r / ks, t1 = KT * (r + 1) / ks;
+        const size_t t0 = kt0 + KR * r / ks, t1 = kt0 + KR * (r + 1) / ks;
         // one K range: straight into y; several: a partial row each, added below
         float* acc = ks == 1 ? y + s * 128 : part.data() + r * npad + s * 128;
         std::fill(acc, acc + 128, 0.f);
