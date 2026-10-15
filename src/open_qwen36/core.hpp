@@ -627,6 +627,11 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     bool cpu_decode_ok() const;
     bool cpu_decode_on_ = false;
     bool drop_pools_ = false;   ///< the q4 pools freed after building the int4 weights (CPU decode)
+    /// the final norm and q8 lm_head on the CPU (CPU decode; OFLM_OPEN_CPU_HEAD=0 keeps the NPU's):
+    /// the head repacked from the pool order (host::lmhead_q8_repack), the norm weight as f32
+    bool cpu_head_ = false, cpu_head_check_ = false;
+    std::vector<uint8_t> lm_cpu_;
+    std::vector<float> normw_f_;
     /// which side holds the newest per-layer state (DeltaNet S / conv rows, KV rows): 0 both,
     /// 1 the host (CPU decode wrote it), 2 the device (the fused NPU decode wrote it)
     int state_owner_ = 0;

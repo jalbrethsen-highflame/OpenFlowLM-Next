@@ -121,5 +121,14 @@ void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y);
 /// silu(gate) * up. Parallel and 16 lanes wide (ff % 64 == 0).
 void swiglu_tiles(const float* ug, size_t ff, float* h);
 
+/// The q8 lm_head on the CPU. lmhead_q8_repack: the NPU pool's chunks (32 rows x 256 K, 8704 B:
+/// 256 bf16 scales [kb][r], then int8 codes [(r / 16) * 4096 + k * 16 + r % 16]; band order of
+/// pools.cpp's lmhead_q8 op) -> [N / 16 row groups][K / 32 blocks][16 bf16 scales | 8 x (16 rows
+/// x 4 k) codes], lmhead_q8_cpu_bytes(N, K) bytes. lmhead_q8_cpu: y [N] = W x, x rounded to int8
+/// per 32 (max|x| / 127), vpdpbusd on |x| with x's sign moved onto the codes.
+size_t lmhead_q8_cpu_bytes(size_t N, size_t K);
+void lmhead_q8_repack(const uint8_t* pool, size_t N, size_t K, uint8_t* out);
+void lmhead_q8_cpu(const uint8_t* W, size_t N, size_t K, const float* x, float* y);
+
 }  // namespace host
 }  // namespace open_qwen36

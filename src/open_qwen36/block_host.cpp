@@ -1344,6 +1344,90 @@ void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y) 
     }
 }
 
+size_t lmhead_q8_cpu_bytes(size_t N, size_t K) { return N / 16 * (K / 32) * 544; }
+
+void lmhead_q8_repack(const uint8_t* pool, size_t N, size_t K, uint8_t* out) {
+    if (N % 128 || K % 256) throw std::runtime_error("open_qwen36: lmhead_q8_repack: N % 128 or K % 256");
+    const size_t nk = K / 256, per_band = 4 * nk, GS = K / 32 * 544;
+#pragma omp parallel for schedule(static)
+    for (long long cc = 0; cc < static_cast<long long>(N / 128 * per_band); ++cc) {
+        const size_t c = static_cast<size_t>(cc), b = c / per_band, q = c % per_band % 4, kt = c % per_band / 4;
+        const uint8_t* ch = pool + c * 8704;
+        for (size_t r = 0; r < 32; ++r) {
+            const size_t g = b * 8 + q * 2 + r / 16, lane = r % 16;
+            uint8_t* gp = out + g * GS;
+            for (size_t kb = 0; kb < 8; ++kb) {
+                uint8_t* blk = gp + (kt * 8 + kb) * 544;
+                std::memcpy(blk + lane * 2, ch + (kb * 32 + r) * 2, 2);
+                for (size_t k = kb * 32; k < kb * 32 + 32; ++k)
+                    blk[32 + ((k % 32) / 4) * 64 + lane * 4 + k % 4] = ch[512 + (r / 16) * 4096 + k * 16 + r % 16];
+            }
+        }
+    }
+}
+
+namespace {
+__attribute__((target("avx512f,avx512bw,avx512vnni")))
+void lmhead_groups(const uint8_t* W, size_t K, const uint32_t* ax, const uint64_t* neg, const float* sx, size_t g0, size_t g1,
+                   float* y) {
+    const size_t KB = K / 32, GS = KB * 544;
+    const __m512i zero = _mm512_setzero_si512();
+    for (size_t g = g0; g < g1; ++g) {
+        const uint8_t* gp = W + g * GS;
+        _mm_prefetch(reinterpret_cast<const char*>(gp + GS), _MM_HINT_NTA);
+        __m512 acc = _mm512_setzero_ps();
+        for (size_t B = 0; B < KB; ++B) {
+            const uint8_t* blk = gp + B * 544;
+            __m512i a = _mm512_setzero_si512();
+            for (int kq = 0; kq < 8; ++kq) {
+                __m512i w = _mm512_loadu_si512(blk + 32 + kq * 64);
+                w = _mm512_mask_sub_epi8(w, neg[B * 8 + kq], zero, w);
+                a = _mm512_dpbusd_epi32(a, _mm512_set1_epi32(static_cast<int>(ax[B * 8 + kq])), w);
+            }
+            const __m512 sc = _mm512_castsi512_ps(
+                _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk))), 16));
+            acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(a), _mm512_mul_ps(sc, _mm512_set1_ps(sx[B])), acc);
+        }
+        _mm512_storeu_ps(y + g * 16, acc);
+    }
+}
+}  // namespace
+
+void lmhead_q8_cpu(const uint8_t* W, size_t N, size_t K, const float* x, float* y) {
+    const size_t KB = K / 32;
+    static thread_local std::vector<uint32_t> ax;
+    static thread_local std::vector<uint64_t> neg;
+    static thread_local std::vector<float> sx;
+    ax.resize(KB * 8); neg.resize(KB * 8); sx.resize(KB);
+    for (size_t B = 0; B < KB; ++B) {
+        float m = 0.f;
+        for (int i = 0; i < 32; ++i) m = std::max(m, std::fabs(x[B * 32 + i]));
+        const float s = m > 0.f ? m / 127.f : 1.f, inv = 1.f / s;
+        sx[B] = s;
+        for (int kq = 0; kq < 8; ++kq) {
+            uint32_t a = 0, pat = 0;
+            for (int j = 0; j < 4; ++j) {
+                const long v = std::lrint(x[B * 32 + kq * 4 + j] * inv);
+                a |= static_cast<uint32_t>(std::labs(v)) << (8 * j);
+                if (v < 0) pat |= 1u << j;
+            }
+            uint64_t mk = 0;
+            for (int lane = 0; lane < 16; ++lane) mk |= static_cast<uint64_t>(pat) << (4 * lane);
+            ax[B * 8 + kq] = a;
+            neg[B * 8 + kq] = mk;
+        }
+    }
+    const size_t G = N / 16;
+    const uint32_t* axp = ax.data();
+    const uint64_t* negp = neg.data();
+    const float* sxp = sx.data();
+#pragma omp parallel
+    {
+        const size_t T = static_cast<size_t>(omp_get_num_threads()), i = static_cast<size_t>(omp_get_thread_num());
+        lmhead_groups(W, K, axp, negp, sxp, G * i / T, G * (i + 1) / T, y);
+    }
+}
+
 void swiglu_tiles(const float* ug, size_t ff, float* h) {
 #pragma omp parallel for schedule(static)
     for (long long jj = 0; jj < static_cast<long long>(ff / 64); ++jj) {

@@ -1189,6 +1189,16 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     for (const auto& [name, bytes] : w_->globals) {
         if (name == "lmpool" && skip_pools) {
             continue;
+        } else if (name == "lmpool" && drop_pools_ && !(std::getenv("OFLM_OPEN_CPU_HEAD") && *std::getenv("OFLM_OPEN_CPU_HEAD") == '0')) {
+            // CPU decode: the head on the CPU, repacked once; the NPU copy only to check it
+            cpu_head_check_ = std::getenv("OFLM_OPEN_CPU_HEAD_CHECK") && *std::getenv("OFLM_OPEN_CPU_HEAD_CHECK") == '1';
+            std::vector<uint8_t> pool(bytes);
+            pools::pack_lmhead(*w_, *file_, pool.data());
+            lm_cpu_.resize(host::lmhead_q8_cpu_bytes(w_->vocab, w_->hidden));
+            host::lmhead_q8_repack(pool.data(), w_->vocab, w_->hidden, lm_cpu_.data());
+            cpu_head_ = true;
+            if (cpu_head_check_) globals_[name] = alloc(bytes, pool.data(), pool.size());
+            log("CPU decode: the lm_head on the CPU (" + std::to_string(lm_cpu_.size() >> 20) + " MB, q8)");
         } else if (name == "lmpool") {
             xrt::bo lm = xrt::ext::bo(*dev_, bytes);
             pools::pack_lmhead(*w_, *file_, lm.map<uint8_t*>());
@@ -2832,6 +2842,41 @@ void Core::step_cpu_decode(int token, bool want_logits) {
 
 void Core::tail_logits(const float* row) {
     auto t1 = std::chrono::steady_clock::now();
+    if (cpu_head_) {
+        const size_t hid = w_->hidden;
+        if (normw_f_.empty()) {
+            const uint16_t* nw = buffer("normw", 0).map<const uint16_t*>();
+            normw_f_.resize(hid);
+            for (size_t i = 0; i < hid; ++i) normw_f_[i] = bf16_to_f32(nw[i]);
+        }
+        static thread_local std::vector<float> xn;
+        xn.resize(hid);
+        host::rmsnorm_rows(row, 1, hid, normw_f_.data(), types_[0]->gemm_block.eps, xn.data());
+        host::lmhead_q8_cpu(lm_cpu_.data(), w_->vocab, hid, xn.data(), logits_host_.data());
+        timing_.lmhead_ms = ms_since(t1);
+        if (!cpu_head_check_) return;
+        // debug: the NPU's head on the same row, compared
+        std::vector<float> cpu(logits_host_);
+        xrt::bo& x0 = buffer("xres", 0);
+        std::memcpy(x0.map<uint8_t*>(), row, hid * 4);
+        x0.sync(XCL_BO_SYNC_BO_TO_DEVICE, hid * 4, 0);
+        for (const Step& st : w_->tail) run(kerns_.at(st.kernel), st.args, 0);
+        xrt::bo& lg = buffer("logits", 0);
+        read_back(lg, w_->vocab * 4, 0);
+        const float* npu = lg.map<const float*>();
+        const size_t V = w_->real_vocab ? w_->real_vocab : w_->vocab;
+        double sxy = 0, sxx = 0, syy = 0, mx = 0, my = 0;
+        for (size_t i = 0; i < V; ++i) { mx += cpu[i]; my += npu[i]; }
+        mx /= V; my /= V;
+        size_t ac = 0, an = 0;
+        for (size_t i = 0; i < V; ++i) {
+            sxy += (cpu[i] - mx) * (npu[i] - my); sxx += (cpu[i] - mx) * (cpu[i] - mx); syy += (npu[i] - my) * (npu[i] - my);
+            if (cpu[i] > cpu[ac]) ac = i;
+            if (npu[i] > npu[an]) an = i;
+        }
+        std::fprintf(stderr, "cpu head check: corr %.6f argmax cpu %zu npu %zu\n", sxy / std::sqrt(sxx * syy), ac, an);
+        return;
+    }
     xrt::bo& xres1 = buffer("xres", 0);
     std::memcpy(xres1.map<uint8_t*>(), row, w_->hidden * 4);
     xres1.sync(XCL_BO_SYNC_BO_TO_DEVICE, w_->hidden * 4, 0);
