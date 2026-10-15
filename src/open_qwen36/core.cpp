@@ -2775,15 +2775,18 @@ void Core::step_cpu_decode(int token, bool want_logits) {
             for (size_t kb = 0; kb < 8; ++kb) bfp_encode8_avx2(in + ks * 64 + kb * 8, a + ks * unit + (2 * kb) * 8 * 9);
         ab.sync(XCL_BO_SYNC_BO_TO_DEVICE, k / 64 * unit, 0);
         Inflight f = start_run(kerns_.at(sv["kernel"].get<std::string>()), {an, st.args[0], cn}, l);
+        timing_.moe_prep_ms += ms_since(tg);      // trace: pack + flush + start before the CPU's share
         host::gemv_b4(B + nn / 128 * (k / 64) * 4224, npad - nn, k, in, out.data() + nn);
-        const double cpu_ms = ms_since(tg);
+        const double cpu_ms = ms_since(tg), attn0 = timing_.attn_ms;
+        auto tw = std::chrono::steady_clock::now();
         wait_run(f);
+        timing_.attn_ms += ms_since(tw);
         xrt::bo& cb = globals_.at(cn);
         read_back(cb, nn * 2, 0);
         const uint16_t* c16 = cb.map<const uint16_t*>();
         for (size_t i = 0; i < nn; ++i) out[i] = bf16_to_f32(c16[i]);
+        timing_.moe_read_ms += ms_since(tg) - cpu_ms - (timing_.attn_ms - attn0);   // trace: read back + convert
         timing_.part0_ms += ms_since(tg);
-        timing_.attn_ms += ms_since(tg) - cpu_ms;    // trace: the time waiting on the NPU past the CPU's share
     };
     static thread_local std::vector<float> x, xn, y, og, h, ya, yb, yc, yd;
     x.resize(hid); xn.resize(hid);
@@ -2836,8 +2839,9 @@ void Core::step_cpu_decode(int token, bool want_logits) {
     timing_.total_ms = ms_since(t0);
     static const bool trace = std::getenv("OFLM_OPEN_CPU_DECODE_TRACE") != nullptr;
     if (trace)
-        std::fprintf(stderr, "cpu decode pos %zu: %.1f ms | gemv %.1f (npu wait %.1f) mixer %.1f lm %.1f\n", pos, timing_.total_ms,
-                     timing_.part0_ms, timing_.attn_ms, timing_.part1_ms, timing_.lmhead_ms);
+        std::fprintf(stderr, "cpu decode pos %zu: %.1f ms | gemv %.1f (npu wait %.1f) mixer %.1f lm %.1f | split pre %.1f post %.1f\n", pos,
+                     timing_.total_ms, timing_.part0_ms, timing_.attn_ms, timing_.part1_ms, timing_.lmhead_ms, timing_.moe_prep_ms,
+                     timing_.moe_read_ms);
 }
 
 void Core::tail_logits(const float* row) {
