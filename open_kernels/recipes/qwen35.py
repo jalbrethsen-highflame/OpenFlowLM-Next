@@ -305,6 +305,11 @@ GEMM_SMALL_M = int(_os.environ.get("OPEN_QWEN35_GEMM_SMALL_M", 512))
 # against 2.37 at 512 rows; its best stack of a 0x1000-0x5800 sweep is 0x3000. OPEN_QWEN35_GEMM_TINY_M=0 off.
 GEMM_TINY_M = int(_os.environ.get("OPEN_QWEN35_GEMM_TINY_M", 256))
 _TINY_MT = 64
+# The CPU decode route's NPU share (OFLM_OPEN_CPU_DECODE): each decode GEMV's first `nn` columns
+# (OPEN_QWEN35_DECODE_NPU_FRAC of N, in dit2's 1024-column groups) run on the NPU as a 256-row,
+# 64-row-tile dit2 GEMM (the tiny tier's image; row 0 real) while the CPU does the rest from the
+# same int4 buffer. Plain kernels (the FFN up|gate without its epilogue, down without a_units).
+DECODE_NPU_FRAC = float(_os.environ.get("OPEN_QWEN35_DECODE_NPU_FRAC", "0.2"))
 
 
 def gemm_dit(spec: ModelSpec) -> dict | None:
@@ -351,6 +356,16 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
         sm = f"_m{GEMM_TINY_M}"
         tiny = {"m": GEMM_TINY_M, "mt": _TINY_MT, "kernels2": {key: name + sm for key, name in k2.items()},
                 "ffn": {"up2p": ffn["up2p"] + sm, "down2u": ffn["down2u"] + sm}}
+    decode = None
+    if tiny and DECODE_NPU_FRAC > 0:
+        split = {}
+        for key in list(k2) + ([f"{2 * ff_}x{spec.hidden}", f"{spec.hidden}x{ff_}"] if (ff_ := spec.intermediate) and ffn else []):
+            n, k = (int(x) for x in key.split("x"))
+            nn = max(1024, int(round(n * DECODE_NPU_FRAC / 1024)) * 1024)
+            if nn < n:
+                split[key] = {"nn": nn, "kernel": f"dit2_n{nn}_k{k}_m{GEMM_TINY_M}_dec"}
+        if split:
+            decode = {"m": GEMM_TINY_M, "mt": _TINY_MT, "split": split}
     fa = None
     if GEMM_DIT2 and FA_MAX_LK >= DIT_M and spec.has_full and spec.head_dim == 256:
         fa = {"lk": {str(lk): f"fa256_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)},
@@ -368,6 +383,7 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             **({"ffn": ffn} if ffn else {}),
             **({"small": small} if small else {}),
             **({"tiny": tiny} if tiny else {}),
+            **({"decode": decode} if decode else {}),
             **({"kernels2": k2} if k2 else {}),
             "kernels": {f"{n}x{k}": f"dit_n{npad[n]}_k{k}" for n, k in shapes},
             "npad": {str(n): p for n, p in npad.items()},
@@ -434,7 +450,8 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         for name in names2:
             out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
             out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
-        for name in list(d.get("tiny", {}).get("kernels2", {}).values()) + list(d.get("tiny", {}).get("ffn", {}).values()):
+        for name in (list(d.get("tiny", {}).get("kernels2", {}).values()) + list(d.get("tiny", {}).get("ffn", {}).values())
+                     + [v["kernel"] for v in d.get("decode", {}).get("split", {}).values()]):
             out["contexts"].setdefault("dit2t", f"{name}/final.xclbin")     # 64-row tiles: its own image
             out["kernels"][name] = {"context": "dit2t", "insts": f"{name}/insts.bin", "build": name}
         for key in ("lk", "nc"):      # the noncausal streams share the causal ones' image
@@ -567,6 +584,14 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             b[T["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{tm}_k{ff2}_n{spec.hidden}_au{tsfx}",
                                      "env": {"DG_M": str(tm), "DG_K": str(ff2), "DG_N": str(spec.hidden),
                                              "DG_LAYOUT": _lay(a_units=True), **tenv}}
+        if "decode" in d:
+            T = d["decode"]
+            tenv = {**_HS_ENV, "DG_MT": str(T["mt"]), **({"DG_STACK": "0x3000"} if GEMM_B4 else {})}
+            for key, v in T["split"].items():
+                k = int(key.split("x")[1])
+                b[v["kernel"]] = {"design": "dit2/dit2.py",
+                                  "build_dir": f"dit2/build_m{T['m']}_k{k}_n{v['nn']}_mt{T['mt']}{_HS_SFX}_dec",
+                                  "env": {"DG_M": str(T["m"]), "DG_K": str(k), "DG_N": str(v["nn"]), "DG_LAYOUT": _lay(), **tenv}}
         if "ffn" in d:
             ff, hid = d["ffn"]["ff"], spec.hidden
             b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",

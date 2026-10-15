@@ -626,6 +626,7 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     void step_cpu_decode(int token, bool want_logits);
     bool cpu_decode_ok() const;
     bool cpu_decode_on_ = false;
+    bool drop_pools_ = false;   ///< the q4 pools freed after building the int4 weights (CPU decode)
     /// which side holds the newest per-layer state (DeltaNet S / conv rows, KV rows): 0 both,
     /// 1 the host (CPU decode wrote it), 2 the device (the fused NPU decode wrote it)
     int state_owner_ = 0;

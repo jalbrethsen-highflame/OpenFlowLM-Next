@@ -704,6 +704,8 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
             if (v.is_string()) wanted[v.get<std::string>()] = true;
     if (man_.gemm_dit.contains("kernels2"))
         for (const auto& [shape, k] : man_.gemm_dit["kernels2"].items()) wanted[k.get<std::string>()] = true;
+    if (man_.gemm_dit.contains("decode"))
+        for (const auto& [shape, v] : man_.gemm_dit["decode"]["split"].items()) wanted[v["kernel"].get<std::string>()] = true;
     for (const char* tier : {"small", "tiny"})
         if (man_.gemm_dit.contains(tier))
             for (const char* key : {"kernels2", "ffn"})
@@ -1029,10 +1031,22 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     };
     const bool skip_pools = cfg_.prompt_only && hf_bf16_ && dit_on_;
     if (skip_pools) log("prompt only: no q4 pools, no lm_head (the GEMM weights come from the bf16 source)");
+    // OFLM_OPEN_CPU_DECODE=1 on an int4 dit set: decode reads the int4 GEMM weights, so each
+    // layer's q4 pool is packed in host memory only to build them, then freed (the 27B: 31.8 ->
+    // ~17 GB). The fused NPU decode route needs the pools: OFLM_OPEN_KEEP_POOLS=1 keeps them.
+    drop_pools_ = !skip_pools && cpu_decode_on_ && dit_on_ && dit_b4_ && gemm_block_t_ &&
+                  !(std::getenv("OFLM_OPEN_KEEP_POOLS") && *std::getenv("OFLM_OPEN_KEEP_POOLS") == '1');
+    if (drop_pools_) log("CPU decode: the q4 pools only feed the int4 GEMM weights, then go");
+    std::vector<uint8_t> pool_tmp;
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];
         if (skip_pools) {
             build_weights(lt, l, "pool", nullptr);
+            pools_.emplace_back();
+        } else if (drop_pools_) {
+            pool_tmp.assign(w_->pool_bytes, 0);
+            pools::pack_pool(*w_, lt, *file_, l, pool_tmp.data());
+            build_weights(lt, l, "pool", pool_tmp.data());
             pools_.emplace_back();
         } else {
             xrt::bo pool = xrt::ext::bo(*dev_, w_->pool_bytes);
@@ -2267,6 +2281,9 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
         step_cpu_decode(token, want_logits);
         return;
     }
+    if (drop_pools_)
+        throw std::runtime_error("open_qwen36: the q4 pools were dropped for the CPU decode route (OFLM_OPEN_CPU_DECODE=1), "
+                                 "and this step cannot take it; OFLM_OPEN_KEEP_POOLS=1 keeps the NPU route");
     if (state_owner_ == 1) states_to_device();
     state_owner_ = 2;
     auto t0 = std::chrono::steady_clock::now();
@@ -2717,13 +2734,46 @@ void Core::step_cpu_decode(int token, bool want_logits) {
         k = std::stoul(kn.substr(kn.find("_k") + 2));
         npad = D["npad"][std::to_string(n)].get<size_t>();
     };
+    // gemm_dit.decode.split (OFLM_OPEN_DECODE_SPLIT, default on): a GEMV's first nn columns on the
+    // NPU -- a 256-row dit2 GEMM on 64-row tiles, row 0 real -- while the CPU does the rest of the
+    // same int4 buffer; the NPU's row 0 read back as bf16
+    static const bool split_on = [] { const char* e = std::getenv("OFLM_OPEN_DECODE_SPLIT"); return !(e && *e == '0'); }();
+    const nlohmann::json* SP = split_on && D.contains("decode") ? &D["decode"] : nullptr;
     auto gemv = [&](const Step& st, int l, const float* in, std::vector<float>& out) {
         size_t n, k, npad;
         shape(st, n, k, npad);
         out.resize(npad);
         auto tg = std::chrono::steady_clock::now();
-        host::gemv_b4(gemm_w_.at(st.args[0])[l].map<const uint8_t*>(), npad, k, in, out.data());
+        const uint8_t* B = gemm_w_.at(st.args[0])[l].map<const uint8_t*>();
+        const std::string key = std::to_string(n) + "x" + std::to_string(k);
+        if (!SP || !(*SP)["split"].contains(key)) {
+            host::gemv_b4(B, npad, k, in, out.data());
+            timing_.part0_ms += ms_since(tg);
+            return;
+        }
+        const nlohmann::json& sv = (*SP)["split"][key];
+        const size_t nn = sv["nn"].get<size_t>(), M = (*SP)["m"].get<size_t>(), mt = (*SP)["mt"].get<size_t>();
+        const std::string an = "dec_a_k" + std::to_string(k), cn = "dec_c_n" + std::to_string(nn);
+        if (!globals_.count(an)) globals_[an] = alloc(M * k * 9 / 8);     // zero: rows 1.. stay zero
+        if (!globals_.count(cn)) globals_[cn] = alloc(M * nn * 2);
+        // row 0 into dit2's A order (dit2_pack_a, hs): per 64-K unit of mt rows, quarter 0, the
+        // blocks j = 2 kb (row block 0), i = 0
+        xrt::bo& ab = globals_.at(an);
+        uint8_t* a = ab.map<uint8_t*>();
+        const size_t unit = mt / 32 * 32 * 8 * 9;
+        for (size_t ks = 0; ks < k / 64; ++ks)
+            for (size_t kb = 0; kb < 8; ++kb) bfp_encode8_avx2(in + ks * 64 + kb * 8, a + ks * unit + (2 * kb) * 8 * 9);
+        ab.sync(XCL_BO_SYNC_BO_TO_DEVICE, k / 64 * unit, 0);
+        Inflight f = start_run(kerns_.at(sv["kernel"].get<std::string>()), {an, st.args[0], cn}, l);
+        host::gemv_b4(B + nn / 128 * (k / 64) * 4224, npad - nn, k, in, out.data() + nn);
+        const double cpu_ms = ms_since(tg);
+        wait_run(f);
+        xrt::bo& cb = globals_.at(cn);
+        read_back(cb, nn * 2, 0);
+        const uint16_t* c16 = cb.map<const uint16_t*>();
+        for (size_t i = 0; i < nn; ++i) out[i] = bf16_to_f32(c16[i]);
         timing_.part0_ms += ms_since(tg);
+        timing_.attn_ms += ms_since(tg) - cpu_ms;    // trace: the time waiting on the NPU past the CPU's share
     };
     static thread_local std::vector<float> x, xn, y, og, h, ya, yb, yc, yd;
     x.resize(hid); xn.resize(hid);
@@ -2776,8 +2826,8 @@ void Core::step_cpu_decode(int token, bool want_logits) {
     timing_.total_ms = ms_since(t0);
     static const bool trace = std::getenv("OFLM_OPEN_CPU_DECODE_TRACE") != nullptr;
     if (trace)
-        std::fprintf(stderr, "cpu decode pos %zu: %.1f ms | gemv %.1f mixer %.1f lm %.1f\n", pos, timing_.total_ms, timing_.part0_ms,
-                     timing_.part1_ms, timing_.lmhead_ms);
+        std::fprintf(stderr, "cpu decode pos %zu: %.1f ms | gemv %.1f (npu wait %.1f) mixer %.1f lm %.1f\n", pos, timing_.total_ms,
+                     timing_.part0_ms, timing_.attn_ms, timing_.part1_ms, timing_.lmhead_ms);
 }
 
 void Core::tail_logits(const float* row) {
