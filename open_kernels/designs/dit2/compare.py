@@ -7,10 +7,10 @@ if (out / "pack_h").exists():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from pack_a import unpack_a, unpack_a2
     M_, ff = ref.shape   # slots [rg][ks][crow] -> pack order [rg][crow][ks]
-    raw = np.fromfile(out / "c.bin", dtype=np.uint8).reshape(M_ // 512, ff // 64, 4, 36864)[..., :9216]
+    mt = int((out / "mt").read_text()) if (out / "mt").exists() else 128
+    raw = np.fromfile(out / "c.bin", dtype=np.uint8).reshape(M_ // (4 * mt), ff // 64, 4, 36864)[..., :72 * mt]
     raw = raw.transpose(0, 2, 1, 3).reshape(-1)
-    up = unpack_a2 if (out / "pack_h").read_text() == "hs" else unpack_a
-    c = up(raw, *ref.shape).astype(np.float64)
+    c = (unpack_a2(raw, *ref.shape, mt) if (out / "pack_h").read_text() == "hs" else unpack_a(raw, *ref.shape)).astype(np.float64)
 else:
     c = np.fromfile(out / "c.bin", dtype=bfloat16).astype(np.float64).reshape(ref.shape)
 if (out / "mask.npy").exists() and not (out / "pack_h").exists():

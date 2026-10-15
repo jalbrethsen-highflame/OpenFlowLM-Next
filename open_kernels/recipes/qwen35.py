@@ -300,6 +300,11 @@ FA_NCB = _os.environ.get("OPEN_QWEN35_FA_NCB", "1") != "0"
 # image and core code, only the instruction streams differ), which the engine takes when the
 # whole prompt fits. OPEN_QWEN35_GEMM_SMALL_M=0 off.
 GEMM_SMALL_M = int(_os.environ.get("OPEN_QWEN35_GEMM_SMALL_M", 512))
+# ... and at GEMM_TINY_M rows on 64-row core tiles (dit2 DG_MT=64: other core code, so its own
+# image, context dit2t). Data-movement bound (no-MAC time = full time), 1.31 ms at 256x5120x16384
+# against 2.37 at 512 rows; its best stack of a 0x1000-0x5800 sweep is 0x3000. OPEN_QWEN35_GEMM_TINY_M=0 off.
+GEMM_TINY_M = int(_os.environ.get("OPEN_QWEN35_GEMM_TINY_M", 256))
+_TINY_MT = 64
 
 
 def gemm_dit(spec: ModelSpec) -> dict | None:
@@ -341,6 +346,11 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
         sm = f"_m{GEMM_SMALL_M}"
         small = {"m": GEMM_SMALL_M, "kernels2": {key: name + sm for key, name in k2.items()},
                  "ffn": {"up2p": ffn["up2p"] + sm, "down2u": ffn["down2u"] + sm}}
+    tiny = None
+    if GEMM_HS and 0 < GEMM_TINY_M < (GEMM_SMALL_M or DIT_M) and ffn and "up2p" in ffn:
+        sm = f"_m{GEMM_TINY_M}"
+        tiny = {"m": GEMM_TINY_M, "mt": _TINY_MT, "kernels2": {key: name + sm for key, name in k2.items()},
+                "ffn": {"up2p": ffn["up2p"] + sm, "down2u": ffn["down2u"] + sm}}
     fa = None
     if GEMM_DIT2 and FA_MAX_LK >= DIT_M and spec.has_full and spec.head_dim == 256:
         fa = {"lk": {str(lk): f"fa256_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)},
@@ -357,6 +367,7 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             **({"fa": fa} if fa else {}),
             **({"ffn": ffn} if ffn else {}),
             **({"small": small} if small else {}),
+            **({"tiny": tiny} if tiny else {}),
             **({"kernels2": k2} if k2 else {}),
             "kernels": {f"{n}x{k}": f"dit_n{npad[n]}_k{k}" for n, k in shapes},
             "npad": {str(n): p for n, p in npad.items()},
@@ -423,6 +434,9 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         for name in names2:
             out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
             out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
+        for name in list(d.get("tiny", {}).get("kernels2", {}).values()) + list(d.get("tiny", {}).get("ffn", {}).values()):
+            out["contexts"].setdefault("dit2t", f"{name}/final.xclbin")     # 64-row tiles: its own image
+            out["kernels"][name] = {"context": "dit2t", "insts": f"{name}/insts.bin", "build": name}
         for key in ("lk", "nc"):      # the noncausal streams share the causal ones' image
             for lk, name in d.get("fa", {}).get(key, {}).items():
                 out["contexts"].setdefault("fa", f"{name}/final.xclbin")
@@ -538,6 +552,21 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             b[S["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{sm}_k{ff2}_n{spec.hidden}_au{_HS_SFX}",
                                      "env": {"DG_M": str(sm), "DG_K": str(ff2), "DG_N": str(spec.hidden),
                                              "DG_LAYOUT": _lay(a_units=True), **_HS_ENV}}
+        if "tiny" in d:
+            tm, T = d["tiny"]["m"], d["tiny"]
+            tenv = {**_HS_ENV, "DG_MT": str(T["mt"]), **({"DG_STACK": "0x3000"} if GEMM_B4 else {})}
+            tsfx = f"_mt{T['mt']}{_HS_SFX}"
+            for key, name in T["kernels2"].items():
+                n, k = (int(x) for x in key.split("x"))
+                b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{tm}_k{k}_n{d['npad'][str(n)]}{tsfx}",
+                           "env": {"DG_M": str(tm), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), "DG_LAYOUT": _lay(), **tenv}}
+            ff2 = d["ffn"]["ff"]
+            b[T["ffn"]["up2p"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{tm}_k{spec.hidden}_n{2 * ff2}_epi_ph{tsfx}",
+                                   "env": {"DG_M": str(tm), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
+                                           "DG_LAYOUT": _lay(epi={"first_cb": 0}, pack_h=True), **tenv}}
+            b[T["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{tm}_k{ff2}_n{spec.hidden}_au{tsfx}",
+                                     "env": {"DG_M": str(tm), "DG_K": str(ff2), "DG_N": str(spec.hidden),
+                                             "DG_LAYOUT": _lay(a_units=True), **tenv}}
         if "ffn" in d:
             ff, hid = d["ffn"]["ff"], spec.hidden
             b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",

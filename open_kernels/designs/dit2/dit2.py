@@ -42,7 +42,11 @@ HERE = Path(__file__).resolve().parent
 _KERNEL_SRC = HERE / "mm_dit2.cc"
 _AIE_KERNELS_INC = Path(_aie_config.cxx_header_path()) / "aie_kernels"
 
-M_T, K_T, N_T = 128, 64, 128     # per-core C tile and K step; mm_dit.cc is built for these
+# per-core C tile and K step. DG_MT=64: half-height tiles (2 of the microkernel's 32-row
+# quarters instead of 4), so one 4-row group of cores is 256 rows -- the short-prompt dispatch.
+M_T, K_T, N_T = int(os.environ.get("DG_MT", 128)), 64, 128
+assert M_T in (64, 128), M_T
+QN = M_T // 32                    # 32-row quarters per C tile
 MTK = 512                         # width of the L2 A strip
 N_COLS, N_ROWS = 8, 4
 MAX_INFLIGHT = 4                  # tile groups in flight (upstream's rotation depth)
@@ -85,7 +89,7 @@ def dit_gemm(
     B4_TILE = 4096 + 128
     B_l2_ty = np.ndarray[(B4_TILE,), np.dtype[np.uint8]] if b4 else np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
     C_l2_ty = np.ndarray[(N_ROWS * m, n), np.dtype[bfloat16]]
-    A_l1_ty = np.ndarray[(m // 4 * k // 8,), np.dtype[v8bfp16ebs8]]
+    A_l1_ty = np.ndarray[(32 * k // 8,), np.dtype[v8bfp16ebs8]]
     B_l1_ty = np.ndarray[(B4_TILE,), np.dtype[np.uint8]] if b4 else np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
     C_l1_ty = np.ndarray[(m, n), np.dtype[bfloat16]]
 
@@ -158,7 +162,7 @@ def dit_gemm(
             zero(c)
             for _ in range_(n_kb):
                 b = in_b.acquire(1)
-                for _ in range(4):
+                for _ in range(QN):
                     a = in_a.acquire(1)
                     matmul(a, b, c)
                     in_a.release(1)
@@ -180,7 +184,7 @@ def dit_gemm(
     KS = N // 128                                # the down GEMM's k steps (h width / 64)
     ldc, c_off, gap = N, 0, 0
     first_cb = epi["first_cb"] if epi else 1 << 30
-    # a_units: A in pack_h's unit slots, 4096 v8 blocks (36864 bytes) apart, 1024 used
+    # a_units: A in pack_h's unit slots, 4096 v8 blocks (36864 bytes) apart, 256 QN used
     A_ty = np.ndarray[(M // m * (K // 64) * 4096 if a_units else M * K // 8,), np.dtype[v8bfp16ebs8]]
     A_taps = TensorTiler2D.group_tiler((1, M * K // 8), (1, m * K // 8), (1, 1))
     B_ty = (np.ndarray[(N // n * (K // k) * B4_TILE,), np.dtype[np.uint8]] if b4
@@ -217,7 +221,7 @@ def dit_gemm(
                 if a_units:
                     A_prods[row].fill(a, tap=TensorAccessPattern(
                         (M // m * (K // 64) * 4096,), (rb * (K // 64) * N_ROWS + row) * 4096,
-                        [K // 64, 4, 256], [N_ROWS * 4096, 256, 1]), group=tg, wait=False)   # 256 x 9 B = 576 words
+                        [K // 64, QN, 256], [N_ROWS * 4096, 256, 1]), group=tg, wait=False)   # 256 x 9 B = 576 words
                 else:
                     A_prods[row].fill(a, tap=A_taps[rb * N_ROWS + row], group=tg, wait=False)
             for col in range(N_COLS):

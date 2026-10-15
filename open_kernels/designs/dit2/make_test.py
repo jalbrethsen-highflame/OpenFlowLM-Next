@@ -11,7 +11,8 @@ ap.add_argument("--N", type=int); ap.add_argument("--out"); ap.add_argument("--e
 ap.add_argument("--hs", action="store_true", help="the 2x2 orders of the hand-scheduled kernel (DIT_HS)")
 ap.add_argument("--pack-h", action="store_true", help="C is h packed as the down GEMM's A unit slots (needs --epi)")
 ap.add_argument("--b4", action="store_true", help="int4-mantissa weights (pack_b4); A in the 2x2 order")
-ap.add_argument("--a-units", action="store_true", help="A in pack_h's unit slots (36864 B apart, 9216 used)")
+ap.add_argument("--a-units", action="store_true", help="A in pack_h's unit slots (36864 B apart, 72 mt used)")
+ap.add_argument("--mt", type=int, default=128, help="the per-core tile height (DG_MT), hand-scheduled orders only")
 a = ap.parse_args(); M, K, N = a.M, a.K, a.N; out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
 rng = np.random.default_rng(0)
 A = rng.standard_normal((M, K)).astype(np.float32) * np.exp(rng.standard_normal((M, 1))).astype(np.float32)
@@ -20,17 +21,18 @@ if a.epi:
     from pack import interleave_swiglu
     B = interleave_swiglu(B)
 if a.b4:
-    pa, pb = pack_a2(A), pack_b4(B)
-    ref = unpack_a2(pa, M, K) @ unpack_b4(pb, K, N)
+    pa, pb = pack_a2(A, a.mt), pack_b4(B)
+    ref = unpack_a2(pa, M, K, a.mt) @ unpack_b4(pb, K, N)
 elif a.hs:
-    pa, pb = pack_a2(A), pack_b2(B)
-    ref = unpack_a2(pa, M, K) @ unpack_b2(pb, K, N)
+    pa, pb = pack_a2(A, a.mt), pack_b2(B)
+    ref = unpack_a2(pa, M, K, a.mt) @ unpack_b2(pb, K, N)
 else:
     pa, pb = pack_a(A), pack_b(B)
     ref = unpack_a(pa, M, K) @ unpack_b(pb, K, N)
 if a.a_units:
-    u = pa.reshape(M // 512, 4, K // 64, 9216).transpose(0, 2, 1, 3).reshape(-1, 9216)   # slots [rg][ks][crow]
-    pa = np.zeros((u.shape[0], 36864), np.uint8); pa[:, :9216] = u; pa = pa.reshape(-1)
+    ub = 72 * a.mt
+    u = pa.reshape(M // (4 * a.mt), 4, K // 64, ub).transpose(0, 2, 1, 3).reshape(-1, ub)   # slots [rg][ks][crow]
+    pa = np.zeros((u.shape[0], 36864), np.uint8); pa[:, :ub] = u; pa = pa.reshape(-1)
 pa.tofile(out / "a.bin"); pb.tofile(out / "b.bin")
 if a.epi:   # columns 0..63 of every 128 become silu(gate) * up; compare those only
     r3 = ref.reshape(M, N // 128, 128).copy()
@@ -41,8 +43,9 @@ if a.epi:   # columns 0..63 of every 128 become silu(gate) * up; compare those o
 if a.pack_h:   # h = the first 64 of every 128 columns, the comparison decodes the packed C
     ref = ref.reshape(M, N // 128, 128)[:, :, :64].reshape(M, N // 2)
     (out / "pack_h").write_text("hs" if a.hs or a.b4 else "4x1")
+(out / "mt").write_text(str(a.mt))
 np.save(out / "ref.npy", ref.astype(np.float32))
 b = Path(a.build)
-cb = M // 128 * (N // 128) * 36864 if a.pack_h else M * N * 2
+cb = M // a.mt * (N // 128) * 36864 if a.pack_h else M * N * 2
 (out / "run.cfg").write_text(f"device\nxclbin G {b}/final.xclbin\nkernelx k G {b}/insts.bin\nbuf a {pa.size} a.bin\n"
                              f"buf b {pb.size} b.bin\nbuf c {cb}\nrun k a b c\nrun k a b c\ndump c c.bin {cb}\n")

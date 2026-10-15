@@ -171,9 +171,9 @@ __attribute__((section(".data"))) int oflm_dit_quarter = 0;
 
 #ifdef DIT_B4
 void dit_matmul_quarter(bfp16ebs8 *__restrict pA, uint8_t *__restrict pB, bfloat16 *__restrict pC) {
-  constexpr int m = DIM_M / 4, n = DIM_N;
+  constexpr int m = 32, n = DIM_N;   // one quarter's rows
   bfloat16 *pCq = pC + oflm_dit_quarter * m * n;
-  oflm_dit_quarter = (oflm_dit_quarter + 1) & 3;
+  oflm_dit_quarter = (oflm_dit_quarter + 1) % (DIM_M / 32);
 #ifdef DIT_NULL_MM
   return;
 #endif
@@ -185,10 +185,10 @@ void dit_matmul_quarter(bfp16ebs8 *__restrict pA, uint8_t *__restrict pB, bfloat
 void dit_matmul_quarter(bfp16ebs8 *__restrict pA, bfp16ebs8 *__restrict pB,
                       bfloat16 *__restrict pC) {
   constexpr int r = 8, s = 8, t = 8;
-  constexpr int m = DIM_M / 4, k = DIM_K, n = DIM_N;
+  constexpr int m = 32, k = DIM_K, n = DIM_N;   // one quarter's rows
   static_assert(m % (2 * r) == 0 && k % s == 0 && n % (2 * t) == 0);
   bfloat16 *pCq = pC + oflm_dit_quarter * m * n;
-  oflm_dit_quarter = (oflm_dit_quarter + 1) & 3;
+  oflm_dit_quarter = (oflm_dit_quarter + 1) % (DIM_M / 32);
 #ifdef DIT_NULL_MM
   return;
 #endif
@@ -254,7 +254,7 @@ void dit_swiglu_epi(bfloat16 *__restrict c, int32_t *__restrict rtp, int32_t t) 
   // GEMM reads those bytes (a_units). Quarter by quarter through a scratch: quarter q's 2304 bytes land on
   // quarters <= q, which are done.
   alignas(64) static uint8_t scr[32 * 72];   // one quarter's 32 blocks (a bfp16ebs8 is one byte)
-  for (int q = 0; q < 4 && rtp[4]; q++) {
+  for (int q = 0; q < DIM_M / 32 && rtp[4]; q++) {
     aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(reinterpret_cast<bfp16ebs8 *>(scr));
     for (int j = 0; j < 32; j++) {
 #if defined(DIT_HS) || defined(DIT_B4)   // the 2x2 A order both hand kernels read

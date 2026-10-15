@@ -112,20 +112,21 @@ inline void bfp_encode8(const float* v, uint8_t* blk) {
 // bfp16ebs8 block. Rows past `rows` are zeros.
 // hs (manifest gemm_dit.hs, the hand-scheduled 2x2 microkernel): inside each quarter, row-block
 // pairs, each [k-block 8][the pair's 2 row blocks] (pack_a.py order2) instead of [k-block][row-block].
-void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out, bool hs = false) {
-    const size_t KS = K / 64;
-    const long long units = static_cast<long long>(M / 512 * 4 * KS);
+// mt: the per-core tile height (dit2 DG_MT, 128 or 64 under hs), mt / 32 quarters a unit
+void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out, bool hs = false, size_t mt = 128) {
+    const size_t KS = K / 64, qn = mt / 32;
+    const long long units = static_cast<long long>(M / mt * KS);
 #pragma omp parallel for
     for (long long uu = 0; uu < units; ++uu) {
         const size_t u = static_cast<size_t>(uu), ks = u % KS, rc = u / KS;   // rc = rg * 4 + crow
-        uint8_t* o = out + u * (4 * 8 * 4 * 8 * 9);
+        uint8_t* o = out + u * (qn * 8 * 4 * 8 * 9);
         float zero[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        for (size_t q = 0; q < 4; ++q)
+        for (size_t q = 0; q < qn; ++q)
             for (size_t j = 0; j < 32; ++j)
                 for (size_t i = 0; i < 8; ++i) {
                     // j walks [k-block 8][row-block 4], or under hs [pair 2][k-block 8][2]
                     const size_t kb = hs ? (j / 2) % 8 : j / 4, rb = hs ? (j / 16) * 2 + j % 2 : j % 4;
-                    const size_t r = rc * 128 + q * 32 + rb * 8 + i, k0 = ks * 64 + kb * 8;
+                    const size_t r = rc * mt + q * 32 + rb * 8 + i, k0 = ks * 64 + kb * 8;
                     bfp_encode8_avx2(r < rows ? x + r * K + k0 : zero, o);
                     o += 9;
                 }
@@ -677,9 +678,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
             if (v.is_string()) wanted[v.get<std::string>()] = true;
     if (man_.gemm_dit.contains("kernels2"))
         for (const auto& [shape, k] : man_.gemm_dit["kernels2"].items()) wanted[k.get<std::string>()] = true;
-    if (man_.gemm_dit.contains("small"))
-        for (const char* key : {"kernels2", "ffn"})
-            for (const auto& [shape, k] : man_.gemm_dit["small"][key].items()) wanted[k.get<std::string>()] = true;
+    for (const char* tier : {"small", "tiny"})
+        if (man_.gemm_dit.contains(tier))
+            for (const char* key : {"kernels2", "ffn"})
+                for (const auto& [shape, k] : man_.gemm_dit[tier][key].items()) wanted[k.get<std::string>()] = true;
     if (man_.gemm_dit.contains("fa"))
         for (const char* key : {"lk", "nc", "ncb"})
             if (man_.gemm_dit["fa"].contains(key))
@@ -3425,20 +3427,26 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // OFLM_OPEN_SMALL_M=0 off. Its FFN is the device-packed one only.
     static const bool small_on = [] { const char* e = std::getenv("OFLM_OPEN_SMALL_M"); return !(e && *e == '0'); }();
     static const size_t small_max = [] { const char* e = std::getenv("OFLM_OPEN_SMALL_MAX"); return e ? std::strtoul(e, nullptr, 10) : 2048ul; }();
+    // gemm_dit.tiny: the same at its M on 64-row core tiles (its own image) up to OFLM_OPEN_TINY_MAX
+    // tokens (default 256: one chunk, the 512-row result bit for bit, d3 median 0.96 -> 0.69 s;
+    // two chunks for 257-512 only -4 %); OFLM_OPEN_TINY_MAX=0 off
+    static const size_t tiny_max = [] { const char* e = std::getenv("OFLM_OPEN_TINY_MAX"); return e ? std::strtoul(e, nullptr, 10) : 256ul; }();
     static const bool small_ffn = [] { const char* e = std::getenv("OFLM_OPEN_FFN_DEVICE"); return !(e && *e == '0'); }();
     const nlohmann::json* Dp = &man_.gemm_dit;
     nlohmann::json Dsmall;
-    if (small_on && small_ffn && dit_hs_ && Dp->contains("small") &&
-        static_cast<size_t>(pos_) + ids.size() <= small_max) {
-        const nlohmann::json& S = (*Dp)["small"];
+    const size_t want = static_cast<size_t>(pos_) + ids.size();
+    const char* tier = Dp->contains("tiny") && want <= tiny_max ? "tiny" : Dp->contains("small") && want <= small_max ? "small" : nullptr;
+    if (small_on && small_ffn && dit_hs_ && tier) {
+        const nlohmann::json& S = (*Dp)[tier];
         Dsmall = *Dp;
         Dsmall["m"] = S["m"];
+        Dsmall["mt"] = S.value("mt", 128);
         Dsmall["kernels2"] = S["kernels2"];
         for (const auto& [k, v] : S["ffn"].items()) Dsmall["ffn"][k] = v;
         Dp = &Dsmall;
     }
     const nlohmann::json& D = *Dp;
-    const size_t M = D["m"].get<size_t>(), hid = man_.hidden, N = ids.size();
+    const size_t M = D["m"].get<size_t>(), MT = D.value("mt", size_t{128}), hid = man_.hidden, N = ids.size();
     const size_t C = (N + M - 1) / M, TOT = C * M, L = static_cast<size_t>(nl_);
     if (static_cast<size_t>(pos_) + N > cfg_.max_ctx)
         throw std::runtime_error("open_qwen36: prompt of " + std::to_string(N) + " at position " + std::to_string(pos_) +
@@ -3575,7 +3583,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         for (const char* nm : {"fab_k0", "fab_k1", "fab_v0", "fab_v1"})
             need(nm, fab_kvh * (lkn / 64) * kFabChunk);
     need("pp_h", M * 2 * ff * 2);
-    if (ffn_dev) need("pp_hu", M / 128 * (ff / 64) * 36864);   // h unit slots, one NPU step uses and frees them
+    if (ffn_dev) need("pp_hu", M / MT * (ff / 64) * 36864);   // h unit slots, one NPU step uses and frees them
     // Each layer's cells walk a list of operations, host (even index) and NPU (odd) alternating.
     enum Op { PRE, QKV, MID, FAT, GATE, OUT, TAIL, UP, HPACK, DOWN, RES };
     std::vector<std::vector<int>> ops(L);
@@ -3761,7 +3769,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     auto to_bfp2 = [&](const float* src, size_t w, const std::string& buf, size_t rows) {
         // rows past `rows` (the chunk's padding) go in as zeros
         xrt::bo& b = buffer(buf, 0);
-        dit2_pack_a(src, rows, M, w, b.map<uint8_t*>(), dit_hs_);
+        dit2_pack_a(src, rows, M, w, b.map<uint8_t*>(), dit_hs_, MT);
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * w * 9 / 8, 0);
     };
     std::vector<float> ya, yb, yc, yd, og, hf;
