@@ -712,6 +712,9 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
             if (v.is_string()) wanted[v.get<std::string>()] = true;
     if (man_.gemm_dit.contains("kernels2"))
         for (const auto& [shape, k] : man_.gemm_dit["kernels2"].items()) wanted[k.get<std::string>()] = true;
+    if (man_.gemm_dit.contains("small"))
+        for (const char* key : {"kernels2", "ffn"})
+            for (const auto& [shape, k] : man_.gemm_dit["small"][key].items()) wanted[k.get<std::string>()] = true;
     if (man_.gemm_dit.contains("fa"))
         for (const char* key : {"lk", "nc", "ncb"})
             if (man_.gemm_dit["fa"].contains(key))
@@ -3591,7 +3594,25 @@ bool Core::pipe_ok() const {
 void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     auto t0 = std::chrono::steady_clock::now();
     timing_ = StepTiming{};
-    const auto& D = man_.gemm_dit;
+    // gemm_dit.small: a prompt of up to OFLM_OPEN_SMALL_MAX tokens (default 1023: below the NPU
+    // attention, whose streams take full chunks) runs in chunks of the small M on its own GEMM
+    // streams -- fewer padded rows, and from two chunks on the host and NPU overlap.
+    // OFLM_OPEN_SMALL_M=0 off. Its FFN is the device-packed one only.
+    static const bool small_on = [] { const char* e = std::getenv("OFLM_OPEN_SMALL_M"); return !(e && *e == '0'); }();
+    static const size_t small_max = [] { const char* e = std::getenv("OFLM_OPEN_SMALL_MAX"); return e ? std::strtoul(e, nullptr, 10) : 1023ul; }();
+    static const bool small_ffn = [] { const char* e = std::getenv("OFLM_OPEN_FFN_DEVICE"); return !(e && *e == '0'); }();
+    const nlohmann::json* Dp = &man_.gemm_dit;
+    nlohmann::json Dsmall;
+    if (small_on && small_ffn && dit_hs_ && Dp->contains("small") &&
+        static_cast<size_t>(pos_) + ids.size() <= small_max) {
+        const nlohmann::json& S = (*Dp)["small"];
+        Dsmall = *Dp;
+        Dsmall["m"] = S["m"];
+        Dsmall["kernels2"] = S["kernels2"];
+        for (const auto& [k, v] : S["ffn"].items()) Dsmall["ffn"][k] = v;
+        Dp = &Dsmall;
+    }
+    const nlohmann::json& D = *Dp;
     const size_t M = D["m"].get<size_t>(), hid = man_.hidden, N = ids.size();
     const size_t C = (N + M - 1) / M, TOT = C * M, L = static_cast<size_t>(nl_);
     if (static_cast<size_t>(pos_) + N > cfg_.max_ctx)
@@ -3653,7 +3674,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     static const bool ncb_on = [] { const char* e = std::getenv("OFLM_OPEN_FA_NCB"); return !(e && *e == '0'); }();
     bool nc_b = false;
     size_t lkn = 0;
-    if (noncausal_ && !packed && fa_on && D.contains("fa") && D["fa"].contains("nc")) {
+    const bool full_m = M == man_.gemm_dit["m"].get<size_t>();     // the attention streams' query rows
+    if (noncausal_ && !packed && fa_on && full_m && D.contains("fa") && D["fa"].contains("nc")) {
         static const size_t nc_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_NC_MIN"); return e ? std::strtoul(e, nullptr, 10) : 1024ul; }();
         const std::string lk = std::to_string((pos0 + N + M - 1) / M * M);
         lkn = std::stoul(lk);
@@ -3696,7 +3718,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         }
     auto fa_kernel = [&](size_t c) -> std::string {
         const size_t lk = pos0 + (c + 1) * M;
-        if (!fa_on || lk < fa_min || !FA.contains(std::to_string(lk))) return {};
+        if (!fa_on || !full_m || lk < fa_min || !FA.contains(std::to_string(lk))) return {};
         return FA[std::to_string(lk)].get<std::string>();
     };
     // per chunk device buffers (named globals, so start_run binds them), kept across requests
@@ -3911,9 +3933,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         for (long long i = 0; i < static_cast<long long>(rows * w); ++i) d[i] = f32_to_bf16(src[i] * scale);
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE, rows * w * 2, 0);
     };
-    auto to_bfp2 = [&](const float* src, size_t w, const std::string& buf) {
+    auto to_bfp2 = [&](const float* src, size_t w, const std::string& buf, size_t rows) {
+        // rows past `rows` (the chunk's padding) go in as zeros
         xrt::bo& b = buffer(buf, 0);
-        dit2_pack_a(src, M, M, w, b.map<uint8_t*>(), dit_hs_);
+        dit2_pack_a(src, rows, M, w, b.map<uint8_t*>(), dit_hs_);
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * w * 9 / 8, 0);
     };
     std::vector<float> ya, yb, yc, yd, og, hf;
@@ -3947,15 +3970,15 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             float* xc = xn.data() + r0 * hid;
             auto th = std::chrono::steady_clock::now();
             if (op == PRE) {
-                host::rmsnorm_rows(xr, M, hid, hc.ln.data(), gb.eps, xc);
+                host::rmsnorm_rows(xr, t_real, hid, hc.ln.data(), gb.eps, xc);
                 const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
-                if (has2(nq, hid)) to_bfp2(xc, hid, "pp_a2_" + cs);
+                if (has2(nq, hid)) to_bfp2(xc, hid, "pp_a2_" + cs, t_real);
                 else to_bf16(xc, M, hid, "pp_a_" + cs);
             } else if (op == MID) {
                 xrt::bo& qb = buffer("pp_q_" + cs, 0);
                 const bool lin = gb.kind == "linear";
                 const size_t nq = lin ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
-                read_back(qb, M * nq * 2, 0);
+                read_back(qb, t_real * nq * 2, 0);
                 const uint16_t* q16 = qb.map<const uint16_t*>();
                 xrt::bo& st = state_[l];
                 uint8_t* sp = st.map<uint8_t*>();
@@ -3966,7 +3989,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     yb.resize(M * vw);
                     og.resize(M * vw);
 #pragma omp parallel for
-                    for (long long t = 0; t < static_cast<long long>(M); ++t) {
+                    for (long long t = 0; t < static_cast<long long>(t_real); ++t) {
                         for (size_t i = 0; i < nch; ++i) ya[t * nch + i] = bf16_to_f32(q16[t * nq + i]);
                         for (size_t i = 0; i < vw; ++i) yb[t * vw + i] = bf16_to_f32(q16[t * nq + nch + i]);
                     }
@@ -3983,7 +4006,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     timing_.dn_conv_ms += ph[0];
                     timing_.dn_rule_ms += ph[1];
                     if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
-                    if (has2(hid, vw)) to_bfp2(og.data(), vw, "pp_m2_" + cs);
+                    if (has2(hid, vw)) to_bfp2(og.data(), vw, "pp_m2_" + cs, t_real);
                     else to_bf16(og.data(), M, vw, "pp_m_" + cs);
                 } else {
                     const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
@@ -3991,7 +4014,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     if (c == 0 && pos0 > 0) read_back(st, pos0 * row, 0);
                     ya.resize(M * qw); yb.resize(M * kvw); yc.resize(M * kvw); yd.resize(M * qw); og.resize(M * qw);
 #pragma omp parallel for
-                    for (long long t = 0; t < static_cast<long long>(M); ++t) {
+                    for (long long t = 0; t < static_cast<long long>(t_real); ++t) {
                         const uint16_t* r = q16 + t * nq;
                         for (size_t i = 0; i < qw; ++i) ya[t * qw + i] = bf16_to_f32(r[i]);
                         for (size_t i = 0; i < kvw; ++i) yb[t * kvw + i] = bf16_to_f32(r[qw + i]);
@@ -4051,7 +4074,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         host::attention_block(g, ya.data(), yb.data(), yc.data(), yd.data(), hc.qn.data(), hc.kn.data(),
                                               man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
                         timing_.attn_ms += ms_since(ta);
-                        if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs);
+                        if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs, t_real);
                         else to_bf16(og.data(), M, qw, "pp_m_" + cs);
                         if (ops[l].size() > 9) advance = 3;     // no NPU attention for this chunk: past FAT and GATE
                     } else {
@@ -4101,22 +4124,22 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 timing_.attn_ms += ms_since(ta);
                 const uint16_t* q16 = buffer("pp_q_" + cs, 0).map<const uint16_t*>();
 #pragma omp parallel for
-                for (long long t = 0; t < static_cast<long long>(M); ++t)
+                for (long long t = 0; t < static_cast<long long>(t_real); ++t)
                     for (size_t i = 0; i < qw; ++i)
                         og[t * qw + i] = static_cast<size_t>(t) < t_real
                                              ? og[t * qw + i] / (1.f + std::exp(-bf16_to_f32(q16[t * nq + qw + 2 * kvw + i]))) : 0.f;
-                if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs);
+                if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs, t_real);
                 else to_bf16(og.data(), M, qw, "pp_m_" + cs);
             } else if (op == GATE) {
                 // og = O * sigmoid(gate), gate from the qkv GEMM's C (still this chunk's)
                 const size_t qw = gb.qw, kvw = gb.kvw, nq = 2 * qw + 2 * kvw;
                 xrt::bo& ob = buffer("fa_o_" + cs, 0);
-                read_back(ob, M * qw * 2, 0);
+                read_back(ob, t_real * qw * 2, 0);
                 const uint16_t* o16 = ob.map<const uint16_t*>();
                 const uint16_t* q16 = buffer("pp_q_" + cs, 0).map<const uint16_t*>();
                 og.resize(M * qw);
 #pragma omp parallel for
-                for (long long t = 0; t < static_cast<long long>(M); ++t)
+                for (long long t = 0; t < static_cast<long long>(t_real); ++t)
                     for (size_t i = 0; i < qw; ++i) {
                         const float gt = bf16_to_f32(q16[t * nq + qw + 2 * kvw + i]);
                         og[t * qw + i] = static_cast<size_t>(t) < t_real ? bf16_to_f32(o16[t * qw + i]) / (1.f + std::exp(-gt)) : 0.f;
@@ -4137,16 +4160,16 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     std::fprintf(stderr, "fa_check layer %zu chunk %zu: rel_fro %.3e worst row %zu (pos %zu) rel %.3e\n", l, c,
                                  std::sqrt(num / den), wr, pos0 + r0 + wr, worst);
                 }
-                if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs);
+                if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs, t_real);
                 else to_bf16(og.data(), M, qw, "pp_m_" + cs);
             } else if (op == TAIL) {
                 xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
-                read_back(yb2, M * hid * 2, 0);
+                read_back(yb2, t_real * hid * 2, 0);
                 const uint16_t* y16 = yb2.map<const uint16_t*>();
 #pragma omp parallel for
-                for (long long i = 0; i < static_cast<long long>(M * hid); ++i) rs[i] = xr[i] + bf16_to_f32(y16[i]);
-                host::rmsnorm_rows(rs, M, hid, hc.postln.data(), gb.eps, xc);
-                if (up2) to_bfp2(xc, hid, "pp_a2_" + cs);
+                for (long long i = 0; i < static_cast<long long>(t_real * hid); ++i) rs[i] = xr[i] + bf16_to_f32(y16[i]);
+                host::rmsnorm_rows(rs, t_real, hid, hc.postln.data(), gb.eps, xc);
+                if (up2) to_bfp2(xc, hid, "pp_a2_" + cs, t_real);
                 else to_bf16(xc, M, hid, "pp_a_" + cs);
             } else if (op == HPACK) {
                 // h = the first 64 of every 128 columns of the up GEMM's C, packed as dit2's A
@@ -4157,13 +4180,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
 #pragma omp parallel for
                 for (long long r = 0; r < static_cast<long long>(M); ++r)
                     for (size_t j = 0; j < ff; ++j) hf[r * ff + j] = bf16_to_f32(h16[r * 2 * ff + (j / 64) * 128 + j % 64]);
-                to_bfp2(hf.data(), ff, "pp_d2_" + cs);
+                to_bfp2(hf.data(), ff, "pp_d2_" + cs, M);
             } else {   // RES
                 xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
-                read_back(yb2, M * hid * 2, 0);
+                read_back(yb2, t_real * hid * 2, 0);
                 const uint16_t* y16 = yb2.map<const uint16_t*>();
 #pragma omp parallel for
-                for (long long i = 0; i < static_cast<long long>(M * hid); ++i) xr[i] = rs[i] += bf16_to_f32(y16[i]);
+                for (long long i = 0; i < static_cast<long long>(t_real * hid); ++i) xr[i] = rs[i] += bf16_to_f32(y16[i]);
             }
             hst[op] += ms_since(th);
             {

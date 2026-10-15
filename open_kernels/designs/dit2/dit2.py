@@ -46,6 +46,10 @@ M_T, K_T, N_T = 128, 64, 128     # per-core C tile and K step; mm_dit.cc is buil
 MTK = 512                         # width of the L2 A strip
 N_COLS, N_ROWS = 8, 4
 MAX_INFLIGHT = 4                  # tile groups in flight (upstream's rotation depth)
+# FIFO depths (experiments): A and B in L1, A in L2
+A1_DEPTH = int(os.environ.get("DG_A1_DEPTH", 2))
+B1_DEPTH = int(os.environ.get("DG_B1_DEPTH", 2))
+A2_DEPTH = int(os.environ.get("DG_A2_DEPTH", 2))
 
 
 RTP_TILES, RTP_KB, RTP_COL_GROUPS, RTP_EPI_FIRST, RTP_PACK = range(5)
@@ -103,9 +107,9 @@ def dit_gemm(
     # PROBE: A pre-arranged on the host in consumption order, so a linear copy like B.
     A_l3l2, A_l2l1 = [], []
     for row in range(N_ROWS):
-        f = ObjectFifo(A_l2_ty, name=f"A_L3L2_{row}", depth=2)
+        f = ObjectFifo(A_l2_ty, name=f"A_L3L2_{row}", depth=A2_DEPTH)
         A_l3l2.append(f)
-        A_l2l1.append(f.cons().forward(obj_type=A_l1_ty, name=f"A_L2L1_{row}", depth=2))
+        A_l2l1.append(f.cons().forward(obj_type=A_l1_ty, name=f"A_L2L1_{row}", depth=A1_DEPTH))
 
     # B: one shim per column -> memtile -> the 4 cores of that column. Pre-packed on the
     # host, so this is a linear copy.
@@ -113,7 +117,7 @@ def dit_gemm(
     for col in range(N_COLS):
         f = ObjectFifo(B_l2_ty, name=f"B_L3L2_{col}", depth=2)
         B_l3l2.append(f)
-        B_l2l1.append(f.cons().forward(obj_type=B_l1_ty, name=f"B_L2L1_{col}", depth=2))
+        B_l2l1.append(f.cons().forward(obj_type=B_l1_ty, name=f"B_L2L1_{col}", depth=B1_DEPTH))
 
     # C: the 4 cores of a column join at the memtile, which writes row-major out -- or, with
     # pack_h, each core's tile (h packed at the start of its stream by the epilogue, RTP_PACK: a 128 x 64 unit
