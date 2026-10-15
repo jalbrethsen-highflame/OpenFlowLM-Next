@@ -14,6 +14,8 @@ from pack_fa import QSCALE, round_cols, round_rows
 D, HEADS, KVH = 256, 24, 4
 out = Path(sys.argv[1]); r = np.load(out / "ref.npz")
 q, k, v, valid = r["q"], r["k"], r["v"], int(r["valid"])
+causal = int(r["causal"]) if "causal" in r.files else 0
+q_off = int(r["q_off"]) if "q_off" in r.files else 0
 L = q.shape[0]
 o = np.fromfile(sys.argv[2] if len(sys.argv) > 2 else out / "o.bin", dtype=bfloat16).astype(np.float64).reshape(L, HEADS * D)
 
@@ -23,6 +25,8 @@ def attention(qf, kf, vf):
     for h in range(HEADS):
         g = h // (HEADS // KVH)
         s = qf[:, h].astype(np.float64) @ kf[:valid, g].astype(np.float64).T / np.sqrt(D)
+        if causal:   # row i is position q_off + i: keys past it masked
+            s = np.where(np.arange(valid)[None, :] > (q_off + np.arange(L))[:, None], -np.inf, s)
         s = np.exp(s - s.max(1, keepdims=True)); s /= s.sum(1, keepdims=True)
         ref[:, h * D:(h + 1) * D] = s @ vf[:valid, g]
     return ref

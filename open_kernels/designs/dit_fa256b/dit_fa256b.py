@@ -68,6 +68,7 @@ def dit_fa256b(
     L: CompileTime[int], heads: CompileTime[int], kv_heads: CompileTime[int] = 0,
     lk: CompileTime[int] = 0, o_ld: CompileTime[int] = 0, o_col: CompileTime[int] = 0,
     valid_len: CompileTime[int] = 0,
+    causal: CompileTime[int] = 0, q_off: CompileTime[int] = 0, kv_inter: CompileTime[int] = 0,
 ):
     kv_heads = kv_heads or heads
     lk = lk or L
@@ -267,9 +268,9 @@ def dit_fa256b(
             buf[RTP_PASSES] = n_pass
             buf[RTP_CHUNKS] = n_chunks
             buf[RTP_VALID] = valid_len
-            buf[RTP_CAUSAL] = 0
+            buf[RTP_CAUSAL] = causal       # the queries are positions q_off .. q_off + L - 1 of the keys
             buf[RTP_ROW0] = i * TQ
-            buf[RTP_QOFF] = 0
+            buf[RTP_QOFF] = q_off
         for b in barriers.values():
             b.set(1)
 
@@ -284,14 +285,17 @@ def dit_fa256b(
                     half = CORES // 2 * Q_CORE
                     for prods, off in ((a_prods, 0), (b_prods, half)):
                         prods[g].fill(q, offset=qbase + off, sizes=[half // W, W], strides=[W, 1], group=tg)
-                    kvbase = kvh * n_chunks * CHUNK
+                    # kv_inter: K / V as [chunk][kv head], so one buffer serves every lk (the causal
+                    # prompt's per-layer K / V; each chunk's kernel reads the first lk / 64 chunks)
+                    kvbase = kvh * CHUNK if kv_inter else kvh * n_chunks * CHUNK
+                    kv_step = kv_heads * CHUNK if kv_inter else CHUNK
                     if "nokv" in _EXPT:
                         pass
                     else:
                       a_prods[g].fill(k, offset=kvbase, sizes=[n_chunks, CHUNK // W, W],
-                                    strides=[CHUNK, W, 1], group=tg)
+                                    strides=[kv_step, W, 1], group=tg)
                       b_prods[g].fill(v, offset=kvbase, sizes=[n_chunks, CHUNK // W, W],
-                                    strides=[CHUNK, W, 1], group=tg)
+                                    strides=[kv_step, W, 1], group=tg)
                     for cc in range(GROUP_COLS):
                         col = g * GROUP_COLS + cc
                         row0 = p * QROWS_PASS + cc * N_ROWS * TQ
@@ -320,5 +324,8 @@ SPECIALIZE = dict(
     lk=int(os.environ.get("DF_LK", 1024)),
     # the engine patches DF_VALID (a sentinel word) to the prompt's length in the stream
     valid_len=int(os.environ.get("DF_VALID", 0)),
+    causal=int(os.environ.get("DF_CAUSAL", 0)),
+    q_off=int(os.environ.get("DF_QOFF", 0)),
+    kv_inter=int(os.environ.get("DF_KV_INTER", 0)),
     o_ld=int(os.environ.get("DF_O_LD", 0)),
 )

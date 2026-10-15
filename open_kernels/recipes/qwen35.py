@@ -296,6 +296,10 @@ FA_NC_VALID = 0x7A11D5EE
 # (~3.4x dit_fa256's nc stream); the engine packs Q, K and V^T in its pop order. Same lengths and
 # valid_len sentinel. OPEN_QWEN35_FA_NCB=0 off.
 FA_NCB = _os.environ.get("OPEN_QWEN35_FA_NCB", "1") != "0"
+# The same kernel causal (DF_CAUSAL, queries = the last DIT_M positions of lk keys; chunks past a
+# core's rows skipped, the diagonal masked): the causal prompt's attention, ~3x dit_fa256's.
+# OPEN_QWEN35_FA_CB=0 off.
+FA_CB = _os.environ.get("OPEN_QWEN35_FA_CB", "1") != "0"
 # Short prompts: the pipe's dit2 GEMMs again at GEMM_SMALL_M rows (one 512-row group; the same
 # image and core code, only the instruction streams differ), which the engine takes when the
 # whole prompt fits. OPEN_QWEN35_GEMM_SMALL_M=0 off.
@@ -406,6 +410,8 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
         if FA_NCB:
             fa["ncb"] = {str(lk): f"fa256b_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)}
             fa["nc_valid"] = FA_NC_VALID
+        if FA_CB:
+            fa["cb"] = {str(lk): f"fa256bc_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)}
     return {"m": DIT_M,
             **({"hs": True} if GEMM_HS and k2 else {}),
             **({"b4": True} if GEMM_B4 and k2 else {}),
@@ -492,7 +498,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             for lk, name in d.get("fa", {}).get(key, {}).items():
                 out["contexts"].setdefault("fa", f"{name}/final.xclbin")
                 out["kernels"][name] = {"context": "fa", "insts": f"{name}/insts.bin", "build": name}
-        for lk, name in d.get("fa", {}).get("ncb", {}).items():   # dit_fa256b: its own image
+        for lk, name in list(d.get("fa", {}).get("ncb", {}).items()) + list(d.get("fa", {}).get("cb", {}).items()):   # dit_fa256b: its own image
             out["contexts"].setdefault("fab", f"{name}/final.xclbin")
             out["kernels"][name] = {"context": "fab", "insts": f"{name}/insts.bin", "build": name}
         if "fa" in d:
@@ -569,6 +575,10 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             b[name] = {"design": "dit_fa256/dit_fa256.py", "build_dir": f"dit_fa256/build_l{DIT_M}_lk{lk}_fix_nc",
                        "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": "0", "DF_EXP_FIX": "1",
                                "DF_CAUSAL": "0", "DF_VALID": str(FA_NC_VALID),
+                               "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
+        for lk, name in d.get("fa", {}).get("cb", {}).items():
+            b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{DIT_M}_lk{lk}_causal_kvi",
+                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_CAUSAL": "1", "DF_QOFF": str(int(lk) - DIT_M), "DF_KV_INTER": "1",
                                "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
         for lk, name in d.get("fa", {}).get("ncb", {}).items():
             b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{DIT_M}_lk{lk}",

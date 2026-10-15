@@ -580,10 +580,27 @@ void apply_mask(bfloat16 *__restrict g, int32_t *__restrict rtp, int32_t pass,
     int32_t bound = valid_len;
     if (causal && row0 + row + 1 < bound)
       bound = row0 + row + 1;
+    // keys [kept, LKP) of this row masked: whole 8-key blocks as two 64-bit stores, the one
+    // partial block element by element (the per-element loop was ~half the causal kernel's time)
+    int32_t kept = bound - col0;
+    if (kept >= LKP)
+      continue;
+    if (kept < 0)
+      kept = 0;
     bfloat16 *__restrict p = g + (row / 8) * 64 + (row % 8) * 8;
-    for (int j = 0; j < LKP; j++)
-      if (col0 + j >= bound)
-        p[(j / 8) * BLOCK_STRIDE + (j % 8)] = ninf;
+    const int32_t jb0 = kept / 8;
+    for (int32_t j = kept; j < (jb0 + 1) * 8 && j < LKP; j++)
+      p[jb0 * BLOCK_STRIDE + (j % 8)] = ninf;
+    uint64_t pat;
+    {
+      bfloat16 n4[4] = {ninf, ninf, ninf, ninf};
+      __builtin_memcpy(&pat, n4, 8);
+    }
+    for (int32_t jb = jb0 + 1; jb < LKP / 8; jb++) {
+      uint64_t *q8 = reinterpret_cast<uint64_t *>(p + jb * BLOCK_STRIDE);
+      q8[0] = pat;
+      q8[1] = pat;
+    }
   }
 }
 
@@ -701,7 +718,9 @@ void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
 void sm_all(bfloat16 *__restrict g, bfloat16 *__restrict up, float *__restrict sp,
             bfloat16 *__restrict gp, uint8_t *__restrict p, int32_t *__restrict rtp, int32_t pass,
             int32_t chunk) {
-  if (fa_dead(rtp, chunk)) {   // fa_qkpv runs pv on it unchecked: P zero adds nothing
+  // past valid_len, or (causal) past every one of this core's rows: fa_qkpv runs pv on it
+  // unchecked, so P zero adds nothing
+  if (fa_dead(rtp, chunk) || fa_skip(rtp, pass, chunk)) {
     for (int i = 0; i < TQ * LKP * 9 / 8; i += 64)
       aie::store_v(p + i, aie::zeros<uint8_t, 64>());
     return;
@@ -709,7 +728,9 @@ void sm_all(bfloat16 *__restrict g, bfloat16 *__restrict up, float *__restrict s
 #if FA_HS
   // flat (one frame, no nested calls but the asm and the rare path): sm_exp + softmax_step
   const int32_t valid = rtp[3];
-  if ((chunk + 1) * LKP > valid)          // the chunk valid_len cuts: mask its tail keys
+  // the chunk valid_len cuts, or (causal) one that may cross a row's diagonal: apply_mask returns
+  // at once when no key of it is masked
+  if ((chunk + 1) * LKP > valid || rtp[4])
     apply_mask(g, rtp, pass, chunk);
   SET_ROUNDING();
   fa_exp_call(g, s_ones, p, s_rs);
