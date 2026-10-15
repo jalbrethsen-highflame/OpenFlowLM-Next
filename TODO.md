@@ -64,10 +64,28 @@ Tried and left off (switches kept):
       d3's work, so the crossover to 1024-row chunks is probably higher.
 - [ ] OMP_WAIT_POLICY=ACTIVE in the causal runner (d3: -7 % on a short prompt, -9 % at 1K).
 
-### Decode (target 10 tok/s)
-- [ ] MTP: draft with the model's MTP layer, verify k + 1 tokens in one pass. Needs the HF MTP
-      weights (only shard 1 of 18 is on disk), a multi-token verify pass (the CPU kernel's math
-      grows k + 1 times), DeltaNet state rollback.
+### Decode (target 10 tok/s) -- met with MTP
+
+`OFLM_OPEN_CPU_DECODE=1 OFLM_OPEN_MTP=<HF model-00018-of-00018.safetensors>` (2026-10-15): greedy
+decode **exactly** equal to plain decode, k = 2 drafts a pass (`OFLM_OPEN_MTP_K`):
+
+| Prompt (200 tokens) | Tokens a pass | Drafts accepted | tok/s |
+|---|---|---|---|
+| explain | 2.31 | 66.9 % | 10.6 |
+| code | 2.65 | 82.7 % | 12.2 |
+| list | 2.43 | 71.3 % | 11.2 |
+| math | 2.65 | 82.7 % | 12.6 |
+
+Mean 11.7 tok/s (k = 3: 11.1, k = 1: ~9.5); peak 18.5 GB. The MTP layer is int4 on the CPU; drafts
+read an int4 copy of the head, the verify pass the q8 head once for all its rows; MTP gets the
+prompt's last 256 rows as context (OFLM_OPEN_MTP_CTX, 22-55 ms once). The delta rule runs token
+by token in verify passes and rollbacks: a T > 1 block sums differently (~2e-7) and flips
+near-ties over 64 layers.
+
+- [ ] Adaptive k: k = 3 wins on code / math (12.9 / 12.4 tok/s) and loses on prose; pick k
+      per pass from the recent acceptance.
+- [ ] Sampling (temperature / top-p) with MTP: rejection sampling instead of greedy matching.
+- [ ] The MTP weights from a converted model file rather than the HF shard.
 - [x] An NPU decode kernel without the 255 padding rows: designs/dit2/dec.py (gemm_dit.decode2),
       32 rows, B split over the 32 cores, ~80 us a dispatch then ~55 GB/s, verified against numpy
       (dec_test.py). One image (K = 5120 core loop): qkv's first 4096 columns, the FFN up|gate's
