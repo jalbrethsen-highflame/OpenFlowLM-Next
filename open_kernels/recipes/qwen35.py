@@ -363,7 +363,11 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             n, k = (int(x) for x in key.split("x"))
             nn = max(1024, int(round(n * DECODE_NPU_FRAC / 1024)) * 1024)
             if nn < n:
-                split[key] = {"nn": nn, "kernel": f"dit2_n{nn}_k{k}_m{GEMM_TINY_M}_dec"}
+                # every 1024-column share from ~15 to ~45 % of N, so the engine can pick one at run
+                # time (OFLM_OPEN_DECODE_NPU_FRAC); `nn` is the default
+                opts = sorted({c for c in range(1024, n, 1024) if 0.15 <= c / n <= 0.45} | {nn})
+                split[key] = {"nn": nn, "kernel": f"dit2_n{nn}_k{k}_m{GEMM_TINY_M}_dec",
+                              "kernels": {str(c): f"dit2_n{c}_k{k}_m{GEMM_TINY_M}_dec" for c in opts}}
         if split:
             decode = {"m": GEMM_TINY_M, "mt": _TINY_MT, "split": split}
     fa = None
@@ -451,7 +455,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
             out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
         for name in (list(d.get("tiny", {}).get("kernels2", {}).values()) + list(d.get("tiny", {}).get("ffn", {}).values())
-                     + [v["kernel"] for v in d.get("decode", {}).get("split", {}).values()]):
+                     + [k for v in d.get("decode", {}).get("split", {}).values() for k in v["kernels"].values()]):
             out["contexts"].setdefault("dit2t", f"{name}/final.xclbin")     # 64-row tiles: its own image
             out["kernels"][name] = {"context": "dit2t", "insts": f"{name}/insts.bin", "build": name}
         for key in ("lk", "nc"):      # the noncausal streams share the causal ones' image
@@ -589,9 +593,10 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
             tenv = {**_HS_ENV, "DG_MT": str(T["mt"]), **({"DG_STACK": "0x3000"} if GEMM_B4 else {})}
             for key, v in T["split"].items():
                 k = int(key.split("x")[1])
-                b[v["kernel"]] = {"design": "dit2/dit2.py",
-                                  "build_dir": f"dit2/build_m{T['m']}_k{k}_n{v['nn']}_mt{T['mt']}{_HS_SFX}_dec",
-                                  "env": {"DG_M": str(T["m"]), "DG_K": str(k), "DG_N": str(v["nn"]), "DG_LAYOUT": _lay(), **tenv}}
+                for c, name in v["kernels"].items():
+                    b[name] = {"design": "dit2/dit2.py",
+                               "build_dir": f"dit2/build_m{T['m']}_k{k}_n{c}_mt{T['mt']}{_HS_SFX}_dec",
+                               "env": {"DG_M": str(T["m"]), "DG_K": str(k), "DG_N": c, "DG_LAYOUT": _lay(), **tenv}}
         if "ffn" in d:
             ff, hid = d["ffn"]["ff"], spec.hidden
             b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",

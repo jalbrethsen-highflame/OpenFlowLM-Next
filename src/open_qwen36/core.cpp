@@ -705,7 +705,11 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (man_.gemm_dit.contains("kernels2"))
         for (const auto& [shape, k] : man_.gemm_dit["kernels2"].items()) wanted[k.get<std::string>()] = true;
     if (man_.gemm_dit.contains("decode"))
-        for (const auto& [shape, v] : man_.gemm_dit["decode"]["split"].items()) wanted[v["kernel"].get<std::string>()] = true;
+        for (const auto& [shape, v] : man_.gemm_dit["decode"]["split"].items()) {
+            wanted[v["kernel"].get<std::string>()] = true;
+            if (v.contains("kernels"))
+                for (const auto& [c, k] : v["kernels"].items()) wanted[k.get<std::string>()] = true;
+        }
     for (const char* tier : {"small", "tiny"})
         if (man_.gemm_dit.contains(tier))
             for (const char* key : {"kernels2", "ffn"})
@@ -1147,6 +1151,12 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                     h.lanes = ab("ssm_alpha_proj", h.Wa);
                     if (ab("ssm_beta_proj", h.Wb) != h.lanes)
                         throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": alpha and beta disagree on lanes");
+                    // OFLM_OPEN_DECODE_AB16=1: bf16 copies for the CPU decode's alpha / beta. Off by default:
+                    // the conversion costs more than the 60 MB a token it saves (mixer +1 ms)
+                    if (cpu_decode_on_ && std::getenv("OFLM_OPEN_DECODE_AB16") && *std::getenv("OFLM_OPEN_DECODE_AB16") == '1') {
+                        h.Wa16.resize(h.Wa.size()); h.Wb16.resize(h.Wb.size());
+                        for (size_t i = 0; i < h.Wa.size(); ++i) { h.Wa16[i] = f32_to_bf16(h.Wa[i]); h.Wb16[i] = f32_to_bf16(h.Wb[i]); }
+                    }
                     h.A = file_->f32(const_tensor(lt, "ssm_a", l));
                     h.dtb = file_->f32(const_tensor(lt, "ssm_dt.bias", l));
                     h.convw = bf("ssm_conv1d.weight");
@@ -1192,13 +1202,44 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
         } else if (name == "lmpool" && drop_pools_ && !(std::getenv("OFLM_OPEN_CPU_HEAD") && *std::getenv("OFLM_OPEN_CPU_HEAD") == '0')) {
             // CPU decode: the head on the CPU, repacked once; the NPU copy only to check it
             cpu_head_check_ = std::getenv("OFLM_OPEN_CPU_HEAD_CHECK") && *std::getenv("OFLM_OPEN_CPU_HEAD_CHECK") == '1';
+            const bool int4 = std::getenv("OFLM_OPEN_CPU_HEAD") && std::string(std::getenv("OFLM_OPEN_CPU_HEAD")) == "int4";
             std::vector<uint8_t> pool(bytes);
             pools::pack_lmhead(*w_, *file_, pool.data());
-            lm_cpu_.resize(host::lmhead_q8_cpu_bytes(w_->vocab, w_->hidden));
-            host::lmhead_q8_repack(pool.data(), w_->vocab, w_->hidden, lm_cpu_.data());
+            const size_t V = w_->vocab, K = w_->hidden;
+            if (!int4 || cpu_head_check_) {
+                lm_cpu_.resize(host::lmhead_q8_cpu_bytes(V, K));
+                host::lmhead_q8_repack(pool.data(), V, K, lm_cpu_.data());
+            }
+            if (int4) {
+                // OFLM_OPEN_CPU_HEAD=int4: the q8 head dequantized a 128-row band at a time and
+                // re-encoded as dit2 int4 blocks (dit_encode_b4), half the bytes a token
+                const size_t nk = K / 256, per_band = 4 * nk, KT = K / 64;
+                lm_b4_.resize(V / 128 * KT * kB4Tile);
+#pragma omp parallel
+                {
+                    std::vector<float> W(128 * K);
+#pragma omp for schedule(dynamic, 4)
+                    for (long long bb = 0; bb < static_cast<long long>(V / 128); ++bb) {
+                        const size_t b = static_cast<size_t>(bb);
+                        for (size_t c = 0; c < per_band; ++c) {
+                            const uint8_t* ch = pool.data() + (b * per_band + c) * 8704;
+                            const size_t q = c % 4, kt = c / 4;
+                            for (size_t r = 0; r < 32; ++r)
+                                for (size_t k = 0; k < 256; ++k) {
+                                    uint16_t sc;
+                                    std::memcpy(&sc, ch + ((k / 32) * 32 + r) * 2, 2);
+                                    W[(q * 32 + r) * K + kt * 256 + k] =
+                                        bf16_to_f32(sc) * static_cast<float>(static_cast<int8_t>(ch[512 + (r / 16) * 4096 + k * 16 + r % 16]));
+                                }
+                        }
+                        dit_encode_b4(W.data(), 128, K, 128, lm_b4_.data() + b * KT * kB4Tile);
+                    }
+                }
+            }
             cpu_head_ = true;
             if (cpu_head_check_) globals_[name] = alloc(bytes, pool.data(), pool.size());
-            log("CPU decode: the lm_head on the CPU (" + std::to_string(lm_cpu_.size() >> 20) + " MB, q8)");
+            log("CPU decode: the lm_head on the CPU (" + std::to_string((lm_b4_.empty() ? lm_cpu_.size() : lm_b4_.size()) >> 20) +
+                " MB, " + (lm_b4_.empty() ? "q8)" : "int4)"));
         } else if (name == "lmpool") {
             xrt::bo lm = xrt::ext::bo(*dev_, bytes);
             pools::pack_lmhead(*w_, *file_, lm.map<uint8_t*>());
@@ -2762,21 +2803,49 @@ void Core::step_cpu_decode(int token, bool want_logits) {
             return;
         }
         const nlohmann::json& sv = (*SP)["split"][key];
-        const size_t nn = sv["nn"].get<size_t>(), M = (*SP)["m"].get<size_t>(), mt = (*SP)["mt"].get<size_t>();
+        // OFLM_OPEN_DECODE_NPU_FRAC: the built share closest to that fraction of N (default: the manifest's)
+        static const double frac = [] { const char* e = std::getenv("OFLM_OPEN_DECODE_NPU_FRAC"); return e ? std::atof(e) : -1.0; }();
+        size_t nn = sv["nn"].get<size_t>();
+        std::string kname = sv["kernel"].get<std::string>();
+        if (frac >= 0 && sv.contains("kernels"))
+            for (const auto& [c, kn] : sv["kernels"].items()) {
+                const size_t cv = std::stoul(c);
+                if (std::fabs(cv / double(n) - frac) < std::fabs(nn / double(n) - frac) && kerns_.count(kn.get<std::string>())) {
+                    nn = cv;
+                    kname = kn.get<std::string>();
+                }
+            }
+        const size_t M = (*SP)["m"].get<size_t>(), mt = (*SP)["mt"].get<size_t>();
         const std::string an = "dec_a_k" + std::to_string(k), cn = "dec_c_n" + std::to_string(nn);
         if (!globals_.count(an)) globals_[an] = alloc(M * k * 9 / 8);     // zero: rows 1.. stay zero
         if (!globals_.count(cn)) globals_[cn] = alloc(M * nn * 2);
-        // row 0 into dit2's A order (dit2_pack_a, hs): per 64-K unit of mt rows, quarter 0, the
-        // blocks j = 2 kb (row block 0), i = 0
-        xrt::bo& ab = globals_.at(an);
-        uint8_t* a = ab.map<uint8_t*>();
-        const size_t unit = mt / 32 * 32 * 8 * 9;
-        for (size_t ks = 0; ks < k / 64; ++ks)
-            for (size_t kb = 0; kb < 8; ++kb) bfp_encode8_avx2(in + ks * 64 + kb * 8, a + ks * unit + (2 * kb) * 8 * 9);
-        ab.sync(XCL_BO_SYNC_BO_TO_DEVICE, k / 64 * unit, 0);
-        Inflight f = start_run(kerns_.at(sv["kernel"].get<std::string>()), {an, st.args[0], cn}, l);
-        timing_.moe_prep_ms += ms_since(tg);      // trace: pack + flush + start before the CPU's share
-        host::gemv_b4(B + nn / 128 * (k / 64) * 4224, npad - nn, k, in, out.data() + nn);
+        // the side task, on one of gemv_b4's threads while the others start the CPU's share: row 0
+        // into dit2's A order (dit2_pack_a, hs: per 64-K unit of mt rows, quarter 0, blocks j = 2 kb,
+        // i = 0), flushed, the NPU run started
+        Inflight f{};
+        double side_ms = 0;
+        auto side = [&] {
+            auto ts = std::chrono::steady_clock::now();
+            xrt::bo& ab = globals_.at(an);
+            uint8_t* a = ab.map<uint8_t*>();
+            const size_t unit = mt / 32 * 32 * 8 * 9;
+            for (size_t ks = 0; ks < k / 64; ++ks)
+                for (size_t kb = 0; kb < 8; ++kb) bfp_encode8_avx2(in + ks * 64 + kb * 8, a + ks * unit + (2 * kb) * 8 * 9);
+            ab.sync(XCL_BO_SYNC_BO_TO_DEVICE, k / 64 * unit, 0);
+            f = start_run(kerns_.at(kname), {an, st.args[0], cn}, l);
+            side_ms = ms_since(ts);
+        };
+        // OFLM_OPEN_DECODE_SIDE=1: the side task on one of gemv_b4's threads, overlapped with the
+        // CPU's share. Off by default: it starts the NPU later and takes a CPU thread, so the NPU
+        // waits longer (27B, 8 threads: 152 ms/token against 149 serial)
+        static const bool side_on = [] { const char* e = std::getenv("OFLM_OPEN_DECODE_SIDE"); return e && *e == '1'; }();
+        if (side_on) {
+            host::gemv_b4(B + nn / 128 * (k / 64) * 4224, npad - nn, k, in, out.data() + nn, side);
+        } else {
+            side();
+            host::gemv_b4(B + nn / 128 * (k / 64) * 4224, npad - nn, k, in, out.data() + nn);
+        }
+        timing_.moe_prep_ms += side_ms;          // trace: the side task
         const double cpu_ms = ms_since(tg), attn0 = timing_.attn_ms;
         auto tw = std::chrono::steady_clock::now();
         wait_run(f);
@@ -2807,6 +2876,7 @@ void Core::step_cpu_decode(int token, bool want_logits) {
             g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
             g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
             g.t_real = 1;
+            if (!hc.Wa16.empty()) { g.wa16 = hc.Wa16.data(); g.wb16 = hc.Wb16.data(); }
             double ph[2] = {0, 0};
             host::deltanet_block(g, y.data(), y.data() + nch, xn.data(), hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
                                  hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
@@ -2856,11 +2926,29 @@ void Core::tail_logits(const float* row) {
         static thread_local std::vector<float> xn;
         xn.resize(hid);
         host::rmsnorm_rows(row, 1, hid, normw_f_.data(), types_[0]->gemm_block.eps, xn.data());
-        host::lmhead_q8_cpu(lm_cpu_.data(), w_->vocab, hid, xn.data(), logits_host_.data());
+        if (!lm_b4_.empty()) host::gemv_b4(lm_b4_.data(), w_->vocab, hid, xn.data(), logits_host_.data());
+        else host::lmhead_q8_cpu(lm_cpu_.data(), w_->vocab, hid, xn.data(), logits_host_.data());
         timing_.lmhead_ms = ms_since(t1);
         if (!cpu_head_check_) return;
-        // debug: the NPU's head on the same row, compared
+        // debug: the reference head on the same row, compared -- the CPU q8 one for an int4 head,
+        // else the NPU's
         std::vector<float> cpu(logits_host_);
+        if (!lm_b4_.empty()) {
+            std::vector<float> ref(w_->vocab);
+            host::lmhead_q8_cpu(lm_cpu_.data(), w_->vocab, hid, xn.data(), ref.data());
+            const size_t V = w_->real_vocab ? w_->real_vocab : w_->vocab;
+            double sxy = 0, sxx = 0, syy = 0, mx = 0, my = 0;
+            for (size_t i = 0; i < V; ++i) { mx += cpu[i]; my += ref[i]; }
+            mx /= V; my /= V;
+            size_t ac = 0, ar = 0;
+            for (size_t i = 0; i < V; ++i) {
+                sxy += (cpu[i] - mx) * (ref[i] - my); sxx += (cpu[i] - mx) * (cpu[i] - mx); syy += (ref[i] - my) * (ref[i] - my);
+                if (cpu[i] > cpu[ac]) ac = i;
+                if (ref[i] > ref[ar]) ar = i;
+            }
+            std::fprintf(stderr, "int4 head check: corr %.6f argmax int4 %zu q8 %zu\n", sxy / std::sqrt(sxx * syy), ac, ar);
+            return;
+        }
         xrt::bo& x0 = buffer("xres", 0);
         std::memcpy(x0.map<uint8_t*>(), row, hid * 4);
         x0.sync(XCL_BO_SYNC_BO_TO_DEVICE, hid * 4, 0);

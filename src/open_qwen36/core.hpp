@@ -416,6 +416,7 @@ private:
     struct HostConsts {
         std::vector<float> ln, postln, router;          ///< [hid], [hid], [hid, E]
         std::vector<float> convw, Wa, Wb, A, dtb, nw;   ///< linear: [taps, nch], [hid, lanes] x2, [heads] x2, [head_dim]
+        std::vector<uint16_t> Wa16, Wb16;               ///< linear: bf16 copies of Wa / Wb for CPU decode
         size_t lanes = 0;
         std::vector<float> qn, kn;                      ///< full: [hd] x2
         std::vector<float> sgw;                         ///< the shared expert's sigmoid gate, [hid]
@@ -631,6 +632,7 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// the head repacked from the pool order (host::lmhead_q8_repack), the norm weight as f32
     bool cpu_head_ = false, cpu_head_check_ = false;
     std::vector<uint8_t> lm_cpu_;
+    std::vector<uint8_t> lm_b4_;   ///< OFLM_OPEN_CPU_HEAD=int4: the head as dit2 int4 blocks (host::gemv_b4)
     std::vector<float> normw_f_;
     /// which side holds the newest per-layer state (DeltaNet S / conv rows, KV rows): 0 both,
     /// 1 the host (CPU decode wrote it), 2 the device (the fused NPU decode wrote it)

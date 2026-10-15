@@ -578,6 +578,15 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                 size_t hh = 0;
                 for (; hh + 8 <= lanes; hh += 8) {   // 8 lanes in registers over the whole i slice
                     __m256 sa = _mm256_setzero_ps(), sb = _mm256_setzero_ps();
+                    if (g.wa16 && g.wb16) {
+                        for (size_t i = i0; i < i1; ++i) {
+                            const __m256 xv = _mm256_set1_ps(xn[u * hid + i]);
+                            const __m128i a16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(g.wa16 + i * lanes + hh));
+                            const __m128i b16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(g.wb16 + i * lanes + hh));
+                            sa = _mm256_fmadd_ps(xv, _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(a16), 16)), sa);
+                            sb = _mm256_fmadd_ps(xv, _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(b16), 16)), sb);
+                        }
+                    } else
                     for (size_t i = i0; i < i1; ++i) {
                         const __m256 xv = _mm256_set1_ps(xn[u * hid + i]);
                         sa = _mm256_fmadd_ps(xv, _mm256_loadu_ps(Wa + i * lanes + hh), sa);
@@ -1245,10 +1254,11 @@ struct B4XQ {
     std::vector<int32_t> ev, od, cs;
     std::vector<float> sx;
 };
-void b4_prep_xq(const float* x, size_t K, B4XQ& q) {
-    const size_t KT = K / 64;
-    q.ev.resize(K / 8); q.od.resize(K / 8); q.sx.resize(KT); q.cs.resize(KT);
-    for (size_t kt = 0; kt < KT; ++kt) {
+void b4_xq_size(size_t K, B4XQ& q) {
+    q.ev.resize(K / 8); q.od.resize(K / 8); q.sx.resize(K / 64); q.cs.resize(K / 64);
+}
+void b4_prep_xq_tiles(const float* x, size_t kt0, size_t kt1, B4XQ& q) {
+    for (size_t kt = kt0; kt < kt1; ++kt) {
         float m = 0.f;
         for (int i = 0; i < 64; ++i) m = std::max(m, std::fabs(x[kt * 64 + i]));
         const float sc = m > 0.f ? m / 127.f : 1.f, inv = 1.f / sc;
@@ -1295,7 +1305,7 @@ void b4_strip_vnni(const uint8_t* st, const B4XQ& q, size_t t0, size_t t1, float
 }
 }  // namespace
 
-void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y) {
+void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y, const std::function<void()>& side) {
     if (npad % 128 || K % 64) throw std::runtime_error("open_qwen36: gemv_b4: N % 128 or K % 64");
     static const bool avx = __builtin_cpu_supports("avx512bf16") && __builtin_cpu_supports("avx512bw");
     static const bool int8 = [] {
@@ -1307,12 +1317,8 @@ void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y) 
     static thread_local std::vector<float> part_tl;
     std::vector<uint32_t>& xp = xp_tl;
     B4XQ& xq = xq_tl;
-    if (int8) {
-        b4_prep_xq(x, K, xq);
-    } else {
-        xp.resize(K / 8 * 16);
-        b4_prep_x(x, K, xp.data());
-    }
+    if (int8) b4_xq_size(K, xq);
+    else xp.resize(K / 8 * 16);
     const size_t S = npad / 128, KT = K / 64;
     const size_t T = static_cast<size_t>(omp_get_max_threads());
     // enough work items to balance the threads: K split in ranges when there are few strips
@@ -1322,6 +1328,21 @@ void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y) 
     const uint32_t* xpp = xp.data();
 #pragma omp parallel
     {
+    // x rounded to int8 over the threads, one 64-K tile each (bf16 path: one thread)
+    if (int8) {
+#pragma omp for schedule(static)
+        for (long long kt = 0; kt < static_cast<long long>(KT); ++kt)
+            b4_prep_xq_tiles(x, static_cast<size_t>(kt), static_cast<size_t>(kt) + 1, xq);
+    } else {
+#pragma omp single
+        b4_prep_x(x, K, xp.data());
+    }
+    // the side task (the NPU share's pack / flush / start) on one thread while the others start
+    // on the strips; it joins them when done
+    if (side) {
+#pragma omp single nowait
+        side();
+    }
 #pragma omp for schedule(dynamic, 1)
     for (long long w = 0; w < static_cast<long long>(S * ks); ++w) {
         const size_t s = static_cast<size_t>(w) / ks, r = static_cast<size_t>(w) % ks;

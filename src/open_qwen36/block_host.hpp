@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace open_qwen36 {
 namespace host {
@@ -47,6 +48,10 @@ struct DeltaGeom {
     /// packed prompts: reset[t] != 0 starts a new sequence at row t -- the conv window sees
     /// zeros before it and S restarts from zero. nullptr: one sequence.
     const uint8_t* reset = nullptr;
+    /// optional bf16 copies of Wa / Wb ([hid, lanes]): a decode-sized block (T <= 8) reads these
+    /// instead of the f32 ones (half the bytes; CPU decode)
+    const uint16_t* wa16 = nullptr;
+    const uint16_t* wb16 = nullptr;
 };
 
 /// The linear-attention layer's middle over a block. qkv [T, 2*key_w + vw] and z [T, vw]
@@ -116,7 +121,8 @@ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, 
 /// [128-column tile][64-K tile] 4096 bytes of nibbles in blocks [pair 8][k-block 8][2] of 8 columns
 /// x 8 k, then 128 exponent bytes, scale 2^(e - 133)) -- the bytes dit2 reads, on the CPU. x is
 /// rounded to bf16 (the products and sums are fp32). OpenMP over 128-column strips and K ranges.
-void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y);
+void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y,
+             const std::function<void()>& side = nullptr);
 /// The dit FFN's up|gate output to h: every 128 columns of `ug` are [gate 64 | up 64]; h [ff] =
 /// silu(gate) * up. Parallel and 16 lanes wide (ff % 64 == 0).
 void swiglu_tiles(const float* ug, size_t ff, float* h);
