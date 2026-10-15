@@ -958,6 +958,110 @@ void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, fl
 }
 }  // namespace
 
+namespace {
+// Decode-sized causal attention (1-8 query rows: a decode step or an MTP verify pass), split over
+// (kv head, 64-key block) work items so a step's few queries still fill the threads ("flash
+// decoding"): each item keeps a partial softmax (max, sum, sum p v) per (row, head), merged in
+// block order. Blocks are fixed from key 0, so a row's result depends only on its own position --
+// the same bits whether it comes alone (decode) or with others (verify). At 4K keys, 8 threads:
+// the tiled path took ~2 ms a layer (one work item per kv head).
+void attention_decode_split(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
+                            const uint16_t* kv, size_t kvr, float* og) {
+    // a work item = one 32-key block for every kv head: whole contiguous cache rows (K then V)
+    constexpr size_t KB = 32;
+    const size_t grp = nh / kvh, qw = nh * hd, kvw = kvh * hd, Kmax = pos0 + R, NB = (Kmax + KB - 1) / KB, PS = hd + 2;
+    if (R > 8 || grp > 8 || hd % 16 || hd > 512 || kvw > 2048) throw std::runtime_error("open_qwen36: attention_decode_split: geometry");
+    static thread_local std::vector<float> part_tl;
+    std::vector<float>& part = part_tl;
+    part.resize(R * nh * NB * PS);
+    float* pp = part.data();
+#pragma omp parallel
+    {
+        std::vector<float> rowf(kvw), sc(R * nh * KB);
+#pragma omp for schedule(dynamic, 1)
+        for (long long bb = 0; bb < static_cast<long long>(NB); ++bb) {
+            const size_t b = static_cast<size_t>(bb), k0 = b * KB, k1 = std::min(k0 + KB, Kmax), nk = k1 - k0;
+            // scores: each key's K row (every kv head) converted once
+            for (size_t key = k0; key < k1; ++key) {
+                const uint16_t* kp = kv + key * kvr;
+                _mm_prefetch(reinterpret_cast<const char*>(kv + (key + 4) * kvr), _MM_HINT_T0);
+                for (size_t i = 0; i < kvw; i += 8)
+                    _mm256_storeu_ps(rowf.data() + i, _mm256_castsi256_ps(_mm256_slli_epi32(
+                                                          _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kp + i))), 16)));
+                for (size_t t = 0; t < R; ++t)
+                    for (size_t h = 0; h < nh; ++h) {
+                        float& s0 = sc[(t * nh + h) * KB + (key - k0)];
+                        if (key >= pos0 + t + 1) { s0 = -INFINITY; continue; }
+                        const float* qp = Q + t * qw + h * hd;
+                        const float* kf = rowf.data() + (h / grp) * hd;
+                        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                        for (size_t i = 0; i < hd; i += 16) {
+                            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(qp + i), _mm256_loadu_ps(kf + i), a0);
+                            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(qp + i + 8), _mm256_loadu_ps(kf + i + 8), a1);
+                        }
+                        alignas(32) float l8[8];
+                        _mm256_store_ps(l8, _mm256_add_ps(a0, a1));
+                        s0 = (((l8[0] + l8[1]) + (l8[2] + l8[3])) + ((l8[4] + l8[5]) + (l8[6] + l8[7]))) * scale;
+                    }
+            }
+            for (size_t t = 0; t < R; ++t)
+                for (size_t h = 0; h < nh; ++h) {
+                    float* s1 = sc.data() + (t * nh + h) * KB;
+                    float m = -INFINITY;
+                    for (size_t j = 0; j < nk; ++j) m = std::max(m, s1[j]);
+                    float l = 0.f;
+                    for (size_t j = 0; j < nk; ++j) {
+                        s1[j] = m == -INFINITY ? 0.f : std::exp(s1[j] - m);
+                        l += s1[j];
+                    }
+                    float* P = pp + ((t * nh + h) * NB + b) * PS;
+                    P[0] = m; P[1] = l;
+                    std::fill(P + 2, P + PS, 0.f);
+                }
+            // sum p v: each key's V row converted once
+            for (size_t key = k0; key < k1; ++key) {
+                const uint16_t* vp = kv + key * kvr + kvw;
+                for (size_t i = 0; i < kvw; i += 8)
+                    _mm256_storeu_ps(rowf.data() + i, _mm256_castsi256_ps(_mm256_slli_epi32(
+                                                          _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(vp + i))), 16)));
+                for (size_t t = 0; t < R; ++t) {
+                    if (key >= pos0 + t + 1) continue;
+                    for (size_t h = 0; h < nh; ++h) {
+                        const __m256 p = _mm256_set1_ps(sc[(t * nh + h) * KB + (key - k0)]);
+                        const float* vf = rowf.data() + (h / grp) * hd;
+                        float* acc = pp + ((t * nh + h) * NB + b) * PS + 2;
+                        for (size_t i = 0; i < hd; i += 8)
+                            _mm256_storeu_ps(acc + i, _mm256_fmadd_ps(p, _mm256_loadu_ps(vf + i), _mm256_loadu_ps(acc + i)));
+                    }
+                }
+            }
+        }
+        // merge the blocks in order
+#pragma omp for schedule(static) collapse(2)
+        for (long long tt = 0; tt < static_cast<long long>(R); ++tt)
+            for (long long h = 0; h < static_cast<long long>(nh); ++h) {
+                const size_t t = static_cast<size_t>(tt);
+                const float* P0 = pp + ((t * nh) + static_cast<size_t>(h)) * NB * PS;
+                const size_t nb = (pos0 + t + 1 + KB - 1) / KB;           // the row's blocks
+                float M = -INFINITY;
+                for (size_t b = 0; b < nb; ++b) M = std::max(M, P0[b * PS]);
+                float L = 0.f;
+                float* o = og + t * qw + static_cast<size_t>(h) * hd;
+                std::fill(o, o + hd, 0.f);
+                for (size_t b = 0; b < nb; ++b) {
+                    const float* P = P0 + b * PS;
+                    if (P[0] == -INFINITY) continue;
+                    const float w = std::exp(P[0] - M);
+                    L += P[1] * w;
+                    for (size_t i = 0; i < hd; ++i) o[i] += P[2 + i] * w;
+                }
+                const float inv = 1.f / L;
+                for (size_t i = 0; i < hd; ++i) o[i] *= inv;
+            }
+    }
+}
+}  // namespace
+
 void attention_block(const AttnGeom& g, const float* q, const float* k, const float* v, const float* gate,
                      const float* qn, const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
                      float* og) {
@@ -1013,7 +1117,12 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
     // ---- phase 2: tiled causal attention, one work item per (kv head, 16-query chunk): its
     // grp query heads x 16 tokens attend together, so every K / V row is read once for all of
     // them (GQA), with an online softmax over 64-row key chunks.
-    attention_tiles(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og);
+    // OFLM_OPEN_ATTN_SPLIT=0 keeps the tiled path for decode-sized blocks too
+    static const bool split = [] { const char* e = std::getenv("OFLM_OPEN_ATTN_SPLIT"); return !(e && *e == '0'); }();
+    if (split && R <= 8 && g.hd % 8 == 0 && grp <= 8)
+        attention_decode_split(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og);
+    else
+        attention_tiles(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og);
     if (gate)                                       // Qwen3.6's output gate; LFM2 has none
         for (size_t i = 0; i < R * qw; ++i) og[i] *= sigmoid(gate[i]);
     (void)grp;
