@@ -206,7 +206,7 @@ static inline void scale_rows(bfloat16 *__restrict x, const bfloat16 *__restrict
 }
 
 // O [row block][col block][8][8] times rep's per-row factors (replicate_rows32 layout).
-static inline void scale_o(bfloat16 *__restrict o, const bfloat16 *__restrict rep) {
+static __attribute__((noinline)) void scale_o(bfloat16 *__restrict o, const bfloat16 *__restrict rep) {
   using V = aie::vector<bfloat16, 32>;
   for (int gi = 0; gi < TQ / 4; gi++) {                 // rows 4gi .. 4gi + 3
     V rv = aie::load_v<32>(rep + gi * 32);
@@ -218,19 +218,26 @@ static inline void scale_o(bfloat16 *__restrict o, const bfloat16 *__restrict re
         v[cb] = aie::load_v<32>(p + (c0 + cb) * 64);
 #pragma clang loop unroll(full)
       for (int cb = 0; cb < 8; cb++)
-        aie::store_v(p + (c0 + cb) * 64, aie::mul(v[cb], rv).template to_vector<bfloat16>());
+        aie::store_v(p + (c0 + cb) * 64, aie::mul(v[cb], rv).template to_vector<bfloat16>());   // (rare path / pass end)
     }
   }
 }
 
 // Per-row values are kept "replicated": row r's value in lanes r*8 .. r*8+7, the
 // layout of an 8-column mmul tile and of replicate_rows32's table.
-alignas(64) static bfloat16 s_rep[TQ * 8];   // scratch: a per-row bf16 value, replicated
-alignas(64) static float s_nuc[TQ * 8];      // -m*c, replicated (exp argument offset)
+// Bank placement was tried (L1 is 4 banks of 16 KB, one access a bank a cycle; peak.cc
+// PEAK_FABANK8): the hand-scheduled calls alone run ~20% faster with their operands in separate
+// banks (376 -> ~301 cycles a call), but in the kernel the K / V fifos' DMA writes share those
+// banks; the allocator's bank-aware scheme measured best (dit_fa256b.py DF_ALLOC).
+alignas(64) static bfloat16 s_rep[TQ * 8];   // a per-row bf16 value, replicated
+alignas(64) static float s_nuc[TQ * 8];      // -m, replicated
 alignas(64) static bfloat16 s_newmax[TQ];
 alignas(64) static bfloat16 s_resc[TQ];
+
+
 alignas(64) static float s_rs[TQ * 8];        // this chunk's row sums, replicated
 alignas(64) static float s_tmp[TQ * 8];
+alignas(64) static uint8_t s_ones[128];       // one bfp16 tile of 1.0 (fa_exp_call's row-sum operand)
 
 // Lazy rescale: the reference max m moves only when a row's chunk max exceeds it
 // by more than TAU (log2 units), so P = exp2((s - m)c) <= 2^TAU (bf16 O and fp32 l
@@ -324,6 +331,16 @@ static inline void exp_p_rowsum(const bfloat16 *__restrict g, uint8_t *__restric
 #ifndef FA_HS
 #define FA_HS 0
 #endif
+
+#ifdef FA_X_PROF   // debug: core cycles per part, written into O's first row at finalize
+alignas(64) static uint32_t s_prof[8];   // qk, pv, sm_exp, softmax_step cycles; calls; finalize count
+static inline uint32_t prof_now() { return 0; }   // (no readable cycle counter on Peano)
+#define PROF_BEGIN uint32_t _t0 = prof_now();
+#define PROF_END(i) s_prof[i] += prof_now() - _t0;
+#else
+#define PROF_BEGIN
+#define PROF_END(i)
+#endif
 #if FA_HS
 #include "fa_hs.inc"
 #endif
@@ -354,6 +371,13 @@ void pass_init(bfloat16 *__restrict gp, bfloat16 *__restrict up, float *__restri
     aie::store_v(sp + i, zf);
     aie::store_v(s_nuc + i, zf);                // m = 0 until the first chunk sets it
   }
+  Acc oa;
+  oa.from_vector(aie::broadcast<float, 64>(1.0f));
+  aie::block_vector_output_buffer_stream<bfp16ebs8, 64> ones(reinterpret_cast<bfp16ebs8 *>(s_ones));
+  ones << oa.template to_vector<bfp16ebs8>();
+#ifdef FA_X_PROF
+  s_prof[6] = prof_now();
+#endif
 }
 
 // G[:, keys 16j .. 16j + 15] = Q K_piece^T over the whole head dim, written once (bf16).
@@ -363,7 +387,9 @@ void qk(uint8_t *__restrict q, uint8_t *__restrict kp, bfloat16 *__restrict g, i
     return;
   SET_ROUNDING();
 #if FA_HS
+  PROF_BEGIN
   fa_qk_call(q, kp, g + j * 2 * (TQ / 8) * 64, s_nuc);
+  PROF_END(0)
   return;
 #endif
   for (int zp = 0; zp < TQ / 16; zp++) {
@@ -390,6 +416,28 @@ void qk(uint8_t *__restrict q, uint8_t *__restrict kp, bfloat16 *__restrict g, i
   }
 }
 
+// The pipelined loop's step: chunk c's K piece j (qk) and chunk c - 1's V element j (pv) in one
+// call (a kernel call and its rtp checks cost ~100 cycles; 4 of them a chunk were ~10%).
+void qk(uint8_t *__restrict q, uint8_t *__restrict kp, bfloat16 *__restrict g, int32_t j,
+        int32_t *__restrict rtp, int32_t pass, int32_t chunk);
+void pv(uint8_t *__restrict p, uint8_t *__restrict ve, bfloat16 *__restrict o, int32_t e,
+        int32_t *__restrict rtp, int32_t pass, int32_t chunk);
+void qkpv(uint8_t *__restrict q, uint8_t *__restrict kp, bfloat16 *__restrict g, uint8_t *__restrict p,
+          uint8_t *__restrict ve, bfloat16 *__restrict o, int32_t j, int32_t *__restrict rtp,
+          int32_t pass, int32_t chunk) {
+#if FA_HS
+  // noncausal only (no fa_skip); the rounding mode is sm_exp's (set every chunk)
+  const int32_t valid = rtp[3];
+  if (chunk * LKP < valid)
+    fa_qk_call(q, kp, g + j * 2 * (TQ / 8) * 64, s_nuc);
+  if ((chunk - 1) * LKP < valid)
+    fa_pv_call(p, ve, o + j * 2 * VPAIRS_PER_ELEM * 64);
+#else
+  qk(q, kp, g, j, rtp, pass, chunk);
+  pv(p, ve, o, j, rtp, pass, chunk - 1);
+#endif
+}
+
 // O[:, d columns 64e .. 64e + 63] += P V for one 4608-byte V element (4 column pairs).
 void pv(uint8_t *__restrict p, uint8_t *__restrict ve, bfloat16 *__restrict o, int32_t e,
         int32_t *__restrict rtp, int32_t pass, int32_t chunk) {
@@ -397,7 +445,9 @@ void pv(uint8_t *__restrict p, uint8_t *__restrict ve, bfloat16 *__restrict o, i
     return;
   SET_ROUNDING();
 #if FA_HS
+  PROF_BEGIN
   fa_pv_call(p, ve, o + e * 2 * VPAIRS_PER_ELEM * 64);
+  PROF_END(1)
   return;
 #endif
   for (int jl = 0; jl < VPAIRS_PER_ELEM; jl++) {
@@ -477,67 +527,118 @@ void apply_mask(bfloat16 *__restrict g, int32_t *__restrict rtp, int32_t pass,
 // Then P (G after the exponentials) goes to bfp16 in pv's pop order, and l += rowsum of
 // that bfp16 P (fa256.cc summed the bf16 P with an emulated-bfp16 mmul; this sums what pv
 // multiplies).
+// The softmax's common path, its own kernel call (fa_exp_call clobbers vector registers the
+// compiler may keep across a call; the core loop between kernel calls holds none): P and this
+// chunk's row sums (s_rs) from G.
+void sm_exp(bfloat16 *__restrict g, uint8_t *__restrict p, int32_t *__restrict rtp, int32_t pass,
+            int32_t chunk) {
+  if (fa_skip(rtp, pass, chunk) || fa_dead(rtp, chunk))
+    return;
+  apply_mask(g, rtp, pass, chunk);       // (returns at once on a chunk with no masked key)
+  SET_ROUNDING();
+#ifndef FA_X_NOEXP
+#if FA_HS
+  PROF_BEGIN
+  for (int zp = 0; zp < TQ / 16; zp++)        // one call per row pair (its own FIFO stream)
+    fa_exp_call(g + 2 * zp * 64, s_ones, p + zp * (LKP / 8) * 2 * TILE_B, s_rs + 2 * zp * 64);
+  PROF_END(2)
+#else
+  exp_p_rowsum(g, p, s_rs);
+#endif
+#endif
+}
+
+} // extern "C"
+
+// The rare path of the softmax step (out of line, so the common path stays small): the pass's
+// first chunk (m is 0 until then), or a chunk whose row sum reached 2^TAU (only possible when
+// some score is past m + TAU - 6). m moves up to the row max, O and l are rescaled, G shifted,
+// and P and the row sums redone.
+static __attribute__((noinline)) void softmax_rescale(bfloat16 *__restrict g, float *__restrict sp,
+                                                      bfloat16 *__restrict gp, uint8_t *__restrict p,
+                                                      int32_t chunk) {
+  row_max(g, s_newmax);                                        // max of score - m, per row
+  for (int i = 0; i < TQ; i += 16) {
+    aie::vector<bfloat16, 16> d = aie::load_v<16>(s_newmax + i);
+    if (chunk > 0)
+      d = aie::max(d, aie::zeros<bfloat16, 16>());             // m only moves up
+    aie::store_v(s_newmax + i, d);
+    if (chunk > 0) {                                           // O, l *= 2^-delta
+      // the hardware exp2 (a few % off): O and l are scaled by the same value, so O / l
+      // does not see the error (exp2f_poly16 cost 1.6 KB of program memory)
+      Acc16 da;
+      da.from_vector(d);
+      aie::store_v(s_resc + i, aie::exp2<bfloat16>(aie::mul(da.template to_vector<float>(), -1.0f)
+                                                       .template to_vector<float>()));
+    }
+  }
+  replicate_rows32(s_newmax, s_rep);                            // delta, replicated
+  widen_scale(s_rep, s_tmp, 1.0f, TQ * 8);
+  for (int i = 0; i < TQ * 8; i += 16)                          // -m -= delta
+    aie::store_v(s_nuc + i, aie::sub(aie::load_v<16>(s_nuc + i), aie::load_v<16>(s_tmp + i)));
+  for (int cb = 0; cb < LKP / 8; cb++)                          // G -= delta
+    for (int z = 0; z < TQ / 8; z++) {
+      bfloat16 *__restrict t = g + (cb * (TQ / 8) + z) * 64;
+      aie::store_v(t, aie::sub(aie::load_v<64>(t), aie::load_v<64>(s_rep + z * 64)));
+    }
+  if (chunk > 0) {
+    replicate_rows32(s_resc, s_rep);
+    scale_o(gp, s_rep);
+    for (int j = 0; j < TQ * 8; j += 16) {
+      Acc16 ra;
+      ra.from_vector(aie::load_v<16>(s_rep + j));
+      aie::store_v(sp + j, aie::mul(aie::load_v<16>(sp + j), ra.template to_vector<float>())
+                               .template to_vector<float>());
+    }
+  }
+  exp_p_rowsum(g, p, s_rs);                                     // (rare: the C++ pass)
+}
+
+extern "C" {
+
+// The rest of the softmax step: the rare path when needed, then l += this chunk's row sums.
 void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
                   float *__restrict sp, bfloat16 *__restrict gp, uint8_t *__restrict p,
                   int32_t *__restrict rtp, int32_t pass, int32_t chunk) {
   (void)up;
+#ifdef FA_X_NOSTEP
+  return;
+#endif
   if (fa_skip(rtp, pass, chunk) || fa_dead(rtp, chunk))
     return;
   SET_ROUNDING();
-#ifndef FA_X_NOEXP
-  exp_p_rowsum(g, p, s_rs);
-#endif
-  // Rare path: the pass's first chunk (m is 0 until then), or a chunk whose row sum reached
-  // 2^TAU (only possible when some score is past m + TAU - 6): m moves up to the row max,
-  // O and l are rescaled, G shifted, and the exp pass redone.
-  bool redo = chunk == 0;
-  const aie::vector<float, 16> lim = aie::broadcast<float, 16>(float(1ull << FA_TAU));
-  for (int i = 0; i < TQ * 8 && !redo; i += 16)
-    redo = !aie::ge(aie::load_v<16>(s_rs + i), lim).empty();
-  if (redo) {
-    row_max(g, s_newmax);                                      // max of score - m, per row
-    for (int i = 0; i < TQ; i += 16) {
-      aie::vector<bfloat16, 16> d = aie::load_v<16>(s_newmax + i);
-      if (chunk > 0)
-        d = aie::max(d, aie::zeros<bfloat16, 16>());           // m only moves up
-      aie::store_v(s_newmax + i, d);
-      if (chunk > 0) {                                         // O, l *= 2^-delta
-        Acc16 da;
-        da.from_vector(d);
-        aie::vector<float, 16> e = exp2f_poly16(aie::mul(da.template to_vector<float>(), -1.0f).template to_vector<float>());
-        Acc16 ea;
-        ea.from_vector(e);
-        aie::store_v(s_resc + i, ea.template to_vector<bfloat16>());
-      }
-    }
-    replicate_rows32(s_newmax, s_rep);                          // delta, replicated
-    widen_scale(s_rep, s_tmp, 1.0f, TQ * 8);
-    for (int i = 0; i < TQ * 8; i += 16)                        // -m -= delta
-      aie::store_v(s_nuc + i, aie::sub(aie::load_v<16>(s_nuc + i), aie::load_v<16>(s_tmp + i)));
-    for (int cb = 0; cb < LKP / 8; cb++)                        // G -= delta
-      for (int z = 0; z < TQ / 8; z++) {
-        bfloat16 *__restrict t = g + (cb * (TQ / 8) + z) * 64;
-        aie::store_v(t, aie::sub(aie::load_v<64>(t), aie::load_v<64>(s_rep + z * 64)));
-      }
-    if (chunk > 0) {
-      replicate_rows32(s_resc, s_rep);
-      scale_o(gp, s_rep);
-      for (int j = 0; j < TQ * 8; j += 16) {
-        Acc16 ra;
-        ra.from_vector(aie::load_v<16>(s_rep + j));
-        aie::store_v(sp + j, aie::mul(aie::load_v<16>(sp + j), ra.template to_vector<float>())
-                                 .template to_vector<float>());
-      }
-    }
-    exp_p_rowsum(g, p, s_rs);
-  }
-  for (int i = 0; i < TQ * 8; i += 16)                          // l += this chunk's row sums
-    aie::store_v(sp + i, aie::add(aie::load_v<16>(sp + i), aie::load_v<16>(s_rs + i)));
+  PROF_BEGIN
+  // any row sum >= 2^TAU: the max over all 256 (replicated) lanes, one compare
+  aie::vector<float, 64> m0 = aie::load_v<64>(s_rs), m1 = aie::load_v<64>(s_rs + 64);
+  m0 = aie::max(m0, aie::load_v<64>(s_rs + 128));
+  m1 = aie::max(m1, aie::load_v<64>(s_rs + 192));
+  m0 = aie::max(m0, m1);
+  aie::vector<float, 16> mx = aie::max(aie::max(m0.extract<16>(0), m0.extract<16>(1)),
+                                       aie::max(m0.extract<16>(2), m0.extract<16>(3)));
+  const bool redo = chunk == 0 || !aie::ge(mx, aie::broadcast<float, 16>(float(1ull << FA_TAU))).empty();
+  if (redo)
+    softmax_rescale(g, sp, gp, p, chunk);
+#pragma clang loop unroll(full)
+  for (int i = 0; i < TQ * 8; i += 64)                          // l += this chunk's row sums
+    aie::store_v(sp + i, aie::add(aie::load_v<64>(sp + i), aie::load_v<64>(s_rs + i)));
+  PROF_END(3)
+}
+
+// The whole softmax step in one call: sm_exp then softmax_step.
+void sm_all(bfloat16 *__restrict g, bfloat16 *__restrict up, float *__restrict sp,
+            bfloat16 *__restrict gp, uint8_t *__restrict p, int32_t *__restrict rtp, int32_t pass,
+            int32_t chunk) {
+  sm_exp(g, p, rtp, pass, chunk);
+  softmax_step(g, up, sp, gp, p, rtp, pass, chunk);
 }
 
 // End of a pass: O /= l (l replicated, so its bf16 inverse is scale_rows' table).
 void finalize(float *__restrict sp, bfloat16 *__restrict gp) {
   SET_ROUNDING();
+#ifdef FA_X_PROF
+  s_prof[4] += prof_now() - s_prof[6];
+  s_prof[5] += 1;
+#endif
   for (int rh = 0; rh < TQ / 32; rh++) {
     for (int j = 0; j < 256; j += 16) {
       aie::accum<accfloat, 16> a;
@@ -546,6 +647,12 @@ void finalize(float *__restrict sp, bfloat16 *__restrict gp) {
     }
     scale_o(gp, s_rep);
   }
+#ifdef FA_X_PROF
+  for (int k = 0; k < 6; k++) {
+    reinterpret_cast<uint16_t *>(gp)[2 * k] = (uint16_t)(s_prof[k] & 0xffff);
+    reinterpret_cast<uint16_t *>(gp)[2 * k + 1] = (uint16_t)(s_prof[k] >> 16);
+  }
+#endif
 }
 
 } // extern "C"

@@ -25,7 +25,7 @@ def peak(a: In, b: Out, *, srchash: CompileTime[int] = 0):
     in4 = np.ndarray[(R * IN,), np.dtype[np.int8]]
     out4 = np.ndarray[(R * OUT,), np.dtype[np.int32]]
     k = ExternalFunction("peak_run", source_file=str(HERE / "peak.cc"), arg_types=[in_ty, out_ty],
-                         include_dirs=include_dirs() + [str(HERE.parent / "moe_batch")], compile_flags=[f"-DPEAK_{MODE.upper()}", f"-DPEAK_ITERS={ITERS}"])
+                         include_dirs=include_dirs() + [str(HERE.parent / "moe_batch")], compile_flags=[f"-DPEAK_{MODE.upper()}", f"-DPEAK_ITERS={ITERS}"] + [f"-D{x}" for x in os.environ.get("PEAK_DEFS", "").split(",") if x])
     A = [ObjectFifo(in4, name=f"A{c}", depth=1) for c in range(C)]
     Asp = [A[c].cons().split([r * IN for r in range(R)], obj_types=[in_ty] * R, names=[f"A{c}_{r}" for r in range(R)],
                              depths=[1] * R, tile=Tile(c, 1)) for c in range(C)]
