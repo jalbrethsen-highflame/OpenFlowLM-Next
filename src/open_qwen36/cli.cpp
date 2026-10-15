@@ -41,6 +41,9 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 #include <vector>
 
 #include "open_qwen36/core.hpp"
@@ -371,6 +374,20 @@ std::vector<int> request(Core& core, const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef __linux__
+    // OFLM_OPEN_CPU_DECODE=1: the decode threads one per core, spread over both CPU dies, and
+    // spinning between the step's short parallel regions. libgomp reads these only at start, so
+    // set them and start again once (OFLM_OPEN_OMP_REEXEC marks the second start). 8 threads
+    // pinned: 6.2 tok/s on the 27B against 4.6 unpinned (16: 6.8).
+    if (const char* cd = std::getenv("OFLM_OPEN_CPU_DECODE"); cd && std::string(cd) == "1" && !std::getenv("OFLM_OPEN_OMP_REEXEC")) {
+        setenv("OFLM_OPEN_OMP_REEXEC", "1", 1);
+        bool changed = false;
+        for (const auto& [k, v] : {std::pair<const char*, const char*>{"OMP_PROC_BIND", "spread"}, {"OMP_PLACES", "cores"},
+                                   {"OMP_WAIT_POLICY", "ACTIVE"}})
+            if (!std::getenv(k)) { setenv(k, v, 1); changed = true; }
+        if (changed) execv("/proc/self/exe", argv);   // on failure, carry on unpinned
+    }
+#endif
     Args a = parse(argc, argv);
     // The server reads this (engine.cpp); the CLI is the tool you reach for when a
     // dispatch times out, so it should honour the same knob - and a small value is how

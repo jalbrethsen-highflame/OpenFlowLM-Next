@@ -13,6 +13,23 @@ with d3.
 - 512-row and 256-row GEMM tiers for short prompts, host stages on real rows only.
 - The tiled host attention, one host thread per physical core.
 
+## Status (2026-10-15)
+
+Decode with `OFLM_OPEN_CPU_DECODE=1` (CLI pins 8 threads, 4 per CPU die): products on the CPU from
+the int4 prompt weights (int8 VNNI kernel), ~20 % of each product's columns on the NPU at the
+same time, mixer on the host, LM head on the NPU. Peak memory 16.6 GB (the q4 pools are dropped).
+
+| Route (45-token prompt, 48 tokens) | ms/token | tok/s | Peak RSS |
+|---|---|---|---|
+| NPU fused kernels (q4_1) | 366 | 2.7 | 30.2 GB |
+| CPU, 8 threads, unpinned, no split | 252 | 4.0 | 16.6 GB |
+| CPU + NPU split, 8 threads pinned | 160-170 | 5.9-6.2 | 16.6 GB |
+| CPU + NPU split, 16 threads pinned | 146 | 6.8 | 16.6 GB |
+
+8 threads pinned, per token: products 124 ms (NPU wait past the CPU's share 7 ms), LM head 25 ms
+(NPU, with its context switch), mixer 8.5 ms, rest 2 ms. The int8 kernel gives the same 48 tokens
+as the exact bf16 one.
+
 ## Pending
 
 ### Verify
@@ -35,13 +52,15 @@ with d3.
       d3's work, so the crossover to 1024-row chunks is probably higher.
 - [ ] OMP_WAIT_POLICY=ACTIVE in the causal runner (d3: -7 % on a short prompt, -9 % at 1K).
 
-### Decode
-- [ ] Measure decode on Linux. The skill records 419-450 ms/token (Windows, 2026-10-01).
-- [ ] Decode reads every weight for every token. At the measured ~54 GB/s NPU DRAM rate, a
-      4-bit 27B dense model is limited to ~3.5 tok/s. Ways past that: speculative decoding
-      with the model's MTP head (the engine has no MTP support yet), or several sequences
-      a step.
-- [ ] Find what limits decode now (kernel time vs host vs DRAM) before choosing.
+### Decode (target 10 tok/s)
+- [ ] MTP: draft with the model's MTP layer, verify k + 1 tokens in one pass. Needs the HF MTP
+      weights (only shard 1 of 18 is on disk), a multi-token verify pass (the CPU kernel's math
+      grows k + 1 times), DeltaNet state rollback.
+- [ ] LM head: 25 ms a token on the NPU, with a context switch. Try it on the CPU (q8, ~13 ms at
+      100 GB/s) or split it like the products.
+- [ ] Tune the NPU share per thread count: at 16 threads the NPU is the slower side (8 ms wait).
+- [ ] Server use: the threads spin (ACTIVE) and are pinned; a server must let them sleep
+      between requests.
 
 ### Integration
 - [ ] A chat / serve entry point for the causal model (`chat.py`, the oflm app).
