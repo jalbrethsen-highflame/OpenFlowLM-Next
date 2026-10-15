@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import math
 import subprocess
 import sys
@@ -119,6 +120,11 @@ class Engine:
         cmd = [str(cli), "--model", str(model), "--kernels", str(kernels), "--max-ctx", str(max_ctx),
                "--gemm-block", "--noncausal", "--serve-decision", "--quiet"]
         self.log = open(log, "w") if log else subprocess.DEVNULL
+        # OpenMP workers spin between the host stages' many short parallel regions instead of
+        # sleeping (the engine's default is PASSIVE): -7 % on a short decision, -9 % at 1K
+        # tokens, no change at 4K / 16K. An OMP_WAIT_POLICY already set wins.
+        env = {**(env if env is not None else os.environ)}
+        env.setdefault("OMP_WAIT_POLICY", "ACTIVE")
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True, env=env)
         line = self.p.stdout.readline()
         if line.strip() != "READY":

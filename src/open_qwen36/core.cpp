@@ -3594,12 +3594,14 @@ bool Core::pipe_ok() const {
 void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     auto t0 = std::chrono::steady_clock::now();
     timing_ = StepTiming{};
-    // gemm_dit.small: a prompt of up to OFLM_OPEN_SMALL_MAX tokens (default 1023: below the NPU
-    // attention, whose streams take full chunks) runs in chunks of the small M on its own GEMM
-    // streams -- fewer padded rows, and from two chunks on the host and NPU overlap.
+    // gemm_dit.small: a prompt of up to OFLM_OPEN_SMALL_MAX tokens (default 2048) runs in chunks
+    // of the small M on its own GEMM streams -- fewer padded rows, and from two chunks on the host
+    // and NPU overlap. Its attention is the host's (the NPU streams take full chunks), which is
+    // what sets the limit: d3 int4 at 1024 / 1536 / 2048 tokens 2.43 / 3.57 / 3.81 s -> 2.12 /
+    // 2.72 / 3.37, but at 2560 4.61 -> 4.83 and at 4096 5.77 -> 8.70.
     // OFLM_OPEN_SMALL_M=0 off. Its FFN is the device-packed one only.
     static const bool small_on = [] { const char* e = std::getenv("OFLM_OPEN_SMALL_M"); return !(e && *e == '0'); }();
-    static const size_t small_max = [] { const char* e = std::getenv("OFLM_OPEN_SMALL_MAX"); return e ? std::strtoul(e, nullptr, 10) : 1023ul; }();
+    static const size_t small_max = [] { const char* e = std::getenv("OFLM_OPEN_SMALL_MAX"); return e ? std::strtoul(e, nullptr, 10) : 2048ul; }();
     static const bool small_ffn = [] { const char* e = std::getenv("OFLM_OPEN_FFN_DEVICE"); return !(e && *e == '0'); }();
     const nlohmann::json* Dp = &man_.gemm_dit;
     nlohmann::json Dsmall;
