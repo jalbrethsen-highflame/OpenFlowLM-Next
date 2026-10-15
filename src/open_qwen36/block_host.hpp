@@ -124,6 +124,10 @@ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, 
 void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y,
              const std::function<void()>& side = nullptr, size_t kt0 = 0, size_t kt1 = 0);
 /// (kt0, kt1: only those 64-K tiles of every strip, a partial sum; kt1 = 0 means all)
+/// R rows at once (1..8; an MTP verify pass): x [R, K] row-major, y [R, ldy] (columns 0..npad);
+/// each weight block unpacked once for all rows. The int8 path; the bf16 one loops gemv_b4.
+void gemv_b4_rows(const uint8_t* B, size_t npad, size_t K, const float* x, size_t R, float* y, size_t ldy,
+                  size_t kt0 = 0, size_t kt1 = 0);
 /// The dit FFN's up|gate output to h: every 128 columns of `ug` are [gate 64 | up 64]; h [ff] =
 /// silu(gate) * up. Parallel and 16 lanes wide (ff % 64 == 0).
 void swiglu_tiles(const float* ug, size_t ff, float* h);

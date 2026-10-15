@@ -625,6 +625,35 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// the dit2 int4 prompt weights, the mixer on the host as the prompt pipeline does it at T=1,
     /// the norm and LM head on the NPU (tail_logits). Qwen3.5 linear / full layers with a dense FFN.
     void step_cpu_decode(int token, bool want_logits);
+    /// R tokens (1..8) at positions pos_.. through the CPU decode route at once (an MTP verify
+    /// pass): rows_x_ the rows' final residuals, rows_logits_ their logits (R > 1), logits_host_ the
+    /// last row's. With verify_save_ the linear layers' states before the rows are kept, so
+    /// cpu_rollback(keep, R) can return to after the first `keep` rows.
+    void step_cpu_rows(const int* toks, size_t R, bool want_logits);
+    void cpu_rollback(size_t keep, size_t R);
+    struct VerifySave { std::vector<uint8_t> state; std::vector<float> qkv, z, xn; };
+    std::vector<VerifySave> ver_;
+    bool verify_save_ = false;
+    std::vector<float> rows_x_, rows_logits_;
+    /// OFLM_OPEN_MTP=<the HF shard with mtp.*> (with OFLM_OPEN_CPU_DECODE=1): Qwen3.5's MTP head as
+    /// a draft model -- its layer's GEMMs as dit2 int4 blocks on the CPU, its own KV rows; drafts
+    /// OFLM_OPEN_MTP_K tokens (default 2) a pass, verified in one step_cpu_rows pass (greedy).
+    struct Mtp {
+        bool on = false;
+        std::vector<float> n_emb, n_hid, n_in, n_post, n_out, qn, kn;   ///< (1 + w)
+        std::vector<uint8_t> fc, qkvg, o, ug, down;                      ///< dit2 int4 blocks
+        std::vector<uint16_t> kv;                                        ///< [max_ctx][2 kvw] bf16
+        size_t kv0 = 0;                                                  ///< the position of slot 0
+    } mtp_;
+    void load_mtp(const std::string& shard);
+    /// R MTP rows (main hidden after the final norm, the next token) at slots pos0..: xn [R, hidden]
+    void mtp_forward(const float* hn, const int* toks, size_t R, size_t pos0, float* xn);
+public:
+    bool mtp_on() const { return mtp_.on; }
+    /// greedy decode with MTP drafts from the prompt's end: tok0 (the prompt's next token) first,
+    /// n tokens in all; stats to stderr
+    std::vector<int> generate_mtp(int tok0, int n, int k);
+private:
     bool cpu_decode_ok() const;
     bool cpu_decode_on_ = false;
     bool drop_pools_ = false;   ///< the q4 pools freed after building the int4 weights (CPU decode)

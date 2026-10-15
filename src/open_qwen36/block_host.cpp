@@ -1305,6 +1305,99 @@ void b4_strip_vnni(const uint8_t* st, const B4XQ& q, size_t t0, size_t t1, float
 }
 }  // namespace
 
+namespace {
+// R rows of the int8 path: the pair's 16 columns x 8 k unpacked once (xor, and, shift) per k block,
+// then 2 vpdpbusd a row; run[r][p] in L1
+template <int R>
+__attribute__((target("avx512f,avx512bw,avx512vnni")))
+void b4_strip_vnni_rows(const uint8_t* st, const B4XQ* q, size_t t0, size_t t1, float* const* acc) {
+    const __m512i x88 = _mm512_set1_epi8(static_cast<char>(0x88)), m0f = _mm512_set1_epi8(0x0F), six = _mm512_set1_epi32(6);
+    alignas(64) float run[R][8][16];
+    std::memset(run, 0, sizeof run);
+    for (size_t kt = t0; kt < t1; ++kt) {
+        const uint8_t* t = st + kt * kB4Tile;
+        _mm_prefetch(reinterpret_cast<const char*>(t + 8 * kB4Tile), _MM_HINT_NTA);
+        for (int p = 0; p < 8; ++p) {
+            __m512i a[R];
+            for (int r = 0; r < R; ++r) a[r] = _mm512_setzero_si512();
+            for (int kb = 0; kb < 8; ++kb) {
+                const __m512i v = _mm512_xor_si512(_mm512_loadu_si512(t + (p * 8 + kb) * 64), x88);
+                const __m512i lo = _mm512_and_si512(v, m0f), hi = _mm512_and_si512(_mm512_srli_epi16(v, 4), m0f);
+                for (int r = 0; r < R; ++r) {
+                    a[r] = _mm512_dpbusd_epi32(a[r], lo, _mm512_set1_epi32(q[r].ev[kt * 8 + kb]));
+                    a[r] = _mm512_dpbusd_epi32(a[r], hi, _mm512_set1_epi32(q[r].od[kt * 8 + kb]));
+                }
+            }
+            const __m512i e = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(t + 4096 + p * 16)));
+            const __m512 pe = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_max_epi32(_mm512_sub_epi32(e, six), _mm512_setzero_si512()), 23));
+            for (int r = 0; r < R; ++r) {
+                const __m512 sc = _mm512_mul_ps(_mm512_set1_ps(q[r].sx[kt]), pe);
+                _mm512_store_ps(run[r][p], _mm512_fmadd_ps(_mm512_sub_ps(_mm512_cvtepi32_ps(a[r]), _mm512_set1_ps(static_cast<float>(q[r].cs[kt]))),
+                                                           sc, _mm512_load_ps(run[r][p])));
+            }
+        }
+    }
+    for (int r = 0; r < R; ++r)
+        for (int p = 0; p < 8; ++p) _mm512_storeu_ps(acc[r] + p * 16, _mm512_add_ps(_mm512_loadu_ps(acc[r] + p * 16), _mm512_load_ps(run[r][p])));
+}
+using RowsFn = void (*)(const uint8_t*, const B4XQ*, size_t, size_t, float* const*);
+constexpr RowsFn kRowsFn[8] = {b4_strip_vnni_rows<1>, b4_strip_vnni_rows<2>, b4_strip_vnni_rows<3>, b4_strip_vnni_rows<4>,
+                               b4_strip_vnni_rows<5>, b4_strip_vnni_rows<6>, b4_strip_vnni_rows<7>, b4_strip_vnni_rows<8>};
+}  // namespace
+
+void gemv_b4_rows(const uint8_t* B, size_t npad, size_t K, const float* x, size_t R, float* y, size_t ldy, size_t kt0, size_t kt1) {
+    if (R == 0) return;
+    if (R > 8) throw std::runtime_error("open_qwen36: gemv_b4_rows: at most 8 rows");
+    static const bool int8 = [] {
+        const char* e = std::getenv("OFLM_OPEN_DECODE_GEMV");
+        return !(e && std::string(e) == "bf16") && __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512bw");
+    }();
+    if (!int8 || R == 1) {
+        for (size_t r = 0; r < R; ++r) gemv_b4(B, npad, K, x + r * K, y + r * ldy, nullptr, kt0, kt1);
+        return;
+    }
+    if (npad % 128 || K % 64) throw std::runtime_error("open_qwen36: gemv_b4_rows: N % 128 or K % 64");
+    static thread_local std::vector<B4XQ> xq_tl;
+    std::vector<B4XQ>& xq = xq_tl;
+    xq.resize(8);
+    for (size_t r = 0; r < R; ++r) b4_xq_size(K, xq[r]);
+    const size_t S = npad / 128, KT = K / 64, T = static_cast<size_t>(omp_get_max_threads());
+    if (!kt1) kt1 = KT;
+    const size_t KR = kt1 - kt0;
+    const size_t ks = std::min(KR, std::max<size_t>(1, (4 * T + S - 1) / S));
+    static thread_local std::vector<float> part_tl;
+    std::vector<float>& part = part_tl;
+    if (ks > 1) part.resize(ks * R * npad);
+    const RowsFn fn = kRowsFn[R - 1];
+#pragma omp parallel
+    {
+#pragma omp for schedule(static) collapse(2)
+        for (long long r = 0; r < static_cast<long long>(R); ++r)
+            for (long long kt = static_cast<long long>(kt0); kt < static_cast<long long>(kt1); ++kt)
+                b4_prep_xq_tiles(x + r * K, static_cast<size_t>(kt), static_cast<size_t>(kt) + 1, xq[static_cast<size_t>(r)]);
+#pragma omp for schedule(dynamic, 1)
+        for (long long w = 0; w < static_cast<long long>(S * ks); ++w) {
+            const size_t s = static_cast<size_t>(w) / ks, rr = static_cast<size_t>(w) % ks;
+            const size_t t0 = kt0 + KR * rr / ks, t1 = kt0 + KR * (rr + 1) / ks;
+            float* acc[8];
+            for (size_t r = 0; r < R; ++r) {
+                acc[r] = ks == 1 ? y + r * ldy + s * 128 : part.data() + (rr * R + r) * npad + s * 128;
+                std::fill(acc[r], acc[r] + 128, 0.f);
+            }
+            fn(B + s * KT * kB4Tile, xq.data(), t0, t1, acc);
+        }
+        if (ks > 1) {
+#pragma omp for schedule(static) collapse(2)
+            for (long long r = 0; r < static_cast<long long>(R); ++r)
+                for (long long n = 0; n < static_cast<long long>(npad); ++n) {
+                    float v = 0.f;
+                    for (size_t rr = 0; rr < ks; ++rr) v += part[(rr * R + static_cast<size_t>(r)) * npad + static_cast<size_t>(n)];
+                    y[r * ldy + n] = v;
+                }
+        }
+    }
+}
+
 void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y, const std::function<void()>& side, size_t kt0,
              size_t kt1) {
     if (npad % 128 || K % 64) throw std::runtime_error("open_qwen36: gemv_b4: N % 128 or K % 64");

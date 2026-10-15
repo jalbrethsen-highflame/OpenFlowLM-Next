@@ -1257,6 +1257,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
             globals_[name] = alloc(bytes);
         }
     }
+    if (const char* mp = std::getenv("OFLM_OPEN_MTP"); mp && *mp && cpu_head_) load_mtp(mp);
     // a "#1" twin per staged GEMM step's x / y, so the host fills or reads one while the NPU uses the other
     if (stage_major_on_ && layer_major_ok())
         for (int l = 0; l < nl_; ++l) {
@@ -2740,6 +2741,18 @@ void Core::gemm(const Step& s, const float* x, size_t T, size_t K, size_t N, int
     timing_.gemm_tr_ms += ms_since(t1);
 }
 
+
+namespace {
+// OFLM_OPEN_DUMP_HIDDEN=<prefix> (debug, MTP evaluation): each position's final residual (before
+// the final norm, f32 [hidden]) appended to <prefix>.h and its input token id to <prefix>.ids
+void dump_hidden(const float* rows, size_t n, size_t hid, const int* ids) {
+    static const char* pre = std::getenv("OFLM_OPEN_DUMP_HIDDEN");
+    if (!pre) return;
+    if (FILE* f = std::fopen((std::string(pre) + ".h").c_str(), "ab")) { std::fwrite(rows, 4, n * hid, f); std::fclose(f); }
+    if (FILE* f = std::fopen((std::string(pre) + ".ids").c_str(), "ab")) { std::fwrite(ids, 4, n, f); std::fclose(f); }
+}
+}  // namespace
+
 void Core::states_to_device() {
     for (int l = 0; l < nl_; ++l) state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE);
     state_owner_ = 0;
@@ -2763,7 +2776,9 @@ bool Core::cpu_decode_ok() const {
     return true;
 }
 
-void Core::step_cpu_decode(int token, bool want_logits) {
+void Core::step_cpu_decode(int token, bool want_logits) { step_cpu_rows(&token, 1, want_logits); }
+
+void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
     apply_thread_budget();
     // OFLM_OPEN_DECODE_THREADS (default 8, 1-16): the cores a CPU decode step uses, so the rest
     // of the machine stays usable. Reading memory needs about 4 cores per CPU die (8 reach
@@ -2773,6 +2788,7 @@ void Core::step_cpu_decode(int token, bool want_logits) {
         const int n = e ? std::atoi(e) : 8;
         return std::max(1, std::min(16, n));
     }();
+    if (R < 1 || R > 8) throw std::runtime_error("open_qwen36: step_cpu_rows: 1 to 8 rows");
     const int saved_threads = omp_get_max_threads();
     omp_set_num_threads(dthreads);
     struct Restore { int n; ~Restore() { omp_set_num_threads(n); } } restore{saved_threads};
@@ -2790,27 +2806,27 @@ void Core::step_cpu_decode(int token, bool want_logits) {
     };
     // gemm_dit.decode.split (OFLM_OPEN_DECODE_SPLIT, default on): a GEMV's first nn columns on the
     // NPU -- a 256-row dit2 GEMM on 64-row tiles, row 0 real -- while the CPU does the rest of the
-    // same int4 buffer; the NPU's row 0 read back as bf16
+    // same int4 buffer; the NPU's row 0 read back as bf16 (one row only)
     static const bool split_on = [] { const char* e = std::getenv("OFLM_OPEN_DECODE_SPLIT"); return !(e && *e == '0'); }();
-    const nlohmann::json* SP = split_on && D.contains("decode") ? &D["decode"] : nullptr;
+    const nlohmann::json* SP = split_on && R == 1 && D.contains("decode") ? &D["decode"] : nullptr;
     // OFLM_OPEN_DECODE2 (default on): gemm_dit.decode2's 32-row kernels where they exist
     static const bool d2_on = [] { const char* e = std::getenv("OFLM_OPEN_DECODE2"); return !(e && *e == '0'); }();
     const nlohmann::json* S2 = split_on && d2_on && D.contains("decode2") ? &D["decode2"] : nullptr;
     // one NPU image a step: with decode2, the shapes it does not cover stay on the CPU rather than
     // switching to the 256-row kernels' image and back
     if (S2) SP = nullptr;
+    // in: R rows of k, out: R rows of npad (row stride npad)
     auto gemv = [&](const Step& st, int l, const float* in, std::vector<float>& out) {
         size_t n, k, npad;
         shape(st, n, k, npad);
-        out.resize(npad);
+        out.resize(R * npad);
         auto tg = std::chrono::steady_clock::now();
         const uint8_t* B = gemm_w_.at(st.args[0])[l].map<const uint8_t*>();
         const std::string key = std::to_string(n) + "x" + std::to_string(k);
         if (S2 && (*S2)["split"].contains(key)) {
             // gemm_dit.decode2 (designs/dit2/dec.py): the first columns as 4096-column NPU chunks of
-            // a 32-row int4 GEMM, B split over the cores; rows [0, R) of A real (R = 1 here; an MTP
-            // verify pass would pack k + 1)
-            const size_t R = 1, KT = k / 64;
+            // a 32-row int4 GEMM, B split over the cores; rows [0, R) of A real
+            const size_t KT = k / 64;
             const nlohmann::json& chunks = (*S2)["split"][key]["chunks"];
             // a 5th chunk field: the NPU's K steps (a K split; the CPU completes the sum)
             const size_t KN = chunks[0].size() > 3 ? chunks[0][3].get<size_t>() : KT;
@@ -2818,7 +2834,8 @@ void Core::step_cpu_decode(int token, bool want_logits) {
             xrt::bo& ab = globals_.at("dec2_a");
             uint8_t* a = ab.map<uint8_t*>();
             // row r into pack_a.py's order2 at mt = 32: per 64-K step 2304 B, block (j, i) with
-            // row block rb = r / 8 at j = (rb / 2) * 16 + 2 kb + rb % 2, i = r % 8
+            // row block rb = r / 8 at j = (rb / 2) * 16 + 2 kb + rb % 2, i = r % 8. Rows past R keep
+            // what the widest pass so far left: harmless, the host reads rows < R only.
             for (size_t r = 0; r < R; ++r) {
                 const size_t rb = r / 8, i = r % 8;
                 for (size_t ks = 0; ks < KN; ++ks)
@@ -2835,10 +2852,8 @@ void Core::step_cpu_decode(int token, bool want_logits) {
                 nnpu = std::max(nnpu, chunks[ci][0].get<size_t>() + chunks[ci][1].get<size_t>());
             }
             timing_.moe_prep_ms += ms_since(tg);
-            const double t_cpu0 = ms_since(tg);
-            host::gemv_b4(B + nnpu / 128 * KT * 4224, npad - nnpu, k, in, out.data() + nnpu);
-            if (KN < KT) host::gemv_b4(B, nnpu, k, in, out.data(), nullptr, KN, KT);   // the NPU columns' other K
-            const double cpu_ms = ms_since(tg) - t_cpu0;
+            host::gemv_b4_rows(B + nnpu / 128 * KT * 4224, npad - nnpu, k, in, R, out.data() + nnpu, npad);
+            if (KN < KT) host::gemv_b4_rows(B, nnpu, k, in, R, out.data(), npad, KN, KT);   // the NPU columns' other K
             auto tw = std::chrono::steady_clock::now();
             for (Inflight& f : fl) wait_run(f);
             timing_.attn_ms += ms_since(tw);
@@ -2849,21 +2864,21 @@ void Core::step_cpu_decode(int token, bool want_logits) {
                 read_back(cb, 32 * 32 * 128 * 2, 0);
                 const uint16_t* c16 = cb.map<const uint16_t*>();
                 const size_t off = chunks[ci][0].get<size_t>(), nc = chunks[ci][1].get<size_t>();
-                for (size_t t = 0; t < nc / 128; ++t)
-                    for (size_t cbk = 0; cbk < 16; ++cbk)
-                        for (size_t j = 0; j < 8; ++j) {
-                            const float v = bf16_to_f32(c16[t * 4096 + cbk * 64 + j]);
-                            float& o = out[off + t * 128 + cbk * 8 + j];
-                            o = KN < KT ? o + v : v;
-                        }
+                for (size_t r = 0; r < R; ++r)
+                    for (size_t t = 0; t < nc / 128; ++t)
+                        for (size_t cbk = 0; cbk < 16; ++cbk)
+                            for (size_t j = 0; j < 8; ++j) {
+                                const float v = bf16_to_f32(c16[t * 4096 + ((r / 8) * 16 + cbk) * 64 + (r % 8) * 8 + j]);
+                                float& o = out[r * npad + off + t * 128 + cbk * 8 + j];
+                                o = KN < KT ? o + v : v;
+                            }
             }
-            (void)cpu_ms;
             timing_.moe_read_ms += ms_since(tr);
             timing_.part0_ms += ms_since(tg);
             return;
         }
         if (!SP || !(*SP)["split"].contains(key)) {
-            host::gemv_b4(B, npad, k, in, out.data());
+            host::gemv_b4_rows(B, npad, k, in, R, out.data(), npad);
             timing_.part0_ms += ms_since(tg);
             return;
         }
@@ -2922,61 +2937,318 @@ void Core::step_cpu_decode(int token, bool want_logits) {
         timing_.moe_read_ms += ms_since(tg) - cpu_ms - (timing_.attn_ms - attn0);   // trace: read back + convert
         timing_.part0_ms += ms_since(tg);
     };
-    static thread_local std::vector<float> x, xn, y, og, h, ya, yb, yc, yd;
-    x.resize(hid); xn.resize(hid);
-    file_->bf16_row(w_->embed_tensor, static_cast<size_t>(token), hid, x.data());
+    // OFLM_OPEN_MTP's verify pass (verify_save_): each linear layer's state before the rows, and the
+    // rows' DeltaNet inputs, so cpu_rollback can keep a prefix
+    const bool save = verify_save_ && R > 1;
+    if (save) ver_.assign(nl_, {});
+    static thread_local std::vector<float> x, xn, y, og, h, ya, yb, yc, yd, mid;
+    x.resize(R * hid); xn.resize(R * hid);
+    for (size_t r = 0; r < R; ++r) file_->bf16_row(w_->embed_tensor, static_cast<size_t>(toks[r]), hid, x.data() + r * hid);
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];
         const GemmBlockProgram& gb = lt.gemm_block;
         const HostConsts& hc = hc_[l];
-        host::rmsnorm_rows(x.data(), 1, hid, hc.ln.data(), gb.eps, xn.data());
+        host::rmsnorm_rows(x.data(), R, hid, hc.ln.data(), gb.eps, xn.data());
         gemv(gb.program[0], l, xn.data(), y);
+        const size_t nq = y.size() / R;
         auto th = std::chrono::steady_clock::now();
         uint8_t* sp = state_[l].map<uint8_t*>();
         if (gb.kind == "linear") {
             const size_t nch = gb.qkv_dim, vw = gb.vw;
-            og.resize(vw);
+            ya.resize(R * nch); yb.resize(R * vw); og.resize(R * vw);
+            for (size_t r = 0; r < R; ++r) {
+                std::copy(y.begin() + r * nq, y.begin() + r * nq + nch, ya.begin() + r * nch);
+                std::copy(y.begin() + r * nq + nch, y.begin() + r * nq + nch + vw, yb.begin() + r * vw);
+            }
+            if (save) {
+                VerifySave& v = ver_[l];
+                v.state.assign(sp, sp + lt.state_bytes);
+                v.qkv = ya; v.z = yb; v.xn = xn;
+            }
             host::DeltaGeom g;
-            g.T = 1; g.hid = hid;
+            g.T = R; g.hid = hid;
             g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
             g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
-            g.t_real = 1;
+            g.t_real = R;
             if (!hc.Wa16.empty()) { g.wa16 = hc.Wa16.data(); g.wb16 = hc.Wb16.data(); }
             double ph[2] = {0, 0};
-            host::deltanet_block(g, y.data(), y.data() + nch, xn.data(), hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
+            host::deltanet_block(g, ya.data(), yb.data(), xn.data(), hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
                                  hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
                                  reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
         } else {
             const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
-            og.resize(qw);
+            ya.resize(R * qw); yb.resize(R * kvw); yc.resize(R * kvw); yd.resize(R * qw); og.resize(R * qw);
+            for (size_t r = 0; r < R; ++r) {
+                const float* yr = y.data() + r * nq;
+                std::copy(yr, yr + qw, ya.begin() + r * qw);
+                std::copy(yr + qw, yr + qw + kvw, yb.begin() + r * kvw);
+                std::copy(yr + qw + kvw, yr + qw + 2 * kvw, yc.begin() + r * kvw);
+                std::copy(yr + qw + 2 * kvw, yr + 2 * qw + 2 * kvw, yd.begin() + r * qw);
+            }
             host::AttnGeom g;
-            g.T = 1; g.t_real = 1; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
+            g.T = R; g.t_real = R; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
             g.pos0 = pos; g.eps = gb.eps;
-            host::attention_block(g, y.data(), y.data() + qw, y.data() + qw + kvw, y.data() + qw + 2 * kvw, hc.qn.data(),
-                                  hc.kn.data(), man_.rope_inv_freq.data(), state_[l].map<uint16_t*>(), row / 2, og.data());
+            host::attention_block(g, ya.data(), yb.data(), yc.data(), yd.data(), hc.qn.data(), hc.kn.data(),
+                                  man_.rope_inv_freq.data(), state_[l].map<uint16_t*>(), row / 2, og.data());
         }
         timing_.part1_ms += ms_since(th);
-        const std::vector<float> mid = og;
+        mid = og;
         gemv(gb.program[1], l, mid.data(), y);
-        for (size_t i = 0; i < hid; ++i) x[i] += y[i];
-        host::rmsnorm_rows(x.data(), 1, hid, hc.postln.data(), gb.eps, xn.data());
+        const size_t no = y.size() / R;
+        for (size_t r = 0; r < R; ++r)
+            for (size_t i = 0; i < hid; ++i) x[r * hid + i] += y[r * no + i];
+        host::rmsnorm_rows(x.data(), R, hid, hc.postln.data(), gb.eps, xn.data());
         gemv(gb.ffn_program[0], l, xn.data(), h);
         // up|gate C: every 128-column tile is [gate 64 | up 64]; h = silu(gate) * up
-        const size_t ff = h.size() / 2;
-        og.resize(ff);
-        host::swiglu_tiles(h.data(), ff, og.data());
+        const size_t ug = h.size() / R, ff = ug / 2;
+        og.resize(R * ff);
+        for (size_t r = 0; r < R; ++r) host::swiglu_tiles(h.data() + r * ug, ff, og.data() + r * ff);
         gemv(gb.ffn_program[1], l, og.data(), y);
-        for (size_t i = 0; i < hid; ++i) x[i] += y[i];
+        const size_t nd = y.size() / R;
+        for (size_t r = 0; r < R; ++r)
+            for (size_t i = 0; i < hid; ++i) x[r * hid + i] += y[r * nd + i];
     }
     state_owner_ = 1;
-    ++pos_;
-    if (want_logits) tail_logits(x.data());
+    pos_ += static_cast<int>(R);
+    dump_hidden(x.data(), R, hid, toks);
+    last_x_.assign(x.end() - static_cast<long>(hid), x.end());
+    rows_x_.assign(x.begin(), x.end());
+    if (want_logits) {
+        rows_logits_.resize(R * w_->vocab);
+        for (size_t r = 0; r < R; ++r) {
+            tail_logits(x.data() + r * hid);
+            if (R > 1) std::copy(logits_host_.begin(), logits_host_.end(), rows_logits_.begin() + r * w_->vocab);
+        }
+    }
     timing_.total_ms = ms_since(t0);
     static const bool trace = std::getenv("OFLM_OPEN_CPU_DECODE_TRACE") != nullptr;
     if (trace)
-        std::fprintf(stderr, "cpu decode pos %zu: %.1f ms | gemv %.1f (npu wait %.1f) mixer %.1f lm %.1f | split pre %.1f post %.1f\n", pos,
-                     timing_.total_ms, timing_.part0_ms, timing_.attn_ms, timing_.part1_ms, timing_.lmhead_ms, timing_.moe_prep_ms,
-                     timing_.moe_read_ms);
+        std::fprintf(stderr, "cpu decode pos %zu rows %zu: %.1f ms | gemv %.1f (npu wait %.1f) mixer %.1f lm %.1f | split pre %.1f post %.1f\n",
+                     pos, R, timing_.total_ms, timing_.part0_ms, timing_.attn_ms, timing_.part1_ms, timing_.lmhead_ms,
+                     timing_.moe_prep_ms, timing_.moe_read_ms);
+}
+
+void Core::load_mtp(const std::string& shard) {
+    std::ifstream f(shard, std::ios::binary);
+    uint64_t n = 0;
+    f.read(reinterpret_cast<char*>(&n), 8);
+    std::string hs(n, '\0');
+    f.read(hs.data(), static_cast<std::streamsize>(n));
+    if (!f) throw std::runtime_error("open_qwen36: MTP: cannot read the header of " + shard);
+    const nlohmann::json hdr = nlohmann::json::parse(hs);
+    auto get = [&](const std::string& name, size_t rows, size_t cols) {
+        if (!hdr.contains(name)) throw std::runtime_error("open_qwen36: MTP: " + shard + " has no " + name);
+        const auto& te = hdr.at(name);
+        size_t numel = 1;
+        for (const auto& d : te.at("shape")) numel *= d.get<size_t>();
+        if (te.at("dtype").get<std::string>() != "BF16" || numel != rows * cols)
+            throw std::runtime_error("open_qwen36: MTP: " + name + " is not a BF16 [" + std::to_string(rows) + ", " + std::to_string(cols) + "]");
+        std::vector<uint16_t> raw(numel);
+        f.seekg(static_cast<std::streamoff>(8 + n + te.at("data_offsets")[0].get<uint64_t>()));
+        f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(numel * 2));
+        std::vector<float> out(numel);
+#pragma omp parallel for
+        for (long long i = 0; i < static_cast<long long>(numel); ++i) out[i] = bf16_to_f32(raw[i]);
+        return out;
+    };
+    auto norm = [&](const std::string& name, size_t d) {
+        std::vector<float> w = get(name, d, 1);
+        for (float& x : w) x += 1.f;                 // Qwen3.5's zero-centred RMSNorm weight
+        return w;
+    };
+    const size_t hid = w_->hidden, nh = 24, kvh = 4, hd = 256, qw = nh * hd, kvw = kvh * hd, ff = 17408;
+    if (hid != 5120) throw std::runtime_error("open_qwen36: MTP: built for the 27B's geometry");
+    const std::string p = "mtp.", L = "mtp.layers.0.";
+    Mtp& m = mtp_;
+    m.n_emb = norm(p + "pre_fc_norm_embedding.weight", hid);
+    m.n_hid = norm(p + "pre_fc_norm_hidden.weight", hid);
+    m.n_out = norm(p + "norm.weight", hid);
+    m.n_in = norm(L + "input_layernorm.weight", hid);
+    m.n_post = norm(L + "post_attention_layernorm.weight", hid);
+    m.qn = norm(L + "self_attn.q_norm.weight", hd);
+    m.kn = norm(L + "self_attn.k_norm.weight", hd);
+    auto enc = [&](const std::vector<float>& W, size_t rows, size_t k, std::vector<uint8_t>& out, const int64_t* cm = nullptr) {
+        out.assign(rows / 128 * (k / 64) * kB4Tile, 0);
+        dit_encode_b4(W.data(), rows, k, rows, out.data(), cm);
+    };
+    enc(get(p + "fc.weight", hid, 2 * hid), hid, 2 * hid, m.fc);
+    {
+        // [q heads | k | v | gate heads], the main full layers' qkvg order; HF's q_proj interleaves
+        // each head's 256 q rows with its 256 gate rows
+        const std::vector<float> q = get(L + "self_attn.q_proj.weight", 2 * qw, hid);
+        const std::vector<float> k = get(L + "self_attn.k_proj.weight", kvw, hid), v = get(L + "self_attn.v_proj.weight", kvw, hid);
+        std::vector<float> W((2 * qw + 2 * kvw) * hid);
+        for (size_t hh = 0; hh < nh; ++hh) {
+            std::memcpy(W.data() + hh * hd * hid, q.data() + hh * 2 * hd * hid, hd * hid * 4);
+            std::memcpy(W.data() + (qw + 2 * kvw + hh * hd) * hid, q.data() + (hh * 2 * hd + hd) * hid, hd * hid * 4);
+        }
+        std::memcpy(W.data() + qw * hid, k.data(), kvw * hid * 4);
+        std::memcpy(W.data() + (qw + kvw) * hid, v.data(), kvw * hid * 4);
+        enc(W, 2 * qw + 2 * kvw, hid, m.qkvg);
+    }
+    enc(get(L + "self_attn.o_proj.weight", hid, qw), hid, qw, m.o);
+    {
+        // [up | gate] rows, every 128-column tile [gate 64 | up 64] (the main FFN's order)
+        std::vector<float> W = get(L + "mlp.up_proj.weight", ff, hid);
+        const std::vector<float> g = get(L + "mlp.gate_proj.weight", ff, hid);
+        W.insert(W.end(), g.begin(), g.end());
+        std::vector<int64_t> cm(2 * ff);
+        for (size_t cc = 0; cc < 2 * ff; ++cc) {
+            const size_t j = cc / 128, w = cc % 128;
+            cm[cc] = static_cast<int64_t>(w < 64 ? ff + 64 * j + w : 64 * j + (w - 64));
+        }
+        enc(W, 2 * ff, hid, m.ug, cm.data());
+    }
+    enc(get(L + "mlp.down_proj.weight", hid, ff), hid, ff, m.down);
+    m.kv.assign(cfg_.max_ctx * 2 * kvw, 0);
+    m.on = true;
+    log("MTP: " + std::to_string((m.fc.size() + m.qkvg.size() + m.o.size() + m.ug.size() + m.down.size()) >> 20) +
+        " MB int4 from " + shard);
+}
+
+void Core::mtp_forward(const float* hn, const int* toks, size_t R, size_t pos0, float* xn) {
+    const size_t hid = w_->hidden, nh = 24, kvh = 4, hd = 256, qw = nh * hd, kvw = kvh * hd, ff = 17408;
+    const Mtp& m = mtp_;
+    std::vector<float> xin(R * 2 * hid), e(hid), x(R * hid), res(R * hid), y, og(R * qw), q(R * qw), k(R * kvw), v(R * kvw),
+        g(R * qw), h(R * 2 * ff), hh(R * ff);
+    for (size_t r = 0; r < R; ++r) {
+        file_->bf16_row(w_->embed_tensor, static_cast<size_t>(toks[r]), hid, e.data());
+        host::rmsnorm_rows(e.data(), 1, hid, m.n_emb.data(), 1e-6, xin.data() + r * 2 * hid);
+        host::rmsnorm_rows(hn + r * hid, 1, hid, m.n_hid.data(), 1e-6, xin.data() + r * 2 * hid + hid);
+    }
+    host::gemv_b4_rows(m.fc.data(), hid, 2 * hid, xin.data(), R, res.data(), hid);
+    host::rmsnorm_rows(res.data(), R, hid, m.n_in.data(), 1e-6, x.data());
+    y.resize(R * (2 * qw + 2 * kvw));
+    host::gemv_b4_rows(m.qkvg.data(), 2 * qw + 2 * kvw, hid, x.data(), R, y.data(), 2 * qw + 2 * kvw);
+    for (size_t r = 0; r < R; ++r) {
+        const float* yr = y.data() + r * (2 * qw + 2 * kvw);
+        std::copy(yr, yr + qw, q.begin() + r * qw);
+        std::copy(yr + qw, yr + qw + kvw, k.begin() + r * kvw);
+        std::copy(yr + qw + kvw, yr + qw + 2 * kvw, v.begin() + r * kvw);
+        std::copy(yr + qw + 2 * kvw, yr + 2 * qw + 2 * kvw, g.begin() + r * qw);
+    }
+    host::AttnGeom ag;
+    ag.T = R; ag.t_real = R; ag.nh = nh; ag.kvh = kvh; ag.hd = hd; ag.rot = 64; ag.pos0 = pos0; ag.eps = 1e-6;
+    host::attention_block(ag, q.data(), k.data(), v.data(), g.data(), m.qn.data(), m.kn.data(), man_.rope_inv_freq.data(),
+                          mtp_.kv.data(), 2 * kvw, og.data());
+    y.resize(R * hid);
+    host::gemv_b4_rows(m.o.data(), hid, qw, og.data(), R, y.data(), hid);
+    for (size_t i = 0; i < R * hid; ++i) res[i] += y[i];
+    host::rmsnorm_rows(res.data(), R, hid, m.n_post.data(), 1e-6, x.data());
+    host::gemv_b4_rows(m.ug.data(), 2 * ff, hid, x.data(), R, h.data(), 2 * ff);
+    for (size_t r = 0; r < R; ++r) host::swiglu_tiles(h.data() + r * 2 * ff, ff, hh.data() + r * ff);
+    host::gemv_b4_rows(m.down.data(), hid, ff, hh.data(), R, y.data(), hid);
+    for (size_t i = 0; i < R * hid; ++i) res[i] += y[i];
+    host::rmsnorm_rows(res.data(), R, hid, m.n_out.data(), 1e-6, xn);
+}
+
+std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
+    if (!mtp_.on || !cpu_head_) throw std::runtime_error("open_qwen36: generate_mtp without OFLM_OPEN_MTP / the CPU head");
+    if (k < 1 || k > 7) throw std::runtime_error("open_qwen36: MTP k must be 1..7");
+    const size_t hid = w_->hidden, V = w_->vocab, RV = w_->real_vocab ? w_->real_vocab : V;
+    auto argmax = [&](const float* lg) { return static_cast<int>(std::max_element(lg, lg + RV) - lg); };
+    auto fnorm = [&](const float* x, float* out) {
+        if (normw_f_.empty()) tail_logits(x);      // fills normw_f_
+        host::rmsnorm_rows(x, 1, hid, normw_f_.data(), types_[0]->gemm_block.eps, out);
+    };
+    const int saved_threads = omp_get_max_threads();
+    static const int dthreads = [] { const char* e = std::getenv("OFLM_OPEN_DECODE_THREADS"); return std::max(1, std::min(16, e ? std::atoi(e) : 8)); }();
+    std::vector<int> out{tok0};
+    size_t P = static_cast<size_t>(pos_);           // tok0's position
+    mtp_.kv0 = P - 1;
+    // the pending MTP rows: (main hidden at position i, the token at i + 1), slots from pslot
+    std::vector<float> ph(hid), xn(hid), lg(V);
+    fnorm(last_x_.data(), ph.data());
+    std::vector<int> pt{tok0};
+    size_t pslot = P - 1;
+    int tok = tok0;
+    verify_save_ = true;
+    size_t passes = 0, drafted = 0, accepted = 0;
+    double t_draft = 0, t_verify = 0, t_roll = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    while (static_cast<int>(out.size()) < n) {
+        auto td = std::chrono::steady_clock::now();
+        omp_set_num_threads(dthreads);
+        std::vector<float> pxn(pt.size() * hid);
+        mtp_forward(ph.data(), pt.data(), pt.size(), pslot - mtp_.kv0, pxn.data());
+        std::copy(pxn.end() - static_cast<long>(hid), pxn.end(), xn.begin());
+        std::vector<int> d;
+        for (int j = 0; j < k; ++j) {
+            host::lmhead_q8_cpu(lm_cpu_.data(), V, hid, xn.data(), lg.data());   // mtp.norm applied: the head direct
+            d.push_back(argmax(lg.data()));
+            if (j + 1 < k) {
+                std::vector<float> nx(hid);
+                mtp_forward(xn.data(), &d.back(), 1, P + j - mtp_.kv0, nx.data());
+                xn = nx;
+            }
+        }
+        omp_set_num_threads(saved_threads);
+        t_draft += ms_since(td);
+        // verify [tok, d1 .. dk] at P .. P + k
+        auto tv = std::chrono::steady_clock::now();
+        std::vector<int> rows{tok};
+        rows.insert(rows.end(), d.begin(), d.end());
+        step_cpu_rows(rows.data(), rows.size(), true);
+        t_verify += ms_since(tv);
+        size_t a = 0;
+        while (a < d.size() && argmax(rows_logits_.data() + a * V) == d[a]) ++a;
+        const int b = argmax(rows_logits_.data() + a * V);
+        auto tr = std::chrono::steady_clock::now();
+        cpu_rollback(a + 1, rows.size());
+        t_roll += ms_since(tr);
+        ++passes; drafted += d.size(); accepted += a;
+        for (size_t i = 0; i < a && static_cast<int>(out.size()) < n; ++i) out.push_back(d[i]);
+        if (static_cast<int>(out.size()) < n) out.push_back(b);
+        // the next pending rows: the true hiddens of P .. P + a with the tokens that follow them
+        ph.assign((a + 1) * hid, 0.f);
+        pt.clear();
+        for (size_t i = 0; i <= a; ++i) {
+            fnorm(rows_x_.data() + i * hid, ph.data() + i * hid);
+            pt.push_back(i < a ? d[i] : b);
+        }
+        pslot = P;
+        P += a + 1;
+        tok = b;
+    }
+    verify_save_ = false;
+    const double ms = ms_since(t0);
+    std::fprintf(stderr, "MTP k=%d: %zu tokens in %zu passes (%.2f a pass), drafts accepted %zu / %zu (%.1f %%); %.1f ms/token (%.2f tok/s) | "
+                         "a pass: draft %.1f verify %.1f rollback %.1f ms\n",
+                 k, out.size() - 1, passes, (out.size() - 1) / double(passes), accepted, drafted, 100.0 * accepted / std::max<size_t>(1, drafted),
+                 ms / (out.size() - 1), 1000.0 * (out.size() - 1) / ms, t_draft / passes, t_verify / passes, t_roll / passes);
+    return out;
+}
+
+void Core::cpu_rollback(size_t keep, size_t R) {
+    // keep the first `keep` of the last pass's R rows: each linear layer's state back to before the
+    // pass, the delta rule re-run over the kept rows; the KV rows past them are simply rewritten later
+    if (keep >= R) return;
+    const size_t hid = w_->hidden;
+    const int saved_threads = omp_get_max_threads();
+    static const int dthreads = [] { const char* e = std::getenv("OFLM_OPEN_DECODE_THREADS"); return std::max(1, std::min(16, e ? std::atoi(e) : 8)); }();
+    omp_set_num_threads(dthreads);
+    for (int l = 0; l < nl_; ++l) {
+        const LayerType& lt = *types_[l];
+        const GemmBlockProgram& gb = lt.gemm_block;
+        if (gb.kind != "linear" || ver_.size() != static_cast<size_t>(nl_) || ver_[l].state.empty()) continue;
+        const HostConsts& hc = hc_[l];
+        uint8_t* sp = state_[l].map<uint8_t*>();
+        const VerifySave& v = ver_[l];
+        std::memcpy(sp, v.state.data(), v.state.size());
+        if (!keep) continue;
+        std::vector<float> og(keep * gb.vw);
+        host::DeltaGeom g;
+        g.T = keep; g.hid = hid;
+        g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
+        g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
+        g.t_real = keep;
+        double ph[2] = {0, 0};
+        host::deltanet_block(g, v.qkv.data(), v.z.data(), v.xn.data(), hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
+                             hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
+                             reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
+    }
+    omp_set_num_threads(saved_threads);
+    pos_ -= static_cast<int>(R - keep);
 }
 
 void Core::tail_logits(const float* row) {
@@ -4443,6 +4715,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     npu.join();
     if (err) std::rethrow_exception(err);
     state_owner_ = 0;
+    if (!packed) dump_hidden(xres.data(), N, hid, ids.data());
     pos_ += static_cast<int>(N);
     last_x_.assign(xres.data() + (N - 1) * hid, xres.data() + N * hid);
     for (size_t i = 0; i < segs.size(); ++i) {

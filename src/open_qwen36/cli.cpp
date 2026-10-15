@@ -340,7 +340,19 @@ std::vector<int> request(Core& core, const Args& a) {
             if (n < (acc += cnt)) return full(r);
         return sched.empty() ? nullptr : full(sched.back().second);
     };
-    for (int n = 0; n < a.max_tokens; ++n) {
+    bool mtp_done = false;
+    if (core.mtp_on() && a.max_tokens > 1) {
+        // OFLM_OPEN_MTP: greedy decode with MTP drafts (OFLM_OPEN_MTP_K a pass, default 2)
+        const char* ke = std::getenv("OFLM_OPEN_MTP_K");
+        out = core.generate_mtp(tok, a.max_tokens, ke ? std::atoi(ke) : 2);
+        for (int t : out) std::printf("token %d\n", t);
+        std::fflush(stdout);
+        const double ms = std::chrono::duration<double, std::milli>(clock::now() - t1).count();
+        std::fprintf(stderr, "decode %zu tokens: %.0f ms/token (%.2f tok/s) [MTP]\n", out.size() - 1, ms / (out.size() - 1),
+                     1000.0 * (out.size() - 1) / ms);
+        mtp_done = true;
+    }
+    for (int n = 0; !mtp_done && n < a.max_tokens; ++n) {
         out.push_back(tok);
         std::printf("token %d\n", tok);
         std::fflush(stdout);
