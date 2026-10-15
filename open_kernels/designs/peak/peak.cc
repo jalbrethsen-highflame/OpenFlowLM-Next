@@ -156,6 +156,59 @@ alignas(64) static uint8_t ftA[9216], ftB[4608];
 alignas(64) static bfloat16 ftC[TQ * DFULL];
 #endif
 #endif
+#if defined(PEAK_FAQKPV)
+// fa_qkpv (fa256b.cc's asm entry) against fa_qk_call + fa_pv_call called directly, j = 1:
+// out[0] G words that differ, out[1] O words that differ, out[2] = 1234 (reached the end)
+#define FA_HS 1
+#include "../dit_fa256b/fa256b.cc"
+asm(R"tq(
+	.text
+	.globl	tq_qk
+	.p2align	4
+	.type	tq_qk,@function
+tq_qk:
+	mov r27, lr
+	nop
+	nop
+	movxm p3, #fa_nuc
+	nop
+	nop
+	jl #fa_qk_call
+	nop
+	nop
+	nop
+	nop
+	nop
+	mov lr, r27
+	nop
+	nop
+	nop
+	ret lr
+	nop
+	nop
+	nop
+	nop
+	nop
+.Ltq_qk_end:
+	.size	tq_qk, .Ltq_qk_end-tq_qk
+	.globl	tq_pv
+	.p2align	4
+	.type	tq_pv,@function
+tq_pv:
+	j #fa_pv_call
+	nop
+	nop
+	nop
+	nop
+	nop
+.Ltq_pv_end:
+	.size	tq_pv, .Ltq_pv_end-tq_pv
+)tq");
+extern "C" void tq_qk(const uint8_t *q, const uint8_t *kp, bfloat16 *g);
+extern "C" void tq_pv(const uint8_t *p, const uint8_t *ve, bfloat16 *o);
+alignas(64) static uint8_t xq[9216], xk[4608], xp[2304], xv[4608];
+alignas(64) static bfloat16 xg1[TQ * LKP], xg2[TQ * LKP], xo1[TQ * DFULL], xo2[TQ * DFULL];
+#endif
 #if defined(PEAK_FAEXP)
 // fa_exp_call (dit_fa256b/fa_hs.inc) against the C++ pass on one core: G from a formula, guard
 // bytes after every output. out: [0] P bytes that differ, [1] first one, [2] P guard bytes
@@ -945,6 +998,31 @@ void peak_run(const int8_t *__restrict in, int32_t *__restrict out) {
 #elif defined(PEAK_FAPVT)
   for (unsigned it = 0; it < PEAK_ITERS; ++it) fa_pv_call(ftA, ftB, ftC);
   out[0] = reinterpret_cast<int32_t *>(ftC)[0];
+#elif defined(PEAK_FAQKPV)
+  {
+    for (int i = 0; i < 9216; ++i) xq[i] = (uint8_t)(i % 7 == 0 ? 120 : (i * 13) & 0x3f);
+    for (int i = 0; i < 4608; ++i) { xk[i] = (uint8_t)(i % 9 == 0 ? 121 : (i * 7) & 0x3f); xv[i] = (uint8_t)(i % 9 == 0 ? 119 : (i * 5) & 0x3f); }
+    for (int i = 0; i < 2304; ++i) xp[i] = (uint8_t)(i % 9 == 0 ? 118 : (i * 3) & 0x3f);
+    for (int i = 0; i < TQ * 8; ++i) fa_nuc[i] = -1.0f;
+    for (int i = 0; i < TQ * DFULL; ++i) xo1[i] = xo2[i] = (bfloat16)0.5f;
+    for (int i = 0; i < TQ * LKP; ++i) xg1[i] = xg2[i] = (bfloat16)0.f;
+    aie::set_rounding(aie::rounding_mode::conv_even);
+#if defined(PEAK_TQ_QK)
+    tq_qk(xq, xk, xg1 + 1 * 2 * (TQ / 8) * 64);
+    fa_pv_call(xp, xv, xo1 + 1 * 2 * VPAIRS_PER_ELEM * 64);
+#elif defined(PEAK_TQ_PV)
+    fa_qk_call(xq, xk, xg1 + 1 * 2 * (TQ / 8) * 64, fa_nuc);
+    tq_pv(xp, xv, xo1 + 1 * 2 * VPAIRS_PER_ELEM * 64);
+#else
+    fa_qkpv(xq, xk, xg1, xp, xv, xo1, 1);
+#endif
+    fa_qk_call(xq, xk, xg2 + 1 * 2 * (TQ / 8) * 64, fa_nuc);
+    fa_pv_call(xp, xv, xo2 + 1 * 2 * VPAIRS_PER_ELEM * 64);
+    int dg = 0, dob = 0;
+    for (int i = 0; i < TQ * LKP; ++i) dg += reinterpret_cast<uint16_t *>(xg1)[i] != reinterpret_cast<uint16_t *>(xg2)[i];
+    for (int i = 0; i < TQ * DFULL; ++i) dob += reinterpret_cast<uint16_t *>(xo1)[i] != reinterpret_cast<uint16_t *>(xo2)[i];
+    out[0] = dg; out[1] = dob; out[2] = 1234;
+  }
 #elif defined(PEAK_FAEXP)
   for (int i = 0; i < TQ * LKP; ++i)
     fxG[i] = (bfloat16)(-float((i * 37 + in[i % 64]) % 113) / 14.0f);   // scores - m in (-8, 0]

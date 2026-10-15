@@ -71,7 +71,14 @@ __attribute__((target("avx2"))) inline void bfp_encode8_avx2(const float* v, uin
     const __m256i big = _mm256_cmpgt_epi32(shift, _mm256_set1_epi32(24));
     const __m256i sh = _mm256_min_epi32(shift, _mm256_set1_epi32(24));
     const __m256i half = _mm256_sllv_epi32(_mm256_set1_epi32(1), _mm256_sub_epi32(sh, _mm256_set1_epi32(1)));
-    __m256i q = _mm256_srav_epi32(_mm256_add_epi32(mant, half), sh);
+    // nearest, ties to even (ties up biased bf16 inputs: they tie often, +0.0022 mean on V)
+    const __m256i q0 = _mm256_srav_epi32(mant, sh);                                  // floor
+    const __m256i r = _mm256_sub_epi32(mant, _mm256_sllv_epi32(q0, sh));
+    const __m256i up = _mm256_or_si256(_mm256_cmpgt_epi32(r, half),
+                                       _mm256_and_si256(_mm256_cmpeq_epi32(r, half),
+                                                        _mm256_cmpeq_epi32(_mm256_and_si256(q0, _mm256_set1_epi32(1)),
+                                                                           _mm256_set1_epi32(1))));
+    __m256i q = _mm256_sub_epi32(q0, up);                                             // up is -1 where set
     q = _mm256_andnot_si256(big, q);
     q = _mm256_max_epi32(_mm256_min_epi32(q, _mm256_set1_epi32(127)), _mm256_set1_epi32(-128));
     const __m128i lo = _mm256_castsi256_si128(q), hi = _mm256_extracti128_si256(q, 1);
@@ -92,7 +99,9 @@ inline void bfp_encode8(const float* v, uint8_t* blk) {
         int64_t mant = static_cast<int64_t>(bits[j] & 0x7FFFFF) | (e != 0 ? (int64_t{1} << 23) : 0);
         if (bits[j] >> 31) mant = -mant;
         const int shift = 17 + std::min(max_exp - e, 31);
-        int64_t q = (mant + (int64_t{1} << (shift - 1))) >> shift;   // floor((m + half) / 2^shift)
+        int64_t q = mant >> shift;                                   // floor, then nearest, ties to even
+        const int64_t r = mant - (q << shift), half = int64_t{1} << (shift - 1);
+        q += (r > half) || (r == half && (q & 1));
         q = std::clamp<int64_t>(q, -128, 127);
         blk[1 + j] = static_cast<uint8_t>(static_cast<int8_t>(q));
     }
@@ -124,6 +133,58 @@ void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out, 
 }
 
 // A dit weight as [n, k] f32 from its band-order q4_1 pool chunks (5120 B: 32 rows x 256 k).
+// dit_fa256b's operands (designs/dit_fa256b/pack_fa.py, the same bytes): bfp16 in the order its
+// MAC pops them. Rows at or past t_real are zero. Q: one head, rows of x (ld apart, from column
+// col) times s, per 32-row block [row pair 2][d step 32][tile 2][8 rows][8 d] = 9216 bytes.
+constexpr size_t kFabQBlock = 9216, kFabChunk = 18432;
+void fab_pack_q(const float* x, size_t ld, size_t col, size_t T, size_t t_real, float s, uint8_t* out) {
+    float v[8];
+    for (size_t rb = 0; rb < T / 32; ++rb)
+        for (size_t zp = 0; zp < 2; ++zp)
+            for (size_t i = 0; i < 32; ++i)
+                for (size_t r2 = 0; r2 < 2; ++r2)
+                    for (size_t r8 = 0; r8 < 8; ++r8) {
+                        const size_t row = rb * 32 + zp * 16 + r2 * 8 + r8;
+                        for (size_t k = 0; k < 8; ++k) v[k] = row < t_real ? x[row * ld + col + i * 8 + k] * s : 0.f;
+                        bfp_encode8_avx2(v, out);
+                        out += 9;
+                    }
+}
+// K: one kv head of bf16 cache rows (stride elements apart, from column col), per 64-key chunk
+// [piece 4][d step 32][tile 2][8 keys][8 d] = 18432 bytes.
+void fab_pack_k(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t t_real, uint8_t* out) {
+    float v[8];
+    for (size_t c = 0; c < T / 64; ++c)
+        for (size_t j = 0; j < 4; ++j)
+            for (size_t i = 0; i < 32; ++i)
+                for (size_t n2 = 0; n2 < 2; ++n2)
+                    for (size_t k8 = 0; k8 < 8; ++k8) {
+                        const size_t key = c * 64 + j * 16 + n2 * 8 + k8;
+                        for (size_t k = 0; k < 8; ++k)
+                            v[k] = key < t_real ? bf16_to_f32(kv[key * stride + col + i * 8 + k]) : 0.f;
+                        bfp_encode8_avx2(v, out);
+                        out += 9;
+                    }
+}
+// V^T: per 64-key chunk [element 4][column pair 4][key step 8][tile 2][8 d columns][8 keys].
+void fab_pack_v(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t t_real, uint8_t* out) {
+    float v[8];
+    for (size_t c = 0; c < T / 64; ++c)
+        for (size_t e = 0; e < 4; ++e)
+            for (size_t jl = 0; jl < 4; ++jl)
+                for (size_t i = 0; i < 8; ++i)
+                    for (size_t n2 = 0; n2 < 2; ++n2)
+                        for (size_t dc = 0; dc < 8; ++dc) {
+                            const size_t d = (e * 4 + jl) * 16 + n2 * 8 + dc;
+                            for (size_t k = 0; k < 8; ++k) {
+                                const size_t key = c * 64 + i * 8 + k;
+                                v[k] = key < t_real ? bf16_to_f32(kv[key * stride + col + d]) : 0.f;
+                            }
+                            bfp_encode8_avx2(v, out);
+                            out += 9;
+                        }
+}
+
 void dit_decode_q4(const uint8_t* pool, size_t n, size_t k, float* W) {
     const size_t per_band = 2 * k / 256, nch = n * k / (32 * 256);
 #pragma omp parallel for
@@ -617,7 +678,7 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (man_.gemm_dit.contains("kernels2"))
         for (const auto& [shape, k] : man_.gemm_dit["kernels2"].items()) wanted[k.get<std::string>()] = true;
     if (man_.gemm_dit.contains("fa"))
-        for (const char* key : {"lk", "nc"})
+        for (const char* key : {"lk", "nc", "ncb"})
             if (man_.gemm_dit["fa"].contains(key))
                 for (const auto& [lk, k] : man_.gemm_dit["fa"][key].items()) wanted[k.get<std::string>()] = true;
     for (const auto& [name, d] : w_->kernels)
@@ -3410,11 +3471,18 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // the chunk, its valid_len sentinel patched to N; host attention below OFLM_OPEN_FA_NC_MIN
     // tokens or past the streams the set carries
     std::string nc_kernel;
+    // designs/dit_fa256b (manifest fa.ncb): the bfp16 stream, Q / K / V^T packed here (fab_pack_*);
+    // OFLM_OPEN_FA_NCB=0 keeps dit_fa256's
+    static const bool ncb_on = [] { const char* e = std::getenv("OFLM_OPEN_FA_NCB"); return !(e && *e == '0'); }();
+    bool nc_b = false;
+    size_t lkn = 0;
     if (noncausal_ && !packed && fa_on && D.contains("fa") && D["fa"].contains("nc")) {
         static const size_t nc_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_NC_MIN"); return e ? std::strtoul(e, nullptr, 10) : 1024ul; }();
         const std::string lk = std::to_string((pos0 + N + M - 1) / M * M);
-        if (N >= nc_min && D["fa"]["nc"].contains(lk)) {
-            nc_kernel = D["fa"]["nc"][lk].get<std::string>();
+        lkn = std::stoul(lk);
+        nc_b = ncb_on && D["fa"].contains("ncb") && D["fa"]["ncb"].contains(lk);
+        if (N >= nc_min && D["fa"][nc_b ? "ncb" : "nc"].contains(lk)) {
+            nc_kernel = D["fa"][nc_b ? "ncb" : "nc"][lk].get<std::string>();
             Kern& k = kerns_.at(nc_kernel);
             const uint32_t sent = D["fa"]["nc_valid"].get<uint32_t>();
             size_t hits = 0;
@@ -3422,6 +3490,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 if (k.words[i] == sent) { k.iw()[i] = static_cast<uint32_t>(pos0 + N); ++hits; }
             if (!hits) throw std::runtime_error("open_qwen36: " + nc_kernel + " carries no valid_len sentinel");
             k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        if (!nc_kernel.empty() && !nc_b) {
             // The stream reads key rows up to lk; rows [N, lk) still hold an earlier, longer
             // prompt's K / V, and those changed the result despite the valid_len mask (1.6% of
             // the residual at 1809 tokens after a 2017-token prompt). Zero them.
@@ -3435,7 +3505,18 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             }
         }
     }
+    if (nc_kernel.empty()) nc_b = false;
     const bool nc_npu = !nc_kernel.empty();
+    // fa.ncb: K / V packed per full-attention layer into a pair of buffers that alternate by
+    // full layer (a layer's attention is done before the next-but-one full layer's MID starts)
+    std::vector<int> full_ord(nl_, 0);
+    size_t fab_nh = 0, fab_kvh = 0;
+    for (int l = 0, n = 0; l < nl_; ++l)
+        if (types_[l]->gemm_block.kind == "full") {
+            full_ord[l] = n++;
+            fab_nh = types_[l]->gemm_block.nh;
+            fab_kvh = types_[l]->gemm_block.kvh;
+        }
     auto fa_kernel = [&](size_t c) -> std::string {
         const size_t lk = pos0 + (c + 1) * M;
         if (!fa_on || lk < fa_min || !FA.contains(std::to_string(lk))) return {};
@@ -3464,7 +3545,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             need("fa_q_" + cs, M * wmid * 2);
             need("fa_o_" + cs, M * wmid * 2);
         }
+        if (nc_b) need("fab_q_" + cs, fab_nh * (M / 32) * kFabQBlock);
     }
+    if (nc_b)
+        for (const char* nm : {"fab_k0", "fab_k1", "fab_v0", "fab_v1"})
+            need(nm, fab_kvh * (lkn / 64) * kFabChunk);
     need("pp_h", M * 2 * ff * 2);
     if (ffn_dev) need("pp_hu", M / 128 * (ff / 64) * 36864);   // h unit slots, one NPU step uses and frees them
     // Each layer's cells walk a list of operations, host (even index) and NPU (odd) alternating.
@@ -3554,7 +3639,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     else run(kname(nq, hid), {"pp_a_" + cs, gb.program[0].args[0], "pp_q_" + cs});
                 } else if (op == FAT && noncausal_ && nc_npu) {
                     auto tf = std::chrono::steady_clock::now();
-                    run(nc_kernel, {"fa_q_" + cs, "state", "state", "fa_o_" + cs});
+                    if (nc_b) {
+                        const std::string par = std::to_string(full_ord[l] % 2);
+                        run(nc_kernel, {"fab_q_" + cs, "fab_k" + par, "fab_v" + par, "fa_o_" + cs});
+                    } else {
+                        run(nc_kernel, {"fa_q_" + cs, "state", "state", "fa_o_" + cs});
+                    }
                     fa_ms += ms_since(tf);
                     ++n_fa;
                 } else if (op == FAT && noncausal_) {
@@ -3737,7 +3827,38 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     g.pos0 = pos0 + r0; g.eps = gb.eps;
                     g.rpos = packed ? rpos.data() + r0 : nullptr;
                     auto ta = std::chrono::steady_clock::now();
-                    if (noncausal_ && nc_npu) {
+                    if (noncausal_ && nc_npu && nc_b) {
+                        // dit_fa256b: Q packed per head times log2(e) (og carries 1/sqrt(hd): the
+                        // kernel's scores are q.k log2(e) / sqrt(hd)); this chunk's K / V rows,
+                        // from the cache attention_prep just wrote, packed into the layer's pair
+                        host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
+                                             man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
+                        timing_.attn_ms += ms_since(ta);
+                        const size_t nh = gb.nh, kvh = gb.kvh, hd = gb.hd, qb_head = (M / 32) * kFabQBlock;
+                        xrt::bo& qbuf = buffer("fab_q_" + cs, 0);
+                        uint8_t* qm = qbuf.map<uint8_t*>();
+                        const std::string par = std::to_string(full_ord[l] % 2);
+                        xrt::bo& kbuf = buffer("fab_k" + par, 0);
+                        xrt::bo& vbuf = buffer("fab_v" + par, 0);
+                        const uint16_t* kvr = st.map<const uint16_t*>() + (pos0 + r0) * (row / 2);
+                        const size_t kv_head = (lkn / 64) * kFabChunk, at = (r0 / 64) * kFabChunk, span = (M / 64) * kFabChunk;
+#pragma omp parallel for schedule(dynamic, 1)
+                        for (long long w = 0; w < static_cast<long long>(nh + 2 * kvh); ++w) {
+                            const size_t u = static_cast<size_t>(w);
+                            if (u < nh)
+                                fab_pack_q(og.data(), qw, u * hd, M, t_real, 1.4426950408889634f, qm + u * qb_head);
+                            else if (u < nh + kvh)
+                                fab_pack_k(kvr, row / 2, (u - nh) * hd, M, t_real, kbuf.map<uint8_t*>() + (u - nh) * kv_head + at);
+                            else
+                                fab_pack_v(kvr, row / 2, kvh * hd + (u - nh - kvh) * hd, M, t_real,
+                                           vbuf.map<uint8_t*>() + (u - nh - kvh) * kv_head + at);
+                        }
+                        qbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, nh * qb_head, 0);
+                        for (size_t g2 = 0; g2 < kvh; ++g2) {
+                            kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, span, g2 * kv_head + at);
+                            vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, span, g2 * kv_head + at);
+                        }
+                    } else if (noncausal_ && nc_npu) {
                         // Q for the noncausal stream (unscaled, as the causal one), K / V into the cache
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
                                              man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());

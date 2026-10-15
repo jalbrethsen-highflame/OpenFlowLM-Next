@@ -291,6 +291,10 @@ FA_MAX_LK = int(_os.environ.get("OPEN_QWEN35_FA_MAX_LK", 32768))
 # FA_NC_VALID and patched to the prompt's length by the engine. OPEN_QWEN35_FA_NC=0 off.
 FA_NC = _os.environ.get("OPEN_QWEN35_FA_NC", "1") != "0"
 FA_NC_VALID = 0x7A11D5EE
+# designs/dit_fa256b: the noncausal kernel on bfp16 Q / K / V / P with hand-scheduled MAC loops
+# (~3.4x dit_fa256's nc stream); the engine packs Q, K and V^T in its pop order. Same lengths and
+# valid_len sentinel. OPEN_QWEN35_FA_NCB=0 off.
+FA_NCB = _os.environ.get("OPEN_QWEN35_FA_NCB", "1") != "0"
 
 
 def gemm_dit(spec: ModelSpec) -> dict | None:
@@ -333,6 +337,9 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
               "q_cols": spec.num_heads * spec.head_dim}
         if FA_NC:
             fa["nc"] = {str(lk): f"fa256nc_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)}
+            fa["nc_valid"] = FA_NC_VALID
+        if FA_NCB:
+            fa["ncb"] = {str(lk): f"fa256b_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)}
             fa["nc_valid"] = FA_NC_VALID
     return {"m": DIT_M,
             **({"hs": True} if GEMM_HS and k2 else {}),
@@ -408,6 +415,9 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             for lk, name in d.get("fa", {}).get(key, {}).items():
                 out["contexts"].setdefault("fa", f"{name}/final.xclbin")
                 out["kernels"][name] = {"context": "fa", "insts": f"{name}/insts.bin", "build": name}
+        for lk, name in d.get("fa", {}).get("ncb", {}).items():   # dit_fa256b: its own image
+            out["contexts"].setdefault("fab", f"{name}/final.xclbin")
+            out["kernels"][name] = {"context": "fab", "insts": f"{name}/insts.bin", "build": name}
         if "fa" in d:
             out["globals"]["fa_q"] = DIT_M * d["fa"]["q_cols"] * 2
             out["globals"]["fa_o"] = DIT_M * d["fa"]["q_cols"] * 2
@@ -483,6 +493,10 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                        "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": "0", "DF_EXP_FIX": "1",
                                "DF_CAUSAL": "0", "DF_VALID": str(FA_NC_VALID),
                                "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
+        for lk, name in d.get("fa", {}).get("ncb", {}).items():
+            b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{DIT_M}_lk{lk}",
+                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_VALID": str(FA_NC_VALID),
+                               "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
         if "down2" in d.get("ffn", {}):
             b[d["ffn"]["down2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{d['ffn']['ff']}_n{spec.hidden}{_HS_SFX}",
                                     "env": {"DG_M": str(DIT_M), "DG_K": str(d["ffn"]["ff"]), "DG_N": str(spec.hidden), "DG_LAYOUT": _lay(), **_HS_ENV}}
@@ -523,6 +537,7 @@ KERNEL_SOURCES = [
     "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc", "designs/gemm_q4_prefill/*.h",
     "designs/dit_gemm/*.py", "designs/dit_gemm/*.cc", "designs/dit2/*.py", "designs/dit2/*.cc",
     "designs/dit_fa256/*.py", "designs/dit_fa256/*.cc",
+    "designs/dit_fa256b/*.py", "designs/dit_fa256b/*.cc", "designs/dit_fa256b/*.inc",
     "designs/attn_block/attn_gemm.py", "../npu_offload/gemm_rtp/gemm_pretiled.py", "../npu_offload/gemm_rtp/npue.py",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",
 ]

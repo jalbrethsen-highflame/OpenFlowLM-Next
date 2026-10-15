@@ -62,7 +62,7 @@ def check_shape(L: int, heads: int, kv_heads: int, lk: int | None = None) -> str
     return None
 
 
-@iron.jit(aiecc_flags=["--dynamic-objFifos", f"--alloc-scheme={os.environ.get('DF_ALLOC', 'bank-aware')}"])
+@iron.jit(aiecc_flags=["--dynamic-objFifos", f"--alloc-scheme={os.environ.get('DF_ALLOC', 'basic-sequential')}"])
 def dit_fa256b(
     Q: In, K: In, V: In, O: Out, *,
     L: CompileTime[int], heads: CompileTime[int], kv_heads: CompileTime[int] = 0,
@@ -106,8 +106,11 @@ def dit_fa256b(
     k_step = Kernel("softmax_step", obj, [g_ty, up_ty, sp_ty, o_l1_ty, p_ty, rtp_ty, np.int32, np.int32])
     k_exp = Kernel("sm_exp", obj, [g_ty, p_ty, rtp_ty, np.int32, np.int32])
     k_all = Kernel("sm_all", obj, [g_ty, up_ty, sp_ty, o_l1_ty, p_ty, rtp_ty, np.int32, np.int32])
-    k_qkpv = Kernel("qkpv", obj, [q_ty, elem_ty, g_ty, p_ty, elem_ty, o_l1_ty, np.int32, rtp_ty,
-                                  np.int32, np.int32])
+    if HS:   # the asm entry (fa256b.cc fa_qkpv): no rtp, no checks
+        k_qkpv = Kernel("fa_qkpv", obj, [q_ty, elem_ty, g_ty, p_ty, elem_ty, o_l1_ty, np.int32])
+    else:
+        k_qkpv = Kernel("qkpv", obj, [q_ty, elem_ty, g_ty, p_ty, elem_ty, o_l1_ty, np.int32, rtp_ty,
+                                      np.int32, np.int32])
     k_fin = Kernel("finalize", obj, [sp_ty, o_l1_ty])
     kernels = [k_capture, k_init, k_qk, k_pv, k_mask, k_step, k_fin, k_exp, k_qkpv, k_all]
 
@@ -206,13 +209,19 @@ def dit_fa256b(
                     scores_done(0)
                     for c in range_(1, n_chunks):
                         for j in range(4):
-                            if "nokv" in _EXPT or "noqk" in _EXPT or "nopv" in _EXPT:
+                            if "nokv" in _EXPT and HS:   # compute only, the same fused calls
+                                if "noqkpv" not in _EXPT:
+                                    qkpv(q_saved, dummy[0], g_buf, p_buf, dummy[0], o, j)
+                            elif "nokv" in _EXPT or "noqk" in _EXPT or "nopv" in _EXPT:
                                 k_piece(c, j)
                                 v_elem(c - 1, j)
                             else:              # one call: chunk c's K piece and chunk c-1's V
                                 kp = a_in.acquire(1)
                                 ve = b_in.acquire(1)
-                                qkpv(q_saved, kp, g_buf, p_buf, ve, o, j, my_rtp, p, c)
+                                if HS:
+                                    qkpv(q_saved, kp, g_buf, p_buf, ve, o, j)
+                                else:
+                                    qkpv(q_saved, kp, g_buf, p_buf, ve, o, j, my_rtp, p, c)
                                 a_in.release(1)
                                 b_in.release(1)
                         scores_done(c)
