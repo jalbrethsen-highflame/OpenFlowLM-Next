@@ -725,7 +725,7 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
             for (const char* key : {"kernels2", "ffn"})
                 for (const auto& [shape, k] : man_.gemm_dit[tier][key].items()) wanted[k.get<std::string>()] = true;
     if (man_.gemm_dit.contains("fa"))
-        for (const char* key : {"lk", "nc", "ncb", "cb"})
+        for (const char* key : {"lk", "nc", "ncb", "cb", "cbs"})
             if (man_.gemm_dit["fa"].contains(key))
                 for (const auto& [lk, k] : man_.gemm_dit["fa"][key].items()) wanted[k.get<std::string>()] = true;
     for (const auto& [name, d] : w_->kernels)
@@ -4319,19 +4319,24 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // fa.cb (designs/dit_fa256b causal, ~3x dit_fa256): the causal prompt's NPU attention when the
     // prompt starts at position 0 (the packs hold this prompt's K / V rows only), from
     // OFLM_OPEN_FA_CB_MIN keys (default 2048; dit_fa256 keeps OFLM_OPEN_FA_MIN_LK); Q / K / V
-    // packed at MID like fa.ncb, K / V into per-full-layer buffers. OFLM_OPEN_FA_CB=0 off.
+    // packed at MID like fa.ncb, K / V into per-full-layer buffers. fa.cbs: the same at the small
+    // tier's M (512 query rows), from OFLM_OPEN_FA_CBS_MIN keys (default 512). OFLM_OPEN_FA_CB=0 off.
     static const bool cb_on = [] { const char* e = std::getenv("OFLM_OPEN_FA_CB"); return !(e && *e == '0'); }();
     static const size_t cb_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_CB_MIN"); return e ? std::strtoul(e, nullptr, 10) : 2048ul; }();
-    const nlohmann::json& FCB = cb_on && !noncausal_ && pos0 == 0 && full_m && D.contains("fa") && D["fa"].contains("cb") ? D["fa"]["cb"] : kEmpty;
+    static const size_t cbs_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_CBS_MIN"); return e ? std::strtoul(e, nullptr, 10) : 512ul; }();
+    const bool cb_ok = cb_on && !noncausal_ && pos0 == 0 && D.contains("fa");
+    const bool cbs_m = cb_ok && D["fa"].contains("cbs") && D["fa"].value("cbs_m", size_t{0}) == M;
+    const nlohmann::json& FCB = cb_ok && full_m && D["fa"].contains("cb") ? D["fa"]["cb"] : cbs_m ? D["fa"]["cbs"] : kEmpty;
+    const size_t fcb_min = full_m ? cb_min : cbs_min;
     const size_t lkc = (pos0 + N + M - 1) / M * M;           // the causal packs' key capacity
     auto fa_kernel = [&](size_t c) -> std::string {
         const size_t lk = pos0 + (c + 1) * M;
-        if (!fa_on || !full_m) return {};
-        if (FCB.contains(std::to_string(lk)) && lk >= cb_min) return FCB[std::to_string(lk)].get<std::string>();
-        if (lk < fa_min || !FA.contains(std::to_string(lk))) return {};
+        if (!fa_on) return {};
+        if (FCB.contains(std::to_string(lk)) && lk >= fcb_min) return FCB[std::to_string(lk)].get<std::string>();
+        if (!full_m || lk < fa_min || !FA.contains(std::to_string(lk))) return {};
         return FA[std::to_string(lk)].get<std::string>();
     };
-    auto is_cb = [](const std::string& k) { return k.rfind("fa256bc_", 0) == 0; };
+    auto is_cb = [](const std::string& k) { return k.rfind("fa256bc", 0) == 0; };
     bool any_cb = false;
     for (size_t c = 0; c < C; ++c) any_cb = any_cb || is_cb(fa_kernel(c));
     // per chunk device buffers (named globals, so start_run binds them), kept across requests
