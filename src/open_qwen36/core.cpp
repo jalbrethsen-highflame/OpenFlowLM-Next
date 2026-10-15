@@ -3186,6 +3186,8 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
     };
     const int saved_threads = omp_get_max_threads();
     static const int dthreads = [] { const char* e = std::getenv("OFLM_OPEN_DECODE_THREADS"); return std::max(1, std::min(16, e ? std::atoi(e) : 8)); }();
+    static const size_t dvocab_env = [] { const char* e = std::getenv("OFLM_OPEN_MTP_DRAFT_VOCAB"); return e ? std::strtoul(e, nullptr, 10) : 65536ul; }();
+    const size_t dvocab = std::max<size_t>(128, std::min(RV, dvocab_env) / 128 * 128);
     std::vector<int> out{tok0};
     size_t P = static_cast<size_t>(pos_);           // tok0's position
     mtp_.kv0 = P - 1;
@@ -3223,10 +3225,16 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
         std::copy(pxn.end() - static_cast<long>(hid), pxn.end(), xn.begin());
         std::vector<int> d;
         for (int j = 0; j < k; ++j) {
-            // mtp.norm applied: the head direct (its int4 copy when there: only the top token matters)
-            if (!lm_b4_.empty()) host::gemv_b4(lm_b4_.data(), V, hid, xn.data(), lg.data());
-            else host::lmhead_q8_cpu(lm_cpu_.data(), V, hid, xn.data(), lg.data());
-            d.push_back(argmax(lg.data()));
+            // mtp.norm applied: the head direct (its int4 copy when there: only the top token matters),
+            // over the first OFLM_OPEN_MTP_DRAFT_VOCAB ids (default 65536: 99 % of generated tokens on
+            // the test prompts) -- the int4 head's 128-row strips make that a prefix of it
+            if (!lm_b4_.empty()) {
+                host::gemv_b4(lm_b4_.data(), dvocab, hid, xn.data(), lg.data());
+                d.push_back(static_cast<int>(std::max_element(lg.begin(), lg.begin() + static_cast<long>(dvocab)) - lg.begin()));
+            } else {
+                host::lmhead_q8_cpu(lm_cpu_.data(), V, hid, xn.data(), lg.data());
+                d.push_back(argmax(lg.data()));
+            }
             if (j + 1 < k) {
                 std::vector<float> nx(hid);
                 mtp_forward(xn.data(), &d.back(), 1, P + j - mtp_.kv0, nx.data());
