@@ -3177,6 +3177,22 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
     std::vector<int> out{tok0};
     size_t P = static_cast<size_t>(pos_);           // tok0's position
     mtp_.kv0 = P - 1;
+    // the prompt's context first (when step_prompt_pipe kept it): MTP rows (hidden at i, id at i + 1)
+    // for the kept rows but the last, 8 at a time; their slots precede P - 1
+    const size_t C = mtp_prompt_ids_.size();
+    if (C >= 2 && mtp_prompt_x_.size() == C * hid) {
+        auto tc = std::chrono::steady_clock::now();
+        omp_set_num_threads(dthreads);
+        mtp_.kv0 = P - C;
+        std::vector<float> hn(8 * hid), tmp(8 * hid);
+        for (size_t i0 = 0; i0 + 1 < C; i0 += 8) {
+            const size_t R = std::min<size_t>(8, C - 1 - i0);
+            for (size_t r = 0; r < R; ++r) fnorm(mtp_prompt_x_.data() + (i0 + r) * hid, hn.data() + r * hid);
+            mtp_forward(hn.data(), mtp_prompt_ids_.data() + i0 + 1, R, i0, tmp.data());
+        }
+        omp_set_num_threads(saved_threads);
+        std::fprintf(stderr, "MTP: %zu prompt rows of context in %.0f ms\n", C - 1, ms_since(tc));
+    }
     // the pending MTP rows: (main hidden at position i, the token at i + 1), slots from pslot
     std::vector<float> ph(hid), xn(hid), lg(V);
     fnorm(last_x_.data(), ph.data());
@@ -4740,6 +4756,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     if (err) std::rethrow_exception(err);
     state_owner_ = 0;
     if (!packed) dump_hidden(xres.data(), N, hid, ids.data());
+    if (mtp_.on) {
+        // MTP's prompt context (generate_mtp): the last OFLM_OPEN_MTP_CTX rows' residuals and ids
+        static const size_t mctx = [] { const char* e = std::getenv("OFLM_OPEN_MTP_CTX"); return e ? std::strtoul(e, nullptr, 10) : 256ul; }();
+        const size_t c0 = N > mctx ? N - mctx : 0;
+        mtp_prompt_x_.assign(xres.begin() + static_cast<long>(c0 * hid), xres.begin() + static_cast<long>(N * hid));
+        mtp_prompt_ids_.assign(ids.begin() + static_cast<long>(c0), ids.begin() + static_cast<long>(N));
+    }
     pos_ += static_cast<int>(N);
     last_x_.assign(xres.data() + (N - 1) * hid, xres.data() + N * hid);
     for (size_t i = 0; i < segs.size(); ++i) {
