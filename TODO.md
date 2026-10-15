@@ -103,6 +103,12 @@ near-ties over 64 layers.
 
 - [ ] Adaptive k: k = 3 wins on code / math (12.9 / 12.4 tok/s) and loses on prose; pick k
       per pass from the recent acceptance.
+- [x] Tree drafts (top-2 first drafts): measured not worth it (2026-10-15). Teacher forced on the
+      4 prompts, tokens a pass 2.55 (chain k = 2, 3 rows) -> 2.63 (top-2, 4 rows) / 2.68 (both
+      branches chained, 5 rows); verify 182 / 210 / 219 ms at 3 / 4 / 5 rows, so ~76 -> 86 / 90
+      ms a token. The top-1 draft is right 77-96 % of the time; an extra row costs more than the
+      second branch rescues. Revisit only if a verify row gets much cheaper. (tree_eval.py in
+      npu-scratch/mtp.)
 - [ ] Sampling (temperature / top-p) with MTP: rejection sampling instead of greedy matching.
 - [ ] The MTP weights from a converted model file rather than the HF shard.
 - [x] An NPU decode kernel without the 255 padding rows: designs/dit2/dec.py (gemm_dit.decode2),
