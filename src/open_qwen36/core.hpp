@@ -659,7 +659,7 @@ private:
     bool drop_pools_ = false;   ///< the q4 pools freed after building the int4 weights (CPU decode)
     /// the final norm and q8 lm_head on the CPU (CPU decode; OFLM_OPEN_CPU_HEAD=0 keeps the NPU's):
     /// the head repacked from the pool order (host::lmhead_q8_repack), the norm weight as f32
-    bool cpu_head_ = false, cpu_head_check_ = false;
+    bool cpu_head_ = false, cpu_head_check_ = false, head_b4_main_ = false;
     std::vector<uint8_t> lm_cpu_;
     std::vector<uint8_t> lm_b4_;   ///< OFLM_OPEN_CPU_HEAD=int4: the head as dit2 int4 blocks (host::gemv_b4)
     std::vector<float> normw_f_;

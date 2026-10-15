@@ -1205,11 +1205,17 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
         } else if (name == "lmpool" && drop_pools_ && !(std::getenv("OFLM_OPEN_CPU_HEAD") && *std::getenv("OFLM_OPEN_CPU_HEAD") == '0')) {
             // CPU decode: the head on the CPU, repacked once; the NPU copy only to check it
             cpu_head_check_ = std::getenv("OFLM_OPEN_CPU_HEAD_CHECK") && *std::getenv("OFLM_OPEN_CPU_HEAD_CHECK") == '1';
-            const bool int4 = std::getenv("OFLM_OPEN_CPU_HEAD") && std::string(std::getenv("OFLM_OPEN_CPU_HEAD")) == "int4";
+            const bool int4_main = std::getenv("OFLM_OPEN_CPU_HEAD") && std::string(std::getenv("OFLM_OPEN_CPU_HEAD")) == "int4";
+            // OFLM_OPEN_MTP's drafts read an int4 copy of the head (half the bytes; only their top token
+            // matters, and every draft is checked by the q8 head) unless OFLM_OPEN_MTP_DRAFT_HEAD=q8
+            const bool int4_draft = std::getenv("OFLM_OPEN_MTP") && *std::getenv("OFLM_OPEN_MTP") &&
+                                    !(std::getenv("OFLM_OPEN_MTP_DRAFT_HEAD") && std::string(std::getenv("OFLM_OPEN_MTP_DRAFT_HEAD")) == "q8");
+            const bool int4 = int4_main || int4_draft;
+            head_b4_main_ = int4_main;
             std::vector<uint8_t> pool(bytes);
             pools::pack_lmhead(*w_, *file_, pool.data());
             const size_t V = w_->vocab, K = w_->hidden;
-            if (!int4 || cpu_head_check_) {
+            if (!int4_main || cpu_head_check_) {
                 lm_cpu_.resize(host::lmhead_q8_cpu_bytes(V, K));
                 host::lmhead_q8_repack(pool.data(), V, K, lm_cpu_.data());
             }
@@ -1241,8 +1247,8 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
             }
             cpu_head_ = true;
             if (cpu_head_check_) globals_[name] = alloc(bytes, pool.data(), pool.size());
-            log("CPU decode: the lm_head on the CPU (" + std::to_string((lm_b4_.empty() ? lm_cpu_.size() : lm_b4_.size()) >> 20) +
-                " MB, " + (lm_b4_.empty() ? "q8)" : "int4)"));
+            log("CPU decode: the lm_head on the CPU (" + std::to_string((head_b4_main_ ? lm_b4_.size() : lm_cpu_.size()) >> 20) +
+                " MB, " + (head_b4_main_ ? "int4)" : "q8)") + (lm_b4_.empty() || head_b4_main_ ? "" : ", an int4 copy for MTP drafts"));
         } else if (name == "lmpool") {
             xrt::bo lm = xrt::ext::bo(*dev_, bytes);
             pools::pack_lmhead(*w_, *file_, lm.map<uint8_t*>());
@@ -2962,7 +2968,8 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             }
             if (save) {
                 VerifySave& v = ver_[l];
-                v.state.assign(sp, sp + lt.state_bytes);
+                v.state.resize(lt.state_bytes);
+                host::par_copy(v.state.data(), sp, lt.state_bytes);
                 v.qkv = ya; v.z = yb; v.xn = xn;
             }
             host::DeltaGeom g;
@@ -3013,7 +3020,18 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
     dump_hidden(x.data(), R, hid, toks);
     last_x_.assign(x.end() - static_cast<long>(hid), x.end());
     rows_x_.assign(x.begin(), x.end());
-    if (want_logits) {
+    if (want_logits && R > 1 && cpu_head_ && !head_b4_main_ && !cpu_head_check_) {
+        // the rows' final norms, then the q8 head read once for all of them
+        auto tl = std::chrono::steady_clock::now();
+        if (normw_f_.empty()) tail_logits(x.data());      // fills normw_f_
+        static thread_local std::vector<float> hn;
+        hn.resize(R * hid);
+        host::rmsnorm_rows(x.data(), R, hid, normw_f_.data(), types_[0]->gemm_block.eps, hn.data());
+        rows_logits_.resize(R * w_->vocab);
+        host::lmhead_q8_cpu_rows(lm_cpu_.data(), w_->vocab, hid, hn.data(), R, rows_logits_.data());
+        std::copy(rows_logits_.end() - static_cast<long>(w_->vocab), rows_logits_.end(), logits_host_.begin());
+        timing_.lmhead_ms = ms_since(tl);
+    } else if (want_logits) {
         rows_logits_.resize(R * w_->vocab);
         for (size_t r = 0; r < R; ++r) {
             tail_logits(x.data() + r * hid);
@@ -3174,7 +3192,9 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
         std::copy(pxn.end() - static_cast<long>(hid), pxn.end(), xn.begin());
         std::vector<int> d;
         for (int j = 0; j < k; ++j) {
-            host::lmhead_q8_cpu(lm_cpu_.data(), V, hid, xn.data(), lg.data());   // mtp.norm applied: the head direct
+            // mtp.norm applied: the head direct (its int4 copy when there: only the top token matters)
+            if (!lm_b4_.empty()) host::gemv_b4(lm_b4_.data(), V, hid, xn.data(), lg.data());
+            else host::lmhead_q8_cpu(lm_cpu_.data(), V, hid, xn.data(), lg.data());
             d.push_back(argmax(lg.data()));
             if (j + 1 < k) {
                 std::vector<float> nx(hid);
@@ -3234,7 +3254,7 @@ void Core::cpu_rollback(size_t keep, size_t R) {
         const HostConsts& hc = hc_[l];
         uint8_t* sp = state_[l].map<uint8_t*>();
         const VerifySave& v = ver_[l];
-        std::memcpy(sp, v.state.data(), v.state.size());
+        host::par_copy(sp, v.state.data(), v.state.size());
         if (!keep) continue;
         std::vector<float> og(keep * gb.vw);
         host::DeltaGeom g;
@@ -3263,14 +3283,14 @@ void Core::tail_logits(const float* row) {
         static thread_local std::vector<float> xn;
         xn.resize(hid);
         host::rmsnorm_rows(row, 1, hid, normw_f_.data(), types_[0]->gemm_block.eps, xn.data());
-        if (!lm_b4_.empty()) host::gemv_b4(lm_b4_.data(), w_->vocab, hid, xn.data(), logits_host_.data());
+        if (head_b4_main_) host::gemv_b4(lm_b4_.data(), w_->vocab, hid, xn.data(), logits_host_.data());
         else host::lmhead_q8_cpu(lm_cpu_.data(), w_->vocab, hid, xn.data(), logits_host_.data());
         timing_.lmhead_ms = ms_since(t1);
         if (!cpu_head_check_) return;
         // debug: the reference head on the same row, compared -- the CPU q8 one for an int4 head,
         // else the NPU's
         std::vector<float> cpu(logits_host_);
-        if (!lm_b4_.empty()) {
+        if (head_b4_main_) {
             std::vector<float> ref(w_->vocab);
             host::lmhead_q8_cpu(lm_cpu_.data(), w_->vocab, hid, xn.data(), ref.data());
             const size_t V = w_->real_vocab ? w_->real_vocab : w_->vocab;

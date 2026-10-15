@@ -1510,6 +1510,87 @@ void lmhead_groups(const uint8_t* W, size_t K, const uint32_t* ax, const uint64_
 }
 }  // namespace
 
+namespace {
+struct HeadX { std::vector<uint32_t> ax; std::vector<uint64_t> neg; std::vector<float> sx; };
+void head_prep(const float* x, size_t K, HeadX& h) {
+    const size_t KB = K / 32;
+    h.ax.resize(KB * 8); h.neg.resize(KB * 8); h.sx.resize(KB);
+    for (size_t B = 0; B < KB; ++B) {
+        float m = 0.f;
+        for (int i = 0; i < 32; ++i) m = std::max(m, std::fabs(x[B * 32 + i]));
+        const float s = m > 0.f ? m / 127.f : 1.f, inv = 1.f / s;
+        h.sx[B] = s;
+        for (int kq = 0; kq < 8; ++kq) {
+            uint32_t a = 0, pat = 0;
+            for (int j = 0; j < 4; ++j) {
+                const long v = std::lrint(x[B * 32 + kq * 4 + j] * inv);
+                a |= static_cast<uint32_t>(std::labs(v)) << (8 * j);
+                if (v < 0) pat |= 1u << j;
+            }
+            uint64_t mk = 0;
+            for (int lane = 0; lane < 16; ++lane) mk |= static_cast<uint64_t>(pat) << (4 * lane);
+            h.ax[B * 8 + kq] = a;
+            h.neg[B * 8 + kq] = mk;
+        }
+    }
+}
+template <int R>
+__attribute__((target("avx512f,avx512bw,avx512vnni")))
+void lmhead_groups_rows(const uint8_t* W, size_t K, const HeadX* hx, size_t g0, size_t g1, float* y, size_t N) {
+    const size_t KB = K / 32, GS = KB * 544;
+    const __m512i zero = _mm512_setzero_si512();
+    for (size_t g = g0; g < g1; ++g) {
+        const uint8_t* gp = W + g * GS;
+        _mm_prefetch(reinterpret_cast<const char*>(gp + GS), _MM_HINT_NTA);
+        __m512 acc[R];
+        for (int r = 0; r < R; ++r) acc[r] = _mm512_setzero_ps();
+        for (size_t B = 0; B < KB; ++B) {
+            const uint8_t* blk = gp + B * 544;
+            __m512i a[R];
+            for (int r = 0; r < R; ++r) a[r] = _mm512_setzero_si512();
+            for (int kq = 0; kq < 8; ++kq) {
+                const __m512i w = _mm512_loadu_si512(blk + 32 + kq * 64);
+                for (int r = 0; r < R; ++r)
+                    a[r] = _mm512_dpbusd_epi32(a[r], _mm512_set1_epi32(static_cast<int>(hx[r].ax[B * 8 + kq])),
+                                               _mm512_mask_sub_epi8(w, hx[r].neg[B * 8 + kq], zero, w));
+            }
+            const __m512 sc = _mm512_castsi512_ps(
+                _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk))), 16));
+            for (int r = 0; r < R; ++r)
+                acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(a[r]), _mm512_mul_ps(sc, _mm512_set1_ps(hx[r].sx[B])), acc[r]);
+        }
+        for (int r = 0; r < R; ++r) _mm512_storeu_ps(y + r * N + g * 16, acc[r]);
+    }
+}
+using HeadFn = void (*)(const uint8_t*, size_t, const HeadX*, size_t, size_t, float*, size_t);
+constexpr HeadFn kHeadFn[8] = {lmhead_groups_rows<1>, lmhead_groups_rows<2>, lmhead_groups_rows<3>, lmhead_groups_rows<4>,
+                               lmhead_groups_rows<5>, lmhead_groups_rows<6>, lmhead_groups_rows<7>, lmhead_groups_rows<8>};
+}  // namespace
+
+void lmhead_q8_cpu_rows(const uint8_t* W, size_t N, size_t K, const float* x, size_t R, float* y) {
+    if (R < 1 || R > 8) throw std::runtime_error("open_qwen36: lmhead_q8_cpu_rows: 1 to 8 rows");
+    static thread_local std::vector<HeadX> hx;
+    hx.resize(8);
+    for (size_t r = 0; r < R; ++r) head_prep(x + r * K, K, hx[r]);
+    const size_t G = N / 16;
+    const HeadFn fn = kHeadFn[R - 1];
+    const HeadX* hp = hx.data();
+#pragma omp parallel
+    {
+        const size_t T = static_cast<size_t>(omp_get_num_threads()), i = static_cast<size_t>(omp_get_thread_num());
+        fn(W, K, hp, G * i / T, G * (i + 1) / T, y, N);
+    }
+}
+
+void par_copy(void* dst, const void* src, size_t bytes) {
+    const size_t chunk = 1 << 20, n = (bytes + chunk - 1) / chunk;
+#pragma omp parallel for schedule(static)
+    for (long long i = 0; i < static_cast<long long>(n); ++i) {
+        const size_t o = static_cast<size_t>(i) * chunk;
+        std::memcpy(static_cast<uint8_t*>(dst) + o, static_cast<const uint8_t*>(src) + o, std::min(chunk, bytes - o));
+    }
+}
+
 void lmhead_q8_cpu(const uint8_t* W, size_t N, size_t K, const float* x, float* y) {
     const size_t KB = K / 32;
     static thread_local std::vector<uint32_t> ax;
