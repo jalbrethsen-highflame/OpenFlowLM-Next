@@ -765,6 +765,7 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     // only) instead of the fused per-layer dx dispatch. Decode-only: the
     // gemm-block prefill route's own selector stays OFLM_OPEN_HOST_ATTN.
     if (const char* env = std::getenv("OFLM_OPEN_HOST_ATTN_DECODE")) host_attn_decode_on_ = std::string(env) != "0";
+    if (const char* env = std::getenv("OFLM_OPEN_CPU_DECODE")) cpu_decode_on_ = std::string(env) == "1";
     if (host_attn_decode_on_)
         log("decode route: HOST (OFLM_OPEN_HOST_ATTN_DECODE=1; the 2.5 gemm-block chain at T=1 "
             "with host attention; the NPU GEMMs run padded at the kernel set's compiled T)");
@@ -2262,6 +2263,12 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
         step_host_decode(token, x, want_logits);
         return;
     }
+    if (cpu_decode_on_ && !x && !deepstack && !mpos && !mrope_on_ && cpu_decode_ok()) {
+        step_cpu_decode(token, want_logits);
+        return;
+    }
+    if (state_owner_ == 1) states_to_device();
+    state_owner_ = 2;
     auto t0 = std::chrono::steady_clock::now();
     timing_ = StepTiming{};
 
@@ -2660,6 +2667,121 @@ void Core::gemm(const Step& s, const float* x, size_t T, size_t K, size_t N, int
     host::transpose(y, N, T, out.data());                  // [N, T] on the device -> [T, N]
     timing_.part1_ms += ms_since(t1);
     timing_.gemm_tr_ms += ms_since(t1);
+}
+
+void Core::states_to_device() {
+    for (int l = 0; l < nl_; ++l) state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    state_owner_ = 0;
+}
+
+void Core::states_to_host() {
+    for (int l = 0; l < nl_; ++l) read_back(state_[l], state_[l].size(), 0);
+    state_owner_ = 0;
+}
+
+bool Core::cpu_decode_ok() const {
+    if (!dit_on_ || !dit_b4_ || !gemm_block_t_ || static_cast<int>(hc_.size()) != nl_) return false;
+    for (int l = 0; l < nl_; ++l) {
+        const GemmBlockProgram& gb = types_[l]->gemm_block;
+        if ((gb.kind != "linear" && gb.kind != "full") || gb.program.size() < 2 || gb.ffn_program.size() < 2) return false;
+        for (const Step* st : {&gb.program[0], &gb.program[1], &gb.ffn_program[0], &gb.ffn_program[1]}) {
+            auto it = gemm_w_.find(st->args[0]);
+            if (it == gemm_w_.end() || it->second.size() != static_cast<size_t>(nl_)) return false;
+        }
+    }
+    return true;
+}
+
+void Core::step_cpu_decode(int token, bool want_logits) {
+    apply_thread_budget();
+    // OFLM_OPEN_DECODE_THREADS (default 8, 1-16): the cores a CPU decode step uses, so the rest
+    // of the machine stays usable. Reading memory needs about 4 cores per CPU die (8 reach
+    // ~108 GB/s); the int4 GEMV's own math needs more today (16 for ~97 GB/s).
+    static const int dthreads = [] {
+        const char* e = std::getenv("OFLM_OPEN_DECODE_THREADS");
+        const int n = e ? std::atoi(e) : 8;
+        return std::max(1, std::min(16, n));
+    }();
+    const int saved_threads = omp_get_max_threads();
+    omp_set_num_threads(dthreads);
+    struct Restore { int n; ~Restore() { omp_set_num_threads(n); } } restore{saved_threads};
+    auto t0 = std::chrono::steady_clock::now();
+    timing_ = StepTiming{};
+    if (state_owner_ == 2) states_to_host();
+    const size_t hid = w_->hidden, pos = static_cast<size_t>(pos_);
+    const auto& D = man_.gemm_dit;
+    // a GEMM step's [N, K] (its route kernel gemm_n<N>_k<K>) and its padded N
+    auto shape = [&](const Step& st, size_t& n, size_t& k, size_t& npad) {
+        const std::string& kn = st.kernel;
+        n = std::stoul(kn.substr(6, kn.find("_k") - 6));
+        k = std::stoul(kn.substr(kn.find("_k") + 2));
+        npad = D["npad"][std::to_string(n)].get<size_t>();
+    };
+    auto gemv = [&](const Step& st, int l, const float* in, std::vector<float>& out) {
+        size_t n, k, npad;
+        shape(st, n, k, npad);
+        out.resize(npad);
+        auto tg = std::chrono::steady_clock::now();
+        host::gemv_b4(gemm_w_.at(st.args[0])[l].map<const uint8_t*>(), npad, k, in, out.data());
+        timing_.part0_ms += ms_since(tg);
+    };
+    static thread_local std::vector<float> x, xn, y, og, h, ya, yb, yc, yd;
+    x.resize(hid); xn.resize(hid);
+    file_->bf16_row(w_->embed_tensor, static_cast<size_t>(token), hid, x.data());
+    for (int l = 0; l < nl_; ++l) {
+        const LayerType& lt = *types_[l];
+        const GemmBlockProgram& gb = lt.gemm_block;
+        const HostConsts& hc = hc_[l];
+        host::rmsnorm_rows(x.data(), 1, hid, hc.ln.data(), gb.eps, xn.data());
+        gemv(gb.program[0], l, xn.data(), y);
+        auto th = std::chrono::steady_clock::now();
+        uint8_t* sp = state_[l].map<uint8_t*>();
+        if (gb.kind == "linear") {
+            const size_t nch = gb.qkv_dim, vw = gb.vw;
+            og.resize(vw);
+            host::DeltaGeom g;
+            g.T = 1; g.hid = hid;
+            g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
+            g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
+            g.t_real = 1;
+            double ph[2] = {0, 0};
+            host::deltanet_block(g, y.data(), y.data() + nch, xn.data(), hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
+                                 hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
+                                 reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
+        } else {
+            const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
+            og.resize(qw);
+            host::AttnGeom g;
+            g.T = 1; g.t_real = 1; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
+            g.pos0 = pos; g.eps = gb.eps;
+            host::attention_block(g, y.data(), y.data() + qw, y.data() + qw + kvw, y.data() + qw + 2 * kvw, hc.qn.data(),
+                                  hc.kn.data(), man_.rope_inv_freq.data(), state_[l].map<uint16_t*>(), row / 2, og.data());
+        }
+        timing_.part1_ms += ms_since(th);
+        const std::vector<float> mid = og;
+        gemv(gb.program[1], l, mid.data(), y);
+        for (size_t i = 0; i < hid; ++i) x[i] += y[i];
+        host::rmsnorm_rows(x.data(), 1, hid, hc.postln.data(), gb.eps, xn.data());
+        gemv(gb.ffn_program[0], l, xn.data(), h);
+        // up|gate C: every 128-column tile is [gate 64 | up 64]; h = silu(gate) * up
+        const size_t ff = h.size() / 2;
+        og.resize(ff);
+        for (size_t j = 0; j < ff / 64; ++j)
+            for (size_t i = 0; i < 64; ++i) {
+                const float gt = h[128 * j + i], up = h[128 * j + 64 + i];
+                og[64 * j + i] = gt / (1.f + std::exp(-gt)) * up;
+            }
+        gemv(gb.ffn_program[1], l, og.data(), y);
+        for (size_t i = 0; i < hid; ++i) x[i] += y[i];
+    }
+    state_owner_ = 1;
+    ++pos_;
+    if (want_logits) tail_logits(x.data());
+    timing_.total_ms = ms_since(t0);
+    static const bool trace = std::getenv("OFLM_OPEN_CPU_DECODE_TRACE") != nullptr;
+    if (trace)
+        std::fprintf(stderr, "cpu decode pos %zu: %.1f ms | gemv %.1f mixer %.1f lm %.1f\n", pos, timing_.total_ms, timing_.part0_ms,
+                     timing_.part1_ms, timing_.lmhead_ms);
 }
 
 void Core::tail_logits(const float* row) {
@@ -3481,6 +3603,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         throw std::runtime_error("open_qwen36: prompt of " + std::to_string(N) + " at position " + std::to_string(pos_) +
                                  " is past the context capacity of " + std::to_string(cfg_.max_ctx));
     const size_t pos0 = static_cast<size_t>(pos_);
+    if (state_owner_ == 1) states_to_device();
     // packed prompts (set_segments): row flags where one starts (DeltaNet resets there) and
     // each row's position inside its own prompt (rope); attention stays inside each prompt
     std::vector<size_t> segs = std::move(segs_);
@@ -4071,6 +4194,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     }
     npu.join();
     if (err) std::rethrow_exception(err);
+    state_owner_ = 0;
     pos_ += static_cast<int>(N);
     last_x_.assign(xres.data() + (N - 1) * hid, xres.data() + N * hid);
     for (size_t i = 0; i < segs.size(); ++i) {

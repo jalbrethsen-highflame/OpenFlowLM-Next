@@ -620,6 +620,17 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// steps exactly as the NPU route's does, and the KV rows are the same
     /// bf16 cache rows, so the routes can switch mid-stream either direction.
     void step_host_decode(int token, const float* x, bool want_logits);
+    /// OFLM_OPEN_CPU_DECODE=1: one decode step with every GEMM on the CPU (host::gemv_b4) from
+    /// the dit2 int4 prompt weights, the mixer on the host as the prompt pipeline does it at T=1,
+    /// the norm and LM head on the NPU (tail_logits). Qwen3.5 linear / full layers with a dense FFN.
+    void step_cpu_decode(int token, bool want_logits);
+    bool cpu_decode_ok() const;
+    bool cpu_decode_on_ = false;
+    /// which side holds the newest per-layer state (DeltaNet S / conv rows, KV rows): 0 both,
+    /// 1 the host (CPU decode wrote it), 2 the device (the fused NPU decode wrote it)
+    int state_owner_ = 0;
+    void states_to_device();
+    void states_to_host();
     /// The route a step at the current position takes (internal convenience).
     inline bool decode_step_is_host() const { return decode_route_at(static_cast<size_t>(pos_ < 0 ? 0 : pos_)) == "host"; }
     /// The MoE families' block (kinds linear / full): xres as f32 [T, hidden].

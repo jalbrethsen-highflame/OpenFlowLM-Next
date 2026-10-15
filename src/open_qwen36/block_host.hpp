@@ -112,5 +112,11 @@ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, con
 void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, const float* Wr, float* probs,
                   int32_t* idx, float* w);
 
+/// y [npad] = x [K] times a dit2 int4-mantissa weight (designs/dit_gemm/pack.py pack_b4: per
+/// [128-column tile][64-K tile] 4096 bytes of nibbles in blocks [pair 8][k-block 8][2] of 8 columns
+/// x 8 k, then 128 exponent bytes, scale 2^(e - 133)) -- the bytes dit2 reads, on the CPU. x is
+/// rounded to bf16 (the products and sums are fp32). OpenMP over 128-column strips and K ranges.
+void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y);
+
 }  // namespace host
 }  // namespace open_qwen36

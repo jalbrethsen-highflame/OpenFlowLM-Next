@@ -14,8 +14,10 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "open_qwen36/q4nx_file.hpp"   // bf16_to_f32 / f32_to_bf16
@@ -1088,6 +1090,191 @@ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, 
             wsum += lg[best];
         }
         for (size_t s = 0; s < topk; ++s) w[t * topk + s] = static_cast<float>(w[t * topk + s] / wsum);
+    }
+}
+
+// ---- gemv_b4 -------------------------------------------------------------------------------
+namespace {
+constexpr size_t kB4Tile = 4224;
+inline uint16_t bf16_rne(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return static_cast<uint16_t>((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+}
+// x [K] -> [K / 8][16 dwords]: lane j holds the bf16 pair (x[8 kb + 2 (j % 4)], the next one)
+void b4_prep_x(const float* x, size_t K, uint32_t* xp) {
+    for (size_t kb = 0; kb < K / 8; ++kb)
+        for (int j = 0; j < 16; ++j) {
+            const size_t k = kb * 8 + 2 * (j % 4);
+            xp[kb * 16 + j] = uint32_t(bf16_rne(x[k])) | (uint32_t(bf16_rne(x[k + 1])) << 16);
+        }
+}
+// strip s, K tiles [t0, t1): acc [128] += the strip's columns over those tiles. Nibbles become
+// bf16 through a 16-word table (vpermw); vdpbf16ps takes 32 products a step, 4 lanes a column.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16")))
+void b4_strip_avx512(const uint8_t* st, const uint32_t* xp, size_t t0, size_t t1, float* acc) {
+    alignas(64) uint16_t t16[32];
+    for (int i = 0; i < 32; ++i) {
+        const int v = (i & 15) < 8 ? (i & 15) : (i & 15) - 16;
+        t16[i] = bf16_rne(static_cast<float>(v));
+    }
+    const __m512i tab = _mm512_load_si512(t16), m4 = _mm512_set1_epi32(0xF);
+    const __m512i rep = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    const __m512i rep2 = _mm512_add_epi32(rep, _mm512_set1_epi32(4)), six = _mm512_set1_epi32(6);
+    alignas(64) float run[16][2][16];
+    std::memset(run, 0, sizeof run);
+    for (size_t kt = t0; kt < t1; ++kt) {
+        const uint8_t* t = st + kt * kB4Tile;
+        _mm_prefetch(reinterpret_cast<const char*>(t + 8 * kB4Tile), _MM_HINT_NTA);
+        const uint32_t* xk = xp + kt * 8 * 16;
+        for (int g = 0; g < 16; ++g) {
+            const int p = g / 2, n2 = g % 2;
+            __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+            for (int kb = 0; kb < 8; ++kb) {
+                const uint8_t* blk = t + ((p * 8 + kb) * 2 + n2) * 32;
+                const __m512bh xv = (__m512bh)_mm512_loadu_si512(xk + kb * 16);
+                __m512i d0 = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(blk)));
+                __m512i d1 = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 16)));
+                d0 = _mm512_or_si512(_mm512_and_si512(d0, m4), _mm512_slli_epi32(_mm512_srli_epi32(d0, 4), 16));
+                d1 = _mm512_or_si512(_mm512_and_si512(d1, m4), _mm512_slli_epi32(_mm512_srli_epi32(d1, 4), 16));
+                a0 = _mm512_dpbf16_ps(a0, (__m512bh)_mm512_permutexvar_epi16(d0, tab), xv);
+                a1 = _mm512_dpbf16_ps(a1, (__m512bh)_mm512_permutexvar_epi16(d1, tab), xv);
+            }
+            // 2^(e - 133) as float bits; 0 for e <= 6 (an all-zero column)
+            const __m512i e = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(t + 4096 + g * 8)));
+            const __m512i eb = _mm512_slli_epi32(_mm512_max_epi32(_mm512_sub_epi32(e, six), _mm512_setzero_si512()), 23);
+            _mm512_store_ps(run[g][0], _mm512_fmadd_ps(a0, _mm512_castsi512_ps(_mm512_permutexvar_epi32(rep, eb)),
+                                                       _mm512_load_ps(run[g][0])));
+            _mm512_store_ps(run[g][1], _mm512_fmadd_ps(a1, _mm512_castsi512_ps(_mm512_permutexvar_epi32(rep2, eb)),
+                                                       _mm512_load_ps(run[g][1])));
+        }
+    }
+    for (int g = 0; g < 16; ++g)
+        for (int hh = 0; hh < 2; ++hh)
+            for (int c = 0; c < 4; ++c) {
+                const float* r = run[g][hh] + 4 * c;
+                acc[g * 8 + hh * 4 + c] += (r[0] + r[1]) + (r[2] + r[3]);
+            }
+}
+// the same, scalar (no AVX-512 BF16): bf16 x times the decoded mantissa, the same order of sums
+void b4_strip_scalar(const uint8_t* st, const uint32_t* xp, size_t t0, size_t t1, float* acc) {
+    for (size_t kt = t0; kt < t1; ++kt) {
+        const uint8_t* t = st + kt * kB4Tile;
+        for (int c = 0; c < 128; ++c) {
+            const int g = c / 8, p = g / 2, n2 = g % 2, cb = c % 8;
+            float s = 0.f;
+            for (int kb = 0; kb < 8; ++kb)
+                for (int ki = 0; ki < 8; ++ki) {
+                    const uint8_t byte = t[((p * 8 + kb) * 2 + n2) * 32 + cb * 4 + ki / 2];
+                    int m = (ki & 1) ? byte >> 4 : byte & 15;
+                    if (m > 7) m -= 16;
+                    const uint32_t pr = xp[(kt * 8 + kb) * 16 + ki / 2];
+                    s += bf16_to_f32(static_cast<uint16_t>((ki & 1) ? pr >> 16 : pr & 0xFFFF)) * static_cast<float>(m);
+                }
+            const int e = t[4096 + c];
+            acc[c] += e > 6 ? s * std::ldexp(1.f, e - 133) : 0.f;
+        }
+    }
+}
+// The int8 path (OFLM_OPEN_DECODE_GEMV=int8, the default): the weight nibble as u8 (m + 8 =
+// nib ^ 8), x as s8 with one scale per 64-K tile (max|x| / 127), vpdpbusd: 64 products a step,
+// about 3x fewer instructions a weight than the bf16 path -- 8 cores read ~100 GB/s against 64
+// (34816 x 5120). sum (m + 8) x = sum m x + 8 sum x: the second term is one integer a tile. A
+// 64-byte load is a pair's two blocks = 16 columns x 8 k; low nibbles hold the even k, high the odd.
+// Error from x's rounding: ~0.6 % relative per output on random data (the NPU prompt path's
+// bfp16 A rounds alike).
+struct B4XQ {
+    std::vector<int32_t> ev, od, cs;
+    std::vector<float> sx;
+};
+void b4_prep_xq(const float* x, size_t K, B4XQ& q) {
+    const size_t KT = K / 64;
+    q.ev.resize(K / 8); q.od.resize(K / 8); q.sx.resize(KT); q.cs.resize(KT);
+    for (size_t kt = 0; kt < KT; ++kt) {
+        float m = 0.f;
+        for (int i = 0; i < 64; ++i) m = std::max(m, std::fabs(x[kt * 64 + i]));
+        const float sc = m > 0.f ? m / 127.f : 1.f, inv = 1.f / sc;
+        int32_t sum = 0;
+        int8_t v[64];
+        for (int i = 0; i < 64; ++i) {
+            v[i] = static_cast<int8_t>(std::lrint(x[kt * 64 + i] * inv));
+            sum += v[i];
+        }
+        q.sx[kt] = sc;
+        q.cs[kt] = 8 * sum;
+        for (int kb = 0; kb < 8; ++kb) {
+            const uint8_t e[4] = {uint8_t(v[kb * 8]), uint8_t(v[kb * 8 + 2]), uint8_t(v[kb * 8 + 4]), uint8_t(v[kb * 8 + 6])};
+            const uint8_t o[4] = {uint8_t(v[kb * 8 + 1]), uint8_t(v[kb * 8 + 3]), uint8_t(v[kb * 8 + 5]), uint8_t(v[kb * 8 + 7])};
+            std::memcpy(&q.ev[kt * 8 + kb], e, 4);
+            std::memcpy(&q.od[kt * 8 + kb], o, 4);
+        }
+    }
+}
+__attribute__((target("avx512f,avx512bw,avx512vnni")))
+void b4_strip_vnni(const uint8_t* st, const B4XQ& q, size_t t0, size_t t1, float* acc) {
+    const __m512i x88 = _mm512_set1_epi8(static_cast<char>(0x88)), m0f = _mm512_set1_epi8(0x0F), six = _mm512_set1_epi32(6);
+    __m512 run[8];
+    for (int p = 0; p < 8; ++p) run[p] = _mm512_setzero_ps();
+    for (size_t kt = t0; kt < t1; ++kt) {
+        const uint8_t* t = st + kt * kB4Tile;
+        _mm_prefetch(reinterpret_cast<const char*>(t + 8 * kB4Tile), _MM_HINT_NTA);
+        const __m512 corr = _mm512_set1_ps(static_cast<float>(q.cs[kt])), sx = _mm512_set1_ps(q.sx[kt]);
+        for (int p = 0; p < 8; ++p) {
+            __m512i a = _mm512_setzero_si512();
+            for (int kb = 0; kb < 8; ++kb) {
+                const __m512i v = _mm512_xor_si512(_mm512_loadu_si512(t + (p * 8 + kb) * 64), x88);
+                a = _mm512_dpbusd_epi32(a, _mm512_and_si512(v, m0f), _mm512_set1_epi32(q.ev[kt * 8 + kb]));
+                a = _mm512_dpbusd_epi32(a, _mm512_and_si512(_mm512_srli_epi16(v, 4), m0f), _mm512_set1_epi32(q.od[kt * 8 + kb]));
+            }
+            // lane l of the pair's load is the tile's column 16 p + l; its scale 2^(e - 133) x sx
+            const __m512i e = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(t + 4096 + p * 16)));
+            const __m512 sc = _mm512_mul_ps(
+                sx, _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_max_epi32(_mm512_sub_epi32(e, six), _mm512_setzero_si512()), 23)));
+            run[p] = _mm512_fmadd_ps(_mm512_sub_ps(_mm512_cvtepi32_ps(a), corr), sc, run[p]);
+        }
+    }
+    for (int p = 0; p < 8; ++p) _mm512_storeu_ps(acc + p * 16, _mm512_add_ps(_mm512_loadu_ps(acc + p * 16), run[p]));
+}
+}  // namespace
+
+void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y) {
+    if (npad % 128 || K % 64) throw std::runtime_error("open_qwen36: gemv_b4: N % 128 or K % 64");
+    static const bool avx = __builtin_cpu_supports("avx512bf16") && __builtin_cpu_supports("avx512bw");
+    static const bool int8 = [] {
+        const char* e = std::getenv("OFLM_OPEN_DECODE_GEMV");
+        return !(e && std::string(e) == "bf16") && __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512bw");
+    }();
+    static thread_local B4XQ xq_tl;
+    static thread_local std::vector<uint32_t> xp_tl;
+    static thread_local std::vector<float> part_tl;
+    std::vector<uint32_t>& xp = xp_tl;
+    B4XQ& xq = xq_tl;
+    if (int8) {
+        b4_prep_xq(x, K, xq);
+    } else {
+        xp.resize(K / 8 * 16);
+        b4_prep_x(x, K, xp.data());
+    }
+    const size_t S = npad / 128, KT = K / 64;
+    const size_t T = static_cast<size_t>(omp_get_max_threads());
+    // enough work items to balance the threads: K split in ranges when there are few strips
+    const size_t ks = std::min(KT, std::max<size_t>(1, (4 * T + S - 1) / S));
+    std::vector<float>& part = part_tl;
+    part.assign(ks * npad, 0.f);
+    const uint32_t* xpp = xp.data();
+#pragma omp parallel for schedule(dynamic, 1)
+    for (long long w = 0; w < static_cast<long long>(S * ks); ++w) {
+        const size_t s = static_cast<size_t>(w) / ks, r = static_cast<size_t>(w) % ks;
+        const size_t t0 = KT * r / ks, t1 = KT * (r + 1) / ks;
+        float* acc = part.data() + r * npad + s * 128;
+        if (int8) b4_strip_vnni(B + s * KT * kB4Tile, xq, t0, t1, acc);
+        else if (avx) b4_strip_avx512(B + s * KT * kB4Tile, xpp, t0, t1, acc);
+        else b4_strip_scalar(B + s * KT * kB4Tile, xpp, t0, t1, acc);
+    }
+    for (size_t n = 0; n < npad; ++n) {
+        float v = 0.f;
+        for (size_t r = 0; r < ks; ++r) v += part[r * npad + n];
+        y[n] = v;
     }
 }
 
