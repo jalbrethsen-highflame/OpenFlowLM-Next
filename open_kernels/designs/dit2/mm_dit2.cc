@@ -174,6 +174,9 @@ void dit_matmul_quarter(bfp16ebs8 *__restrict pA, uint8_t *__restrict pB, bfloat
   constexpr int m = DIM_M / 4, n = DIM_N;
   bfloat16 *pCq = pC + oflm_dit_quarter * m * n;
   oflm_dit_quarter = (oflm_dit_quarter + 1) & 3;
+#ifdef DIT_NULL_MM
+  return;
+#endif
   aie::rounding_mode saved = aie::swap_rounding(aie::rounding_mode::conv_even);
   hs_b4_call(pA, pB, pCq, reinterpret_cast<const int8_t *>(pB + 4096));
   aie::set_rounding(saved);

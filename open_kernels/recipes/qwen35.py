@@ -272,11 +272,12 @@ _HS_ENV = {"DG_KFLAGS": "-DDIT_HS"} if GEMM_HS else {}
 _HS_SFX = "_hs" if GEMM_HS else ""
 # OPEN_QWEN35_GEMM_B4=1: every dit2 GEMM on int4-mantissa weights (pack.py pack_b4, hsgen
 # HSGEN_B4; a power-of-two scale per column per 64 of K), manifest "b4". 38-41 TFLOPS on the
-# 27B shapes against 31-33, at an accuracy cost (utilities/d3-npu/d3_quant_sim.py). The 0x2800
-# stack moves the L1 buffers off each other's banks (35.5 -> 39.6 TFLOPS at 1024x5120x16384).
+# 27B shapes against 31-33, at an accuracy cost (utilities/d3-npu/d3_quant_sim.py). The stack
+# size places the L1 buffers on the banks: 0x2000 is the best of a 0x1000-0x4400 sweep (41.3
+# TFLOPS at 1024x5120x16384 against 39.4 at 0x2800 and 37.4 at 0x1000; FFN up and down -5 %).
 GEMM_B4 = GEMM_HS and _os.environ.get("OPEN_QWEN35_GEMM_B4", "0") == "1"
 if GEMM_B4:
-    _HS_ENV = {"DG_STACK": "0x2800"}
+    _HS_ENV = {"DG_STACK": "0x2000"}
     _HS_SFX = "_b4"
 
 
@@ -295,6 +296,10 @@ FA_NC_VALID = 0x7A11D5EE
 # (~3.4x dit_fa256's nc stream); the engine packs Q, K and V^T in its pop order. Same lengths and
 # valid_len sentinel. OPEN_QWEN35_FA_NCB=0 off.
 FA_NCB = _os.environ.get("OPEN_QWEN35_FA_NCB", "1") != "0"
+# Short prompts: the pipe's dit2 GEMMs again at GEMM_SMALL_M rows (one 512-row group; the same
+# image and core code, only the instruction streams differ), which the engine takes when the
+# whole prompt fits. OPEN_QWEN35_GEMM_SMALL_M=0 off.
+GEMM_SMALL_M = int(_os.environ.get("OPEN_QWEN35_GEMM_SMALL_M", 512))
 
 
 def gemm_dit(spec: ModelSpec) -> dict | None:
@@ -331,6 +336,11 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
                 # A in unit slots (pack_h), down reads them (a_units) -- no host repack
                 ffn["up2p"] = f"dit2_n{2 * ff}_k{hid}_epi_ph"
                 ffn["down2u"] = f"dit2_n{hid}_k{ff}_au"
+    small = None
+    if GEMM_HS and 0 < GEMM_SMALL_M < DIT_M and ffn and "up2p" in ffn:
+        sm = f"_m{GEMM_SMALL_M}"
+        small = {"m": GEMM_SMALL_M, "kernels2": {key: name + sm for key, name in k2.items()},
+                 "ffn": {"up2p": ffn["up2p"] + sm, "down2u": ffn["down2u"] + sm}}
     fa = None
     if GEMM_DIT2 and FA_MAX_LK >= DIT_M and spec.has_full and spec.head_dim == 256:
         fa = {"lk": {str(lk): f"fa256_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)},
@@ -346,6 +356,7 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             **({"b4": True} if GEMM_B4 and k2 else {}),
             **({"fa": fa} if fa else {}),
             **({"ffn": ffn} if ffn else {}),
+            **({"small": small} if small else {}),
             **({"kernels2": k2} if k2 else {}),
             "kernels": {f"{n}x{k}": f"dit_n{npad[n]}_k{k}" for n, k in shapes},
             "npad": {str(n): p for n, p in npad.items()},
@@ -408,6 +419,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
                 out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
         names2 = list(d.get("kernels2", {}).values()) + [d["ffn"][x] for x in ("up2", "down2", "up2p", "down2u")
                                                          if x in d.get("ffn", {})]
+        names2 += list(d.get("small", {}).get("kernels2", {}).values()) + list(d.get("small", {}).get("ffn", {}).values())
         for name in names2:
             out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
             out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
@@ -512,6 +524,19 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                                            "DG_LAYOUT": _lay(epi={"first_cb": 0}, pack_h=True), **_HS_ENV}}
             b[d["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{ff2}_n{spec.hidden}_au{_HS_SFX}",
                                      "env": {"DG_M": str(DIT_M), "DG_K": str(ff2), "DG_N": str(spec.hidden),
+                                             "DG_LAYOUT": _lay(a_units=True), **_HS_ENV}}
+        if "small" in d:
+            sm, S = d["small"]["m"], d["small"]
+            for key, name in S["kernels2"].items():
+                n, k = (int(x) for x in key.split("x"))
+                b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{sm}_k{k}_n{d['npad'][str(n)]}{_HS_SFX}",
+                           "env": {"DG_M": str(sm), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), "DG_LAYOUT": _lay(), **_HS_ENV}}
+            ff2 = d["ffn"]["ff"]
+            b[S["ffn"]["up2p"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{sm}_k{spec.hidden}_n{2 * ff2}_epi_ph{_HS_SFX}",
+                                   "env": {"DG_M": str(sm), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
+                                           "DG_LAYOUT": _lay(epi={"first_cb": 0}, pack_h=True), **_HS_ENV}}
+            b[S["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{sm}_k{ff2}_n{spec.hidden}_au{_HS_SFX}",
+                                     "env": {"DG_M": str(sm), "DG_K": str(ff2), "DG_N": str(spec.hidden),
                                              "DG_LAYOUT": _lay(a_units=True), **_HS_ENV}}
         if "ffn" in d:
             ff, hid = d["ffn"]["ff"], spec.hidden
