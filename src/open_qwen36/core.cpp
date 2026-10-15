@@ -3938,7 +3938,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         timing_.attn_ms += ms_since(ta);
                         if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs, t_real);
                         else to_bf16(og.data(), M, qw, "pp_m_" + cs);
-                        if (ops[l].size() > 9) advance = 3;     // no NPU attention for this chunk: past FAT and GATE
+                        // no NPU attention for this chunk: past FAT and GATE (when the layer has them)
+                        if (static_cast<size_t>(stage[cell(l, c)]) + 1 < ops[l].size() && ops[l][stage[cell(l, c)] + 1] == FAT) advance = 3;
                     } else {
                         // NPU attention: q / k normed and roped here, K / V rows into the cache (synced),
                         // Q to the kernel unscaled (it applies 1 / sqrt(hd) itself; prep scaled by it)
