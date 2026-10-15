@@ -465,11 +465,20 @@ void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, 
     }
 }
 
+#ifdef DN_PROFILE
+double g_dn_prof[6] = {0, 0, 0, 0, 0, 0};   // setup, phase 1, phase 1b, window, rule (us, summed)
+#define DN_MARK(i) do { auto _n = std::chrono::steady_clock::now(); g_dn_prof[i] += std::chrono::duration<double, std::micro>(_n - dn_t).count(); dn_t = _n; } while (0)
+#else
+#define DN_MARK(i) do {} while (0)
+#endif
 void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const float* xn, const float* convw,
                     const float* Wa, const float* Wb, const float* A, const float* dtb, const float* nw,
                     uint16_t* conv_state, float* S, float* og, double* phase_ms) {
     const auto tp0 = std::chrono::steady_clock::now();
     const size_t dim = g.head_dim, key_w = g.key_heads * dim, vw = g.value_heads * dim, nch = 2 * key_w + vw;
+#ifdef DN_PROFILE
+    auto dn_t = tp0;
+#endif
     if (g.value_heads % g.key_heads || g.t_real > g.T || g.s_rows < dim || g.lanes < g.value_heads)
         throw std::runtime_error("open_qwen36: deltanet_block: inconsistent geometry");
     const size_t grp = g.value_heads / g.key_heads, R = g.t_real;
@@ -495,7 +504,9 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
     static thread_local std::vector<float> Q_tl, K_tl, V_tl, decay_tl, beta_tl;
     std::vector<float> &Q = Q_tl, &Kk = K_tl, &V = V_tl, &decay = decay_tl, &beta = beta_tl;
     Q.resize(R * key_w); Kk.resize(R * key_w); V.resize(R * vw); decay.resize(R * g.value_heads); beta.resize(R * g.value_heads);
-#pragma omp parallel
+    DN_MARK(0);
+    // one or two tokens: on this thread (a team costs more than the work, ~125 us against 37)
+#pragma omp parallel if (R > 2)
     {
         std::vector<float> c(nch), al(g.lanes), be(g.lanes);
 #pragma omp for
@@ -547,7 +558,52 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
     // ---- phase 1b: alpha / beta = xn Wa, xn Wb over the block, 8 tokens a pass so each Wa / Wb
     // row is read once for 8 tokens instead of once per token (per token it was 2.6 MB of weight
     // traffic for 1.3 MFLOP at the 27B's width). Each lane still sums over i in the same order.
-    {
+    DN_MARK(1);
+    // A decode-sized block (R <= 8, one token block): split over the hidden dim instead, each
+    // thread a slice of i for every lane, then the partial sums added -- one thread alone read
+    // all of Wa / Wb (2.6 MB at the 27B's width) for 0.5 ms a layer.
+    if (R <= 8 && omp_get_max_threads() > 1) {
+        const size_t lanes = g.lanes, hid = g.hid, nv = g.value_heads;
+        const int nt = omp_get_max_threads();
+        std::vector<float> pa(static_cast<size_t>(nt) * R * lanes, 0.f), pb(pa.size(), 0.f);
+#pragma omp parallel num_threads(nt)
+        {
+            const size_t ti = static_cast<size_t>(omp_get_thread_num()), T = static_cast<size_t>(omp_get_num_threads());
+            const size_t i0 = hid * ti / T, i1 = hid * (ti + 1) / T;
+            float* a = pa.data() + ti * R * lanes;
+            float* b = pb.data() + ti * R * lanes;
+            for (size_t u = 0; u < R; ++u) {
+                float* __restrict au = a + u * lanes;
+                float* __restrict bu = b + u * lanes;
+                size_t hh = 0;
+                for (; hh + 8 <= lanes; hh += 8) {   // 8 lanes in registers over the whole i slice
+                    __m256 sa = _mm256_setzero_ps(), sb = _mm256_setzero_ps();
+                    for (size_t i = i0; i < i1; ++i) {
+                        const __m256 xv = _mm256_set1_ps(xn[u * hid + i]);
+                        sa = _mm256_fmadd_ps(xv, _mm256_loadu_ps(Wa + i * lanes + hh), sa);
+                        sb = _mm256_fmadd_ps(xv, _mm256_loadu_ps(Wb + i * lanes + hh), sb);
+                    }
+                    _mm256_storeu_ps(au + hh, sa);
+                    _mm256_storeu_ps(bu + hh, sb);
+                }
+                for (; hh < lanes; ++hh)
+                    for (size_t i = i0; i < i1; ++i) {
+                        au[hh] += xn[u * hid + i] * Wa[i * lanes + hh];
+                        bu[hh] += xn[u * hid + i] * Wb[i * lanes + hh];
+                    }
+            }
+        }
+        for (size_t u = 0; u < R; ++u)
+            for (size_t h = 0; h < nv; ++h) {
+                float sa = 0.f, sb = 0.f;
+                for (int t = 0; t < nt; ++t) {
+                    sa += pa[(static_cast<size_t>(t) * R + u) * lanes + h];
+                    sb += pb[(static_cast<size_t>(t) * R + u) * lanes + h];
+                }
+                decay[u * nv + h] = std::exp(A[h] * softplus(sa + dtb[h]));
+                beta[u * nv + h] = sigmoid(sb);
+            }
+    } else {
         const size_t lanes = g.lanes, hid = g.hid, nv = g.value_heads;
         constexpr size_t TB = 8;
 #pragma omp parallel for schedule(static)
@@ -596,6 +652,7 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                 }
         }
     }
+    DN_MARK(2);
     // the window the next block starts from: the last `pre` rows, short blocks keeping what
     // the shift would have left in front of them
     const long long last0 = R ? seg0[R - 1] : LLONG_MIN;   // the sequence the next block continues
@@ -611,6 +668,7 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
         }
     }
 
+    DN_MARK(3);
     // ---- phase 2, per head over every token: the gated delta rule on S (in place), the gated norm
     const auto tp1 = std::chrono::steady_clock::now();
     // one pass per packed sequence, S zeroed where one starts
@@ -1260,21 +1318,38 @@ void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y) 
     // enough work items to balance the threads: K split in ranges when there are few strips
     const size_t ks = std::min(KT, std::max<size_t>(1, (4 * T + S - 1) / S));
     std::vector<float>& part = part_tl;
-    part.assign(ks * npad, 0.f);
+    if (ks > 1) part.resize(ks * npad);
     const uint32_t* xpp = xp.data();
-#pragma omp parallel for schedule(dynamic, 1)
+#pragma omp parallel
+    {
+#pragma omp for schedule(dynamic, 1)
     for (long long w = 0; w < static_cast<long long>(S * ks); ++w) {
         const size_t s = static_cast<size_t>(w) / ks, r = static_cast<size_t>(w) % ks;
         const size_t t0 = KT * r / ks, t1 = KT * (r + 1) / ks;
-        float* acc = part.data() + r * npad + s * 128;
+        // one K range: straight into y; several: a partial row each, added below
+        float* acc = ks == 1 ? y + s * 128 : part.data() + r * npad + s * 128;
+        std::fill(acc, acc + 128, 0.f);
         if (int8) b4_strip_vnni(B + s * KT * kB4Tile, xq, t0, t1, acc);
         else if (avx) b4_strip_avx512(B + s * KT * kB4Tile, xpp, t0, t1, acc);
         else b4_strip_scalar(B + s * KT * kB4Tile, xpp, t0, t1, acc);
     }
-    for (size_t n = 0; n < npad; ++n) {
-        float v = 0.f;
-        for (size_t r = 0; r < ks; ++r) v += part[r * npad + n];
-        y[n] = v;
+    if (ks > 1) {
+#pragma omp for schedule(static)
+        for (long long n = 0; n < static_cast<long long>(npad); ++n) {
+            float v = 0.f;
+            for (size_t r = 0; r < ks; ++r) v += part[r * npad + static_cast<size_t>(n)];
+            y[n] = v;
+        }
+    }
+    }
+}
+
+void swiglu_tiles(const float* ug, size_t ff, float* h) {
+#pragma omp parallel for schedule(static)
+    for (long long jj = 0; jj < static_cast<long long>(ff / 64); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        for (size_t i = 0; i < 64; i += 16)
+            dn_st(h + 64 * j + i, dn_silu(dn_ld(ug + 128 * j + i)) * dn_ld(ug + 128 * j + 64 + i));
     }
 }
 

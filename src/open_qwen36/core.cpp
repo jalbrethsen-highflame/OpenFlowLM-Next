@@ -2766,11 +2766,7 @@ void Core::step_cpu_decode(int token, bool want_logits) {
         // up|gate C: every 128-column tile is [gate 64 | up 64]; h = silu(gate) * up
         const size_t ff = h.size() / 2;
         og.resize(ff);
-        for (size_t j = 0; j < ff / 64; ++j)
-            for (size_t i = 0; i < 64; ++i) {
-                const float gt = h[128 * j + i], up = h[128 * j + 64 + i];
-                og[64 * j + i] = gt / (1.f + std::exp(-gt)) * up;
-            }
+        host::swiglu_tiles(h.data(), ff, og.data());
         gemv(gb.ffn_program[1], l, og.data(), y);
         for (size_t i = 0; i < hid; ++i) x[i] += y[i];
     }
