@@ -2973,15 +2973,18 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
                 v.qkv = ya; v.z = yb; v.xn = xn;
             }
             host::DeltaGeom g;
-            g.T = R; g.hid = hid;
+            g.T = 1; g.hid = hid;
             g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
             g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
-            g.t_real = R;
+            g.t_real = 1;
             if (!hc.Wa16.empty()) { g.wa16 = hc.Wa16.data(); g.wb16 = hc.Wb16.data(); }
             double ph[2] = {0, 0};
-            host::deltanet_block(g, ya.data(), yb.data(), xn.data(), hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
-                                 hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
-                                 reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
+            // one token at a time even in a verify pass: a T > 1 block orders the delta rule's sums
+            // differently (~2e-7), which over 64 layers flips near-ties -- the pass must match decode
+            for (size_t r = 0; r < R; ++r)
+                host::deltanet_block(g, ya.data() + r * nch, yb.data() + r * vw, xn.data() + r * hid, hc.convw.data(), hc.Wa.data(),
+                                     hc.Wb.data(), hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
+                                     reinterpret_cast<float*>(sp + gb.state_s_off), og.data() + r * vw, ph);
         } else {
             const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
             ya.resize(R * qw); yb.resize(R * kvw); yc.resize(R * kvw); yd.resize(R * qw); og.resize(R * qw);
@@ -3256,16 +3259,17 @@ void Core::cpu_rollback(size_t keep, size_t R) {
         const VerifySave& v = ver_[l];
         host::par_copy(sp, v.state.data(), v.state.size());
         if (!keep) continue;
-        std::vector<float> og(keep * gb.vw);
+        std::vector<float> og(gb.vw);
         host::DeltaGeom g;
-        g.T = keep; g.hid = hid;
+        g.T = 1; g.hid = hid;
         g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
         g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
-        g.t_real = keep;
+        g.t_real = 1;
         double ph[2] = {0, 0};
-        host::deltanet_block(g, v.qkv.data(), v.z.data(), v.xn.data(), hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
-                             hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
-                             reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
+        for (size_t r = 0; r < keep; ++r)   // token by token, as the pass and decode ran them
+            host::deltanet_block(g, v.qkv.data() + r * gb.qkv_dim, v.z.data() + r * gb.vw, v.xn.data() + r * hid, hc.convw.data(),
+                                 hc.Wa.data(), hc.Wb.data(), hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
+                                 reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
     }
     omp_set_num_threads(saved_threads);
     pos_ -= static_cast<int>(R - keep);
