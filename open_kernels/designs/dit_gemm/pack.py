@@ -5,7 +5,7 @@ is what ships.
 
 bfp16ebs8: blocks of 8 values share one exponent byte (the largest element's IEEE
 exponent), followed by 8 two's-complement int8 mantissas; value = mant * 2^(exp-127) / 64.
-9 bytes per 8 values. The encoder rounds to nearest (ties away from zero); the device
+9 bytes per 8 values. The encoder rounds to nearest, ties to even (it was ties up, a bias on bf16 inputs); the device
 only decodes, so the rounding is the host's choice -- nearest measured 1.25e-2 end to end
 against truncation's 1.52e-2 (utilities/dit-gemm-bench/README.md).
 
@@ -30,7 +30,10 @@ def bfp16ebs8_encode(x: np.ndarray) -> np.ndarray:
     signed = np.where(bits >> 31 == 1, -mant, mant)
     shift = 17 + np.minimum(max_exp - exp, 31)
     half = np.left_shift(np.int64(1), shift - 1)
-    vals = np.clip(np.floor_divide(signed + half, np.left_shift(np.int64(1), shift)), -128, 127)
+    q = np.right_shift(signed, shift)                     # floor
+    r = signed - np.left_shift(q, shift)
+    q = q + ((r > half) | ((r == half) & (q & 1 == 1)))   # nearest, ties to even (bf16 inputs tie often)
+    vals = np.clip(q, -128, 127)
     out = np.empty((bits.shape[0], 9), dtype=np.uint8)
     out[:, 0] = max_exp[:, 0].astype(np.uint8)
     out[:, 1:] = vals.astype(np.int8).view(np.uint8)
