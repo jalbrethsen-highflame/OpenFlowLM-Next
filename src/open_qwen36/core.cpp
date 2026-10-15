@@ -2946,7 +2946,8 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
     // OFLM_OPEN_MTP's verify pass (verify_save_): each linear layer's state before the rows, and the
     // rows' DeltaNet inputs, so cpu_rollback can keep a prefix
     const bool save = verify_save_ && R > 1;
-    if (save) ver_.assign(nl_, {});
+    if (save && ver_.size() != static_cast<size_t>(nl_)) ver_.assign(nl_, {});
+    if (s_alt_.size() != static_cast<size_t>(nl_)) { s_alt_.assign(nl_, {}); s_in_alt_.assign(nl_, 0); }
     static thread_local std::vector<float> x, xn, y, og, h, ya, yb, yc, yd, mid;
     x.resize(R * hid); xn.resize(R * hid);
     for (size_t r = 0; r < R; ++r) file_->bf16_row(w_->embed_tensor, static_cast<size_t>(toks[r]), hid, x.data() + r * hid);
@@ -2966,10 +2967,17 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
                 std::copy(y.begin() + r * nq, y.begin() + r * nq + nch, ya.begin() + r * nch);
                 std::copy(y.begin() + r * nq + nch, y.begin() + r * nq + nch + vw, yb.begin() + r * vw);
             }
+            // S: the current buffer (state_[l] or its alternate, s_alt_). A verify pass writes its
+            // first token's update into the other one, so the state before the pass stays intact for
+            // cpu_rollback without a copy; only the conv window (bytes [0, state_s_off)) is kept.
+            const size_t sbytes = lt.state_bytes - gb.state_s_off;
+            if (save && s_alt_[l].size() != sbytes / 4) s_alt_[l].assign(sbytes / 4, 0.f);
+            float* s_bo = reinterpret_cast<float*>(sp + gb.state_s_off);
+            float* s_cur = s_in_alt_[l] ? s_alt_[l].data() : s_bo;
+            float* s_oth = s_in_alt_[l] ? s_bo : s_alt_[l].data();
             if (save) {
                 VerifySave& v = ver_[l];
-                v.state.resize(lt.state_bytes);
-                host::par_copy(v.state.data(), sp, lt.state_bytes);
+                v.conv.assign(sp, sp + gb.state_s_off);
                 v.qkv = ya; v.z = yb; v.xn = xn;
             }
             host::DeltaGeom g;
@@ -2981,10 +2989,14 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             double ph[2] = {0, 0};
             // one token at a time even in a verify pass: a T > 1 block orders the delta rule's sums
             // differently (~2e-7), which over 64 layers flips near-ties -- the pass must match decode
-            for (size_t r = 0; r < R; ++r)
-                host::deltanet_block(g, ya.data() + r * nch, yb.data() + r * vw, xn.data() + r * hid, hc.convw.data(), hc.Wa.data(),
+            for (size_t r = 0; r < R; ++r) {
+                host::DeltaGeom gr = g;
+                if (save && r == 0) gr.s_in = s_cur;
+                host::deltanet_block(gr, ya.data() + r * nch, yb.data() + r * vw, xn.data() + r * hid, hc.convw.data(), hc.Wa.data(),
                                      hc.Wb.data(), hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
-                                     reinterpret_cast<float*>(sp + gb.state_s_off), og.data() + r * vw, ph);
+                                     save ? s_oth : s_cur, og.data() + r * vw, ph);
+            }
+            if (save) s_in_alt_[l] ^= 1;
         } else {
             const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
             ya.resize(R * qw); yb.resize(R * kvw); yc.resize(R * kvw); yd.resize(R * qw); og.resize(R * qw);
@@ -3250,6 +3262,13 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
         tok = b;
     }
     verify_save_ = false;
+    // every linear layer's current S back in state_[l] (prefill and the NPU route read it there)
+    for (int l = 0; l < nl_ && static_cast<size_t>(l) < s_in_alt_.size(); ++l)
+        if (s_in_alt_[l]) {
+            const GemmBlockProgram& gb = types_[l]->gemm_block;
+            host::par_copy(state_[l].map<uint8_t*>() + gb.state_s_off, s_alt_[l].data(), s_alt_[l].size() * 4);
+            s_in_alt_[l] = 0;
+        }
     const double ms = ms_since(t0);
     std::fprintf(stderr, "MTP k=%d: %zu tokens in %zu passes (%.2f a pass), drafts accepted %zu / %zu (%.1f %%); %.1f ms/token (%.2f tok/s) | "
                          "a pass: draft %.1f verify %.1f rollback %.1f ms\n",
@@ -3269,12 +3288,19 @@ void Core::cpu_rollback(size_t keep, size_t R) {
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];
         const GemmBlockProgram& gb = lt.gemm_block;
-        if (gb.kind != "linear" || ver_.size() != static_cast<size_t>(nl_) || ver_[l].state.empty()) continue;
+        if (gb.kind != "linear" || ver_.size() != static_cast<size_t>(nl_) || ver_[l].conv.empty()) continue;
         const HostConsts& hc = hc_[l];
         uint8_t* sp = state_[l].map<uint8_t*>();
         const VerifySave& v = ver_[l];
-        host::par_copy(sp, v.state.data(), v.state.size());
-        if (!keep) continue;
+        // the conv window back; S recomputed from the pre-pass state (the other buffer) into the current
+        std::memcpy(sp, v.conv.data(), v.conv.size());
+        float* s_bo = reinterpret_cast<float*>(sp + gb.state_s_off);
+        float* s_cur = s_in_alt_[l] ? s_alt_[l].data() : s_bo;
+        const float* s_pre = s_in_alt_[l] ? s_bo : s_alt_[l].data();
+        if (!keep) {
+            std::memcpy(s_cur, s_pre, s_alt_[l].size() * 4);
+            continue;
+        }
         std::vector<float> og(gb.vw);
         host::DeltaGeom g;
         g.T = 1; g.hid = hid;
@@ -3282,10 +3308,13 @@ void Core::cpu_rollback(size_t keep, size_t R) {
         g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
         g.t_real = 1;
         double ph[2] = {0, 0};
-        for (size_t r = 0; r < keep; ++r)   // token by token, as the pass and decode ran them
-            host::deltanet_block(g, v.qkv.data() + r * gb.qkv_dim, v.z.data() + r * gb.vw, v.xn.data() + r * hid, hc.convw.data(),
+        for (size_t r = 0; r < keep; ++r) {   // token by token, as the pass and decode ran them
+            host::DeltaGeom gr = g;
+            if (r == 0) gr.s_in = s_pre;
+            host::deltanet_block(gr, v.qkv.data() + r * gb.qkv_dim, v.z.data() + r * gb.vw, v.xn.data() + r * hid, hc.convw.data(),
                                  hc.Wa.data(), hc.Wb.data(), hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
-                                 reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
+                                 s_cur, og.data(), ph);
+        }
     }
     omp_set_num_threads(saved_threads);
     pos_ -= static_cast<int>(R - keep);

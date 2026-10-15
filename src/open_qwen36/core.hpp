@@ -631,7 +631,9 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// cpu_rollback(keep, R) can return to after the first `keep` rows.
     void step_cpu_rows(const int* toks, size_t R, bool want_logits);
     void cpu_rollback(size_t keep, size_t R);
-    struct VerifySave { std::vector<uint8_t> state; std::vector<float> qkv, z, xn; };
+    struct VerifySave { std::vector<uint8_t> conv; std::vector<float> qkv, z, xn; };
+    std::vector<std::vector<float>> s_alt_;   ///< per linear layer: the alternate DeltaNet S (verify passes)
+    std::vector<uint8_t> s_in_alt_;           ///< per layer: the current S is s_alt_[l]
     std::vector<VerifySave> ver_;
     bool verify_save_ = false;
     std::vector<float> rows_x_, rows_logits_;

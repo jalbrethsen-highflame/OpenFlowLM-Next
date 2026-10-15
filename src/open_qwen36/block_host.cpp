@@ -226,13 +226,15 @@ void delta_rule_chunk4(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt,
     for (long long hh = 0; hh < static_cast<long long>(nv); ++hh) {
         const size_t h = static_cast<size_t>(hh), kh = h / grp;
         float* Sh = S + h * g.s_rows * D;
+        // g.s_in (one chunk only): the state read from there, the update written to S
+        const float* Shi = (g.s_in ? g.s_in : S) + h * g.s_rows * D;
         alignas(64) float P[CN][D], Qs[CN][D], dl[CN][D], o[D], on[D];
         // S0^T k and S0^T q for chunk 0 (a plain pass)
         auto first_pass = [&](size_t t0, size_t nt) {
             for (size_t u = 0; u < CN; ++u)
                 for (size_t j = 0; j < D; ++j) P[u][j] = Qs[u][j] = 0.f;
             for (size_t i = 0; i < D; ++i) {
-                const float* Si = Sh + i * D;
+                const float* Si = Shi + i * D;
                 for (size_t u = 0; u < nt; ++u) {
                     const float ki = Kp[(t0 + u) * key_w + kh * D + i], qi = Qp[(t0 + u) * key_w + kh * D + i];
                     for (size_t j = 0; j < D; j += 16) {
@@ -348,7 +350,8 @@ void delta_rule_chunk4(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt,
                 }
                 for (size_t i = 0; i < D; ++i) {
                     float* Si = Sh + i * D + jq;
-                    dnv s0 = gl * dn_ld(Si), s1 = gl * dn_ld(Si + 16);
+                    const float* Sr = Shi + i * D + jq;
+                    dnv s0 = gl * dn_ld(Sr), s1 = gl * dn_ld(Sr + 16);
                     for (size_t s2 = 0; s2 < nt; ++s2) {
                         const dnv w = dn_bc(cs[s2] * kt[s2][i]);
                         s0 = s0 + w * e0[s2];
@@ -382,6 +385,7 @@ void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, 
                       const float* Vp, const float* decayp, const float* betap, const float* z, const float* nw, float* S,
                       float* og) {
     const size_t dim = g.head_dim, key_w = g.key_heads * dim, vw = g.value_heads * dim;
+    if (g.s_in && dim != 128) throw std::runtime_error("open_qwen36: DeltaGeom.s_in needs head_dim 128");
     if (dim != 128) {
 #pragma omp parallel for
         for (long long h = 0; h < static_cast<long long>(g.value_heads); ++h) {
@@ -418,6 +422,7 @@ void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, 
         }
         return;
     }
+    if (g.s_in && (R != 1 || std::getenv("OFLM_OPEN_DN_RECURRENT"))) throw std::runtime_error("open_qwen36: DeltaGeom.s_in needs one token on the chunk4 path");
     if (std::getenv("OFLM_OPEN_DN_RECURRENT") == nullptr) {
         delta_rule_chunk4(g, R, grp, inv_sqrt, Qp, Kp, Vp, decayp, betap, z, nw, S, og);
         return;

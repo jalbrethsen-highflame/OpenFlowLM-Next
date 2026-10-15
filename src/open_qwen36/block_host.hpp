@@ -52,6 +52,9 @@ struct DeltaGeom {
     /// instead of the f32 ones (half the bytes; CPU decode)
     const uint16_t* wa16 = nullptr;
     const uint16_t* wb16 = nullptr;
+    /// optional: S read from here and written to the S argument (one token, T = 1 only) -- the
+    /// MTP verify pass keeps the state before it intact without copying it
+    const float* s_in = nullptr;
 };
 
 /// The linear-attention layer's middle over a block. qkv [T, 2*key_w + vw] and z [T, vw]
