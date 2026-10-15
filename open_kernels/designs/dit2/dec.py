@@ -8,6 +8,9 @@ quarter at a time (pack_a.py order2 with mt = 32: [K / 64][2304 B]). The cores w
 their C tile in L1. Decode fills row 0, a verify pass rows 0..k; the host reads those rows of each
 strip's tile ([row block 4][column block 16][8][8], rows 0-7 in the first 2 KB).
 
+The K-step count is a run-time parameter (one RTP word a core, set by each instruction stream), so
+one image serves every K, K range and column offset: a new product or share is a new stream only.
+
 The shim's address generator wraps a dimension at 1023 words and iterates at most 64 times, so a
 column's B goes as one fill per 64 K-steps, each [K-steps, cores, 3, 352 words] (a 4224 B tile =
 3 x 1408 B).
@@ -26,7 +29,8 @@ from ml_dtypes import bfloat16
 import aie.iron as iron
 from aie.dialects.aiex import v8bfp16ebs8
 from aie.helpers.taplib import TensorAccessPattern
-from aie.iron import CompileTime, ExternalFunction, In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker
+from aie.iron import (Buffer, CompileTime, ExternalFunction, In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker,
+                      WorkerRuntimeBarrier)
 from aie.iron.controlflow import range_
 from aie.utils import config as _aie_config
 
@@ -82,19 +86,28 @@ def dit2_dec(A: In, B: In, C: Out, *, K: CompileTime[int], N: CompileTime[int], 
         c_l1.append(f.prod().join([C_T * r for r in range(rows)], obj_types=[c1_ty] * rows,
                                   names=[f"C_L1L2_{col}_{r}" for r in range(rows)], depths=[1] * rows))
 
-    def core_fn(a, b, c, zero_k, mm_k):
+    def core_fn(a, b, c, zero_k, mm_k, rtp, bar):
+        bar.wait_for_value(1)
+        kt = rtp[0]
         cc = c.acquire(1)
         zero_k(cc)
-        for _ in range_(KT):
+        for _ in range_(kt):
             aa = a.acquire(1)
             bb = b.acquire(1)
             mm_k(aa, bb, cc)
             b.release(1)
             a.release(1)
         c.release(1)
+        bar.release_with_value(1)
 
-    workers = [Worker(core_fn, [a_l1.cons(), b_l1[col][r].cons(), c_l1[col][r].prod(), zero, mm], stack_size=stack_size)
-               for col in range(COLS) for r in range(rows)]
+    rtp_ty = np.ndarray[(1,), np.dtype[np.int32]]
+    rtps, bars, workers = [], [], []
+    for col in range(COLS):
+        for r in range(rows):
+            rtps.append(Buffer(rtp_ty, name=f"rtp_{col}_{r}", initial_value=np.zeros(1, dtype=np.int32), use_write_rtp=True))
+            bars.append(WorkerRuntimeBarrier())
+            workers.append(Worker(core_fn, [a_l1.cons(), b_l1[col][r].cons(), c_l1[col][r].prod(), zero, mm, rtps[-1], bars[-1]],
+                                  stack_size=stack_size))
 
     b_size = B_SIZE or (OFF // 128 + COLS * rows) * KTR * B4_TILE
     A_ty = np.ndarray[(KT * A_Q // 9,), np.dtype[v8bfp16ebs8]]
@@ -102,6 +115,10 @@ def dit2_dec(A: In, B: In, C: Out, *, K: CompileTime[int], N: CompileTime[int], 
     C_ty = np.ndarray[(COLS * rows * C_T,), np.dtype[bfloat16]]
 
     def sequence(a, b, c, a_prod, b_prods, c_conses):
+        for buf in rtps:
+            buf[0] = KT
+        for bar in bars:
+            bar.set(1)
         tg = TaskGroup()
         a_prod.fill(a, group=tg, wait=False)
         for col in range(COLS):

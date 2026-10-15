@@ -319,11 +319,13 @@ _TINY_MT = 64
 DECODE_NPU_FRAC = float(_os.environ.get("OPEN_QWEN35_DECODE_NPU_FRAC", "0.2"))
 # designs/dit2/dec.py (gemm_dit.decode2, preferred over decode): the NPU share as a 32-row int4
 # GEMM with B split over the 32 cores (no padding rows past 32, each weight byte read once): ~80 us
-# a dispatch then ~55 GB/s. Its core code depends on K, so one image at the hidden width: the qkv
-# GEMVs' first 4096 columns and the FFN up|gate's first 8192 (two dispatches); out and down stay
-# on the CPU. Up to 32 rows a pass: decode fills row 0, an MTP verify pass rows 0..k.
-# OPEN_QWEN35_DECODE2=0 off.
+# a dispatch then ~55 GB/s. Its K steps are a run-time parameter, so one image takes every
+# product: about DECODE2_FRAC of each product's weight bytes as 4096-column chunks over the first
+# kt K steps (the CPU completes the rest of K for those columns). Up to 32 rows a pass: decode
+# fills row 0, an MTP verify pass rows 0..k. OPEN_QWEN35_DECODE2=0 off.
 DECODE2 = _os.environ.get("OPEN_QWEN35_DECODE2", "1") != "0"
+DECODE2_FRAC = float(_os.environ.get("OPEN_QWEN35_DECODE2_FRAC", "0.26"))
+DECODE2_MIN_KT = int(_os.environ.get("OPEN_QWEN35_DECODE2_MIN_KT", 16))
 
 
 def gemm_dit(spec: ModelSpec) -> dict | None:
@@ -386,23 +388,25 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             decode = {"m": GEMM_TINY_M, "mt": _TINY_MT, "split": split}
     decode2 = None
     if DECODE2 and tiny and GEMM_B4 and ffn:
-        hid, k2n = spec.hidden, f"dit2dec_k{spec.hidden}_n4096"
+        hid = spec.hidden
         split = {}
-        for key in list(k2) + [f"{2 * spec.intermediate}x{hid}"]:
+        for key in sorted(set(k2) | {f"{2 * spec.intermediate}x{hid}", f"{hid}x{spec.intermediate}"}):
             n, k = (int(x) for x in key.split("x"))
-            if k != hid or n <= 4096:
+            if n < 4096 or k % 64:
                 continue
-            chunks = [[off, 4096, f"{k2n}_off{off}"] for off in range(0, min(n - 4096, 8192 if n > 2 * 4096 * 2 else 4096), 4096)]
-            split[key] = {"chunks": chunks}
-        # the FFN down (K = ff): split along K instead -- the first 4096 columns over the first
-        # `hid` of K on the NPU (the same core code, B's strips ff / 64 tiles apart), a partial
-        # sum the CPU completes; the 5th chunk field is the NPU's K steps
-        ffk = spec.intermediate
-        if ffk > hid and spec.hidden > 4096:
-            split[f"{spec.hidden}x{ffk}"] = {"chunks": [[0, 4096, f"{k2n}_off0_kr{ffk}", hid // 64]]}
+            # full-K 4096-column chunks, then one over the first K steps for the rest of the share
+            # (none under DECODE2_MIN_KT steps: a dispatch costs ~80 us)
+            kt, want = k // 64, DECODE2_FRAC * n / 4096
+            full = min(int(want), n // 4096)
+            ks = [kt] * full
+            part = round((want - full) * kt)
+            if full < n // 4096 and part >= DECODE2_MIN_KT:
+                ks.append(min(kt, part))
+            if ks:
+                split[key] = {"chunks": [[i * 4096, 4096, f"dit2dec_kt{t}_off{i * 4096}_kr{k}", t] for i, t in enumerate(ks)]}
         if split:
-            b_size = max(int(x.split("x")[0]) for x in split if int(x.split("x")[1]) == hid) // 128 * (hid // 64) * 4224
-            decode2 = {"m": 32, "k": hid, "b_size": b_size, "split": split}
+            decode2 = {"m": 32, "k": hid, "split": split,
+                       "a_steps": max(c[3] for v in split.values() for c in v["chunks"])}
     fa = None
     if GEMM_DIT2 and FA_MAX_LK >= DIT_M and spec.has_full and spec.head_dim == 256:
         fa = {"lk": {str(lk): f"fa256_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)},
@@ -655,11 +659,7 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                 kr = int(key.split("x")[1])
                 for c in v["chunks"]:
                     name, off = c[2], c[0]
-                    env = {"DD_K": str(T["k"]), "DD_N": "4096", "DD_OFF": str(off)}
-                    if kr != T["k"]:
-                        env["DD_KROW"] = str(kr)
-                    else:
-                        env["DD_B_SIZE"] = str(T["b_size"])
+                    env = {"DD_K": str(c[3] * 64), "DD_N": "4096", "DD_OFF": str(off), "DD_KROW": str(kr)}
                     b[name] = {"design": "dit2/dec.py", "build_dir": f"dit2/build_{name}", "env": env}
         if "ffn" in d:
             ff, hid = d["ffn"]["ff"], spec.hidden

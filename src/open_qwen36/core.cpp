@@ -2841,9 +2841,11 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             // a 32-row int4 GEMM, B split over the cores; rows [0, R) of A real
             const size_t KT = k / 64;
             const nlohmann::json& chunks = (*S2)["split"][key]["chunks"];
-            // a 5th chunk field: the NPU's K steps (a K split; the CPU completes the sum)
-            const size_t KN = chunks[0].size() > 3 ? chunks[0][3].get<size_t>() : KT;
-            if (!globals_.count("dec2_a")) globals_["dec2_a"] = alloc((*S2)["k"].get<size_t>() / 64 * 2304);
+            // a 4th chunk field: that chunk's NPU K steps (a K split; the CPU completes the sum)
+            auto kn_of = [&](size_t ci) { return chunks[ci].size() > 3 ? chunks[ci][3].get<size_t>() : KT; };
+            size_t KN = 0;
+            for (size_t ci = 0; ci < chunks.size(); ++ci) KN = std::max(KN, kn_of(ci));
+            if (!globals_.count("dec2_a")) globals_["dec2_a"] = alloc((*S2).value("a_steps", (*S2)["k"].get<size_t>() / 64) * 2304);
             xrt::bo& ab = globals_.at("dec2_a");
             uint8_t* a = ab.map<uint8_t*>();
             // row r into pack_a.py's order2 at mt = 32: per 64-K step 2304 B, block (j, i) with
@@ -2866,7 +2868,12 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             }
             timing_.moe_prep_ms += ms_since(tg);
             host::gemv_b4_rows(B + nnpu / 128 * KT * 4224, npad - nnpu, k, in, R, out.data() + nnpu, npad);
-            if (KN < KT) host::gemv_b4_rows(B, nnpu, k, in, R, out.data(), npad, KN, KT);   // the NPU columns' other K
+            for (size_t ci = 0; ci < chunks.size(); ++ci)   // the NPU columns' other K
+                if (kn_of(ci) < KT) {
+                    const size_t off = chunks[ci][0].get<size_t>();
+                    host::gemv_b4_rows(B + off / 128 * KT * 4224, chunks[ci][1].get<size_t>(), k, in, R, out.data() + off, npad,
+                                       kn_of(ci), KT);
+                }
             auto tw = std::chrono::steady_clock::now();
             for (Inflight& f : fl) wait_run(f);
             timing_.attn_ms += ms_since(tw);
@@ -2877,13 +2884,14 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
                 read_back(cb, 32 * 32 * 128 * 2, 0);
                 const uint16_t* c16 = cb.map<const uint16_t*>();
                 const size_t off = chunks[ci][0].get<size_t>(), nc = chunks[ci][1].get<size_t>();
+                const bool add = kn_of(ci) < KT;
                 for (size_t r = 0; r < R; ++r)
                     for (size_t t = 0; t < nc / 128; ++t)
                         for (size_t cbk = 0; cbk < 16; ++cbk)
                             for (size_t j = 0; j < 8; ++j) {
                                 const float v = bf16_to_f32(c16[t * 4096 + ((r / 8) * 16 + cbk) * 64 + (r % 8) * 8 + j]);
                                 float& o = out[r * npad + off + t * 128 + cbk * 8 + j];
-                                o = KN < KT ? o + v : v;
+                                o = add ? o + v : v;
                             }
             }
             timing_.moe_read_ms += ms_since(tr);
@@ -4318,11 +4326,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         }
     // fa.cb (designs/dit_fa256b causal, ~3x dit_fa256): the causal prompt's NPU attention when the
     // prompt starts at position 0 (the packs hold this prompt's K / V rows only), from
-    // OFLM_OPEN_FA_CB_MIN keys (default 2048; dit_fa256 keeps OFLM_OPEN_FA_MIN_LK); Q / K / V
+    // OFLM_OPEN_FA_CB_MIN keys (default 1024; dit_fa256 keeps OFLM_OPEN_FA_MIN_LK); Q / K / V
     // packed at MID like fa.ncb, K / V into per-full-layer buffers. fa.cbs: the same at the small
     // tier's M (512 query rows), from OFLM_OPEN_FA_CBS_MIN keys (default 512). OFLM_OPEN_FA_CB=0 off.
     static const bool cb_on = [] { const char* e = std::getenv("OFLM_OPEN_FA_CB"); return !(e && *e == '0'); }();
-    static const size_t cb_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_CB_MIN"); return e ? std::strtoul(e, nullptr, 10) : 2048ul; }();
+    static const size_t cb_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_CB_MIN"); return e ? std::strtoul(e, nullptr, 10) : 1024ul; }();
     static const size_t cbs_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_CBS_MIN"); return e ? std::strtoul(e, nullptr, 10) : 512ul; }();
     const bool cb_ok = cb_on && !noncausal_ && pos0 == 0 && D.contains("fa");
     const bool cbs_m = cb_ok && D["fa"].contains("cbs") && D["fa"].value("cbs_m", size_t{0}) == M;
