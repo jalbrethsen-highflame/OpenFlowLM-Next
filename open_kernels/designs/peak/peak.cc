@@ -138,6 +138,35 @@ alignas(64) static uint8_t b4qN[64];
 alignas(64) static int32_t b4qE[2];
 alignas(64) static bfloat16 b4qC[128];
 #endif
+#if defined(PEAK_FAQKT) || defined(PEAK_FAPVT)
+// cycles of fa_qk_call / fa_pv_call on L1-resident data: PEAK_ITERS calls (time / iters at the clock)
+#define FA_HS 1
+#include "../dit_fa256b/fa256b.cc"
+#ifdef PEAK_FABANK8   // A and B 8 KB apart inside one 16 KB-aligned region, C 16 KB further
+struct alignas(16384) FtArena { uint8_t a[8192]; uint8_t b[8192]; bfloat16 c[TQ * DFULL]; };
+static FtArena ft;
+static uint8_t *const ftA = ft.a, *const ftB = ft.b;
+static bfloat16 *const ftC = ft.c;
+#elif defined(PEAK_FABANK)   // each operand in its own 8 KB bank
+alignas(8192) static uint8_t ftA[9216];
+alignas(8192) static uint8_t ftB[4608];
+alignas(8192) static bfloat16 ftC[TQ * DFULL];
+#else
+alignas(64) static uint8_t ftA[9216], ftB[4608];
+alignas(64) static bfloat16 ftC[TQ * DFULL];
+#endif
+#endif
+#if defined(PEAK_FAEXP)
+// fa_exp_call (dit_fa256b/fa_hs.inc) against the C++ pass on one core: G from a formula, guard
+// bytes after every output. out: [0] P bytes that differ, [1] first one, [2] P guard bytes
+// changed (asm), [3] rs guard floats changed (asm), [4] rs lanes that differ by > 1e-3 rel,
+// [5] first one, [8..15] asm rs[0..7] bits, [16..23] C++ rs[0..7] bits, [24..31] asm P[0..31] words
+#define FA_HS 1
+#include "../dit_fa256b/fa256b.cc"
+alignas(64) static bfloat16 fxG[TQ * LKP];
+alignas(64) static uint8_t fxPa[2304 + 128], fxPc[2304 + 128];
+alignas(64) static float fxRa[256 + 32], fxRc[256 + 32];
+#endif
 #if defined(PEAK_B4PROBE)
 #include "b4probe.inc"
 alignas(64) static uint8_t b4pN[96];
@@ -910,6 +939,47 @@ void peak_run(const int8_t *__restrict in, int32_t *__restrict out) {
 #else
   for (unsigned i = 0; i < 64; ++i) { out[64 + i] = h[i]; out[128 + i] = r[i]; }
 #endif
+#elif defined(PEAK_FAQKT)
+  for (unsigned it = 0; it < PEAK_ITERS; ++it) fa_qk_call(ftA, ftB, ftC, s_nuc);
+  out[0] = reinterpret_cast<int32_t *>(ftC)[0];
+#elif defined(PEAK_FAPVT)
+  for (unsigned it = 0; it < PEAK_ITERS; ++it) fa_pv_call(ftA, ftB, ftC);
+  out[0] = reinterpret_cast<int32_t *>(ftC)[0];
+#elif defined(PEAK_FAEXP)
+  for (int i = 0; i < TQ * LKP; ++i)
+    fxG[i] = (bfloat16)(-float((i * 37 + in[i % 64]) % 113) / 14.0f);   // scores - m in (-8, 0]
+  fxG[5] = bf16_lowest(); fxG[700] = bf16_lowest();                    // two masked
+  for (int i = 0; i < 2304 + 128; ++i) fxPa[i] = fxPc[i] = 0xAB;
+  for (int i = 0; i < 256 + 32; ++i) fxRa[i] = fxRc[i] = -7.0f;
+  {
+    Acc oa;
+    oa.from_vector(aie::broadcast<float, 64>(1.0f));
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64> ones(reinterpret_cast<bfp16ebs8 *>(s_ones));
+    ones << oa.template to_vector<bfp16ebs8>();
+  }
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  for (int zp = 0; zp < 2; zp++)
+    fa_exp_call(fxG + 2 * zp * 64, s_ones, fxPa + zp * 1152, fxRa + 2 * zp * 64);
+  exp_p_rowsum(fxG, fxPc, fxRc);
+  int nd = 0, fd = -1, ng = 0, nr = 0, nrd = 0, frd = -1;
+  for (int i = 0; i < 2304; ++i) if (fxPa[i] != fxPc[i]) { if (fd < 0) fd = i; ++nd; }
+  for (int i = 2304; i < 2304 + 128; ++i) ng += fxPa[i] != 0xAB;
+  for (int i = 256; i < 256 + 32; ++i) nr += fxRa[i] != -7.0f;
+  for (int i = 0; i < 256; ++i) {
+    float d = fxRa[i] - fxRc[i]; if (d < 0) d = -d;
+    float r = fxRc[i] < 0 ? -fxRc[i] : fxRc[i];
+    if (!(d <= 1e-3f * r + 1e-6f)) { if (frd < 0) frd = i; ++nrd; }
+  }
+  int tm = 0;
+  for (int t = 0; t < 32; ++t)
+    for (int i = 0; i < 72; ++i)
+      if (fxPa[t * 72 + i] != fxPc[t * 72 + i]) { tm |= 1 << t; break; }
+  out[0] = nd; out[1] = fd; out[2] = ng; out[3] = nr; out[4] = nrd; out[5] = frd; out[6] = tm;
+  for (int i = 0; i < 8; ++i) { out[8 + i] = reinterpret_cast<int32_t *>(fxRa)[i]; out[16 + i] = reinterpret_cast<int32_t *>(fxRc)[i]; }
+  for (int i = 0; i < 8; ++i) out[24 + i] = reinterpret_cast<int32_t *>(fxPa)[i];
+  for (int i = 0; i < 8; ++i) out[32 + i] = reinterpret_cast<int32_t *>(fxPc)[i];
+  for (int i = 0; i < 18; ++i) out[64 + i] = reinterpret_cast<int32_t *>(fxPa + 144)[i];   // tile 2
+  for (int i = 0; i < 18; ++i) out[96 + i] = reinterpret_cast<int32_t *>(fxPc + 144)[i];
 #elif defined(PEAK_B4PROBE)
   // nibbles: A all 1, B old all 1, B new all 2; exponents: A 127+..., B old e0, B new e1 (each
   // block's 8 groups the same). out[i] = c[0] of case i (bf16 bits)

@@ -44,7 +44,7 @@ PIECE = 4608                           # bytes: one K piece (16 keys) / V elemen
 CHUNK = 4 * PIECE                      # a 64-key chunk of K (or of V)
 Q_CORE = 2 * PIECE                     # one core's 32 rows of Q
 MAX_INFLIGHT = 2                       # passes queued ahead
-STACK = 0x1800                         # softmax_step: a 4.2 KB frame (fused exp + bfp16 P + rowsum)
+STACK = 0x800                          # frames <= 0x280 + 0x80 (softmax_rescale -> scale_o)
 
 RTP_HEADS, RTP_PASSES, RTP_CHUNKS, RTP_VALID, RTP_CAUSAL, RTP_ROW0, RTP_QOFF = range(7)
 RTP_LEN = 8
@@ -62,7 +62,7 @@ def check_shape(L: int, heads: int, kv_heads: int, lk: int | None = None) -> str
     return None
 
 
-@iron.jit(aiecc_flags=["--dynamic-objFifos", "--alloc-scheme=basic-sequential"])
+@iron.jit(aiecc_flags=["--dynamic-objFifos", f"--alloc-scheme={os.environ.get('DF_ALLOC', 'bank-aware')}"])
 def dit_fa256b(
     Q: In, K: In, V: In, O: Out, *,
     L: CompileTime[int], heads: CompileTime[int], kv_heads: CompileTime[int] = 0,
@@ -104,8 +104,12 @@ def dit_fa256b(
     k_pv = Kernel("pv", obj, [p_ty, elem_ty, o_l1_ty, np.int32, rtp_ty, np.int32, np.int32])
     k_mask = Kernel("apply_mask", obj, [g_ty, rtp_ty, np.int32, np.int32])
     k_step = Kernel("softmax_step", obj, [g_ty, up_ty, sp_ty, o_l1_ty, p_ty, rtp_ty, np.int32, np.int32])
+    k_exp = Kernel("sm_exp", obj, [g_ty, p_ty, rtp_ty, np.int32, np.int32])
+    k_all = Kernel("sm_all", obj, [g_ty, up_ty, sp_ty, o_l1_ty, p_ty, rtp_ty, np.int32, np.int32])
+    k_qkpv = Kernel("qkpv", obj, [q_ty, elem_ty, g_ty, p_ty, elem_ty, o_l1_ty, np.int32, rtp_ty,
+                                  np.int32, np.int32])
     k_fin = Kernel("finalize", obj, [sp_ty, o_l1_ty])
-    kernels = [k_capture, k_init, k_qk, k_pv, k_mask, k_step, k_fin]
+    kernels = [k_capture, k_init, k_qk, k_pv, k_mask, k_step, k_fin, k_exp, k_qkpv, k_all]
 
     def core_tile(g, i):
         return Tile(g * GROUP_COLS + i // N_ROWS, 2 + i % N_ROWS)
@@ -146,21 +150,22 @@ def dit_fa256b(
 
     def make_core_fn(i):
         def core_fn(a_in, b_in, o_out, kern, q_saved, g_buf, p_buf, up, sp, my_rtp, barrier, *dummy):
-            (capture, init, qk, pv, mask, step, fin) = kern
+            (capture, init, qk, pv, mask, step, fin, smexp, qkpv, small) = kern
             barrier.wait_for_value(1)
             n_heads = my_rtp[RTP_HEADS]
             n_pass = my_rtp[RTP_PASSES]
             n_chunks = my_rtp[RTP_CHUNKS]
             for _ in range_(n_heads):
                 for p in range_(n_pass):
-                    o = o_out.acquire(1)
-                    # Q: 32 pieces, 2 a core in core order, cores 0-7 on A, 8-15 on B
+                    # Q: 32 pieces, 2 a core in core order, cores 0-7 on A, 8-15 on B -- before
+                    # the O buffer is taken, so it overlaps the previous pass's O drain
                     for k in range(2 * CORES):
                         fifo = a_in if k < CORES else b_in
                         e = fifo.acquire(1)
                         if k // 2 == i:
                             capture(e, q_saved, k % 2)
                         fifo.release(1)
+                    o = o_out.acquire(1)
                     init(o, up, sp)
 
                     def k_piece(c, j):
@@ -183,10 +188,14 @@ def dit_fa256b(
                             pv(p_buf, ve, o, e2, my_rtp, p, c)
                         b_in.release(1)
 
-                    def scores_done(c):
-                        mask(g_buf, my_rtp, p, c)
-                        if "nosm" not in _EXPT:
+                    def scores_done(c):   # (sm_exp applies the key mask)
+                        if "nosm" in _EXPT:
+                            pass
+                        elif "sm2" in _EXPT:          # (the two-call form)
+                            smexp(g_buf, p_buf, my_rtp, p, c)
                             step(g_buf, up, sp, o, p_buf, my_rtp, p, c)
+                        else:
+                            small(g_buf, up, sp, o, p_buf, my_rtp, p, c)
 
                     # software-pipelined: chunk c's K pieces interleaved with chunk c-1's V
                     # elements, so fifos A and B drain evenly (one after the other, each
@@ -197,8 +206,15 @@ def dit_fa256b(
                     scores_done(0)
                     for c in range_(1, n_chunks):
                         for j in range(4):
-                            k_piece(c, j)
-                            v_elem(c - 1, j)
+                            if "nokv" in _EXPT or "noqk" in _EXPT or "nopv" in _EXPT:
+                                k_piece(c, j)
+                                v_elem(c - 1, j)
+                            else:              # one call: chunk c's K piece and chunk c-1's V
+                                kp = a_in.acquire(1)
+                                ve = b_in.acquire(1)
+                                qkpv(q_saved, kp, g_buf, p_buf, ve, o, j, my_rtp, p, c)
+                                a_in.release(1)
+                                b_in.release(1)
                         scores_done(c)
                     for e2 in range(4):
                         v_elem(n_chunks - 1, e2)
