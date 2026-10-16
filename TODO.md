@@ -16,13 +16,14 @@ with d3.
 ## Status (2026-10-16)
 
 **Decode, 8 cores, greedy:** MTP k = 3 + prompt-lookup drafts, two-stage CPU head, chunked delta
-rule in verify passes. 4 short prompts: **16.9 tok/s** mean (14.2 / 19.9 / 15.1 / 18.4); a
+rule in verify passes, NPU share 0.31. 4 short prompts: **17.3 tok/s** mean (15.2 / 19.5 / 15.8 / 18.9); a
 1114-token code-edit prompt: **22.1 tok/s** (16.8 without prompt lookup). Plain decode 130
 ms/token. Not bit-identical to plain decode any more (the chunked rule): 2 of 4 prompts differ,
 each at its closest top-2 call (gaps 0.049 / 0.012).
 
-**Prefill, warm, int4:** 256 / 512 / 768 / 1024 / 2048 / 4096 / 8192 tokens: 380 / 487 / 580 /
-596 / 705 / 719 / 737 tok/s. Later turns (pos0 > 0) use the NPU attention too (1500 tokens at
+**Prefill, warm, int4:** 256 / 512 / 768 / 1024 / 1536 / 2048 / 3072 / 4096 / 8192 tokens: 380 /
+487 / 580 / 596 / 731 / 714 / 753 / 753 / 758 tok/s. The NPU is busy ~97 % of a prompt (dit2 at
+~38 TFLOPS); the host idles 30-60 %. Later turns (pos0 > 0) use the NPU attention too (1500 tokens at
 1519: 4428 -> 3616 ms).
 
 The history below is kept for the numbers behind the defaults.
@@ -105,8 +106,13 @@ Causal prefill, warm, int4, quiet CPU (2026-10-15):
       stages run in turn. Two 256-row chunks gain nothing on a quiet CPU (1196 vs 1199 ms at
       512: the second pass reads the weights again). A head-group split inside each layer
       (qkv by column groups, out by K halves) would overlap without reading the weights twice.
-- [ ] Re-tune OFLM_OPEN_SMALL_MAX (2048) now that the small tier has NPU attention.
-- [ ] 4K / 8K prefill re-measured after the host changes (719 / 737 tok/s are from before).
+- [x] OFLM_OPEN_SMALL_MAX stays 2048: 512-row chunks win below it (1280 / 1536 / 2048 tokens: 2096
+      / 2101 / 2857 ms against 3156 / 3227 / 3345 with 1024-row chunks) and lose slightly above
+      (3072 / 4096 / 8192: 4119 / 5496 / 11064 against 4079 / 5440 / 10814; fa.cbs built to 8192
+      keys for the test).
+- [ ] A CPU share of the prompt GEMMs (the host idles 30-60 %): the CPU int8 kernel does ~3.2
+      TMAC/s at 16 threads against the NPU's ~19, so at most ~7 %; FFN columns need host-packed
+      h units for down2u.
 
 ### Decode (target 10 tok/s) -- met with MTP
 
@@ -147,6 +153,10 @@ near-ties over 64 layers.
       MTP's first draft. Code edit 16.8 -> 22.1 tok/s.
 - [x] dit2_dec C row-block major (read back 64 of 256 KB a chunk) and the read-back converted 8
       at a time: post 5.2 -> 2.8 ms a 4-row pass.
+- [x] NPU share re-swept after the prefetch fix (k = 3): 0.22 / 0.25 / 0.28 / 0.31 / 0.34 / 0.37
+      -> 16.3 / 16.9 / 17.1 / 17.3 / 16.7 / 16.3 tok/s: default 0.31.
+- [ ] Draft + rollback ~17 ms a pass: a 32768-id draft vocabulary covers only 94 % of output
+      tokens (65536: 99 %); the MTP layer's products could split with the idle NPU (~2 ms).
 - [ ] Product overhead left: the CPU reads ~87 GB/s with the NPU share running (100 alone, 111
       in the kernel benchmark); the NPU's ~80 us a dispatch is ~31 ms a pass. Reusing xrt::run
       objects or packing A in parallel did not help (launch cost is the submit itself).
