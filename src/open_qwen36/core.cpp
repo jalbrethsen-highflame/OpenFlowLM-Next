@@ -870,7 +870,9 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     // only) instead of the fused per-layer dx dispatch. Decode-only: the
     // gemm-block prefill route's own selector stays OFLM_OPEN_HOST_ATTN.
     if (const char* env = std::getenv("OFLM_OPEN_HOST_ATTN_DECODE")) host_attn_decode_on_ = std::string(env) != "0";
+    // OFLM_OPEN_CPU_DECODE unset: on when the model ships its MTP weights (mtp_path)
     if (const char* env = std::getenv("OFLM_OPEN_CPU_DECODE")) cpu_decode_on_ = std::string(env) == "1";
+    else cpu_decode_on_ = !mtp_path().empty();
     if (host_attn_decode_on_)
         log("decode route: HOST (OFLM_OPEN_HOST_ATTN_DECODE=1; the 2.5 gemm-block chain at T=1 "
             "with host attention; the NPU GEMMs run padded at the kernel set's compiled T)");
@@ -1310,7 +1312,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
             const bool int4_main = std::getenv("OFLM_OPEN_CPU_HEAD") && std::string(std::getenv("OFLM_OPEN_CPU_HEAD")) == "int4";
             // OFLM_OPEN_MTP's drafts read an int4 copy of the head (half the bytes; only their top token
             // matters, and every draft is checked by the q8 head) unless OFLM_OPEN_MTP_DRAFT_HEAD=q8
-            const bool int4_draft = std::getenv("OFLM_OPEN_MTP") && *std::getenv("OFLM_OPEN_MTP") &&
+            const bool int4_draft = !mtp_path().empty() &&
                                     !(std::getenv("OFLM_OPEN_MTP_DRAFT_HEAD") && std::string(std::getenv("OFLM_OPEN_MTP_DRAFT_HEAD")) == "q8");
             const bool int4 = int4_main || int4_draft;
             head_b4_main_ = int4_main;
@@ -1365,7 +1367,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
             globals_[name] = alloc(bytes);
         }
     }
-    if (const char* mp = std::getenv("OFLM_OPEN_MTP"); mp && *mp && cpu_head_) load_mtp(mp);
+    if (const std::string mp = mtp_path(); !mp.empty() && cpu_head_) load_mtp(mp);
     // a "#1" twin per staged GEMM step's x / y, so the host fills or reads one while the NPU uses the other
     if (stage_major_on_ && layer_major_ok())
         for (int l = 0; l < nl_; ++l) {
@@ -3339,6 +3341,15 @@ int spec_dthreads() {
 }  // namespace
 
 bool Core::spec_ok() const { return mtp_.on && cpu_head_ && cpu_decode_on_; }
+
+// the MTP weights: OFLM_OPEN_MTP (a safetensors file with the mtp.* tensors: the HF shard or
+// mtp.safetensors; "0" none), else <model dir>/mtp.safetensors when it is there
+std::string Core::mtp_path() const {
+    if (const char* e = std::getenv("OFLM_OPEN_MTP")) return (*e && std::string(e) != "0") ? std::string(e) : std::string();
+    const std::string p = cfg_.model_dir + "/mtp.safetensors";
+    std::error_code ec;
+    return std::filesystem::exists(p, ec) ? p : std::string();
+}
 
 void Core::spec_norm(const float* x, float* out) {
     if (normw_f_.empty()) tail_logits(x);      // fills normw_f_

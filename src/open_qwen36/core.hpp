@@ -697,6 +697,7 @@ public:
     /// back their logits are ready, the first other token rolls the pass back and starts the next.
     /// Exact for any sampler. Needs OFLM_OPEN_MTP and OFLM_OPEN_CPU_DECODE=1 (spec_ok).
     bool spec_ok() const;
+    std::string mtp_path() const;
     void spec_step(int tok);
     /// the pass settled (rows past the fed ones rolled back) and S back in state_: before a prompt,
     /// a reset, a snapshot or a plain step
