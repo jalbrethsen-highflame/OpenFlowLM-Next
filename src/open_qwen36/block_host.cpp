@@ -564,12 +564,22 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                     for (size_t j = 0; j < nch; ++j) c[j] += cw[j] * v[j];
                 } else {
                     // MSVC leaves the scalar bf16r loop unvectorized; mul then add keeps today's rounding
-                    const float* __restrict v = qkv + static_cast<size_t>(s) * nch;
                     size_t j = 0;
-                    for (; j + 8 <= nch; j += 8)
-                        _mm256_storeu_ps(c.data() + j, _mm256_add_ps(_mm256_loadu_ps(c.data() + j),
-                                                                     _mm256_mul_ps(_mm256_loadu_ps(cw + j), bf16r8(v + j))));
-                    for (; j < nch; ++j) c[j] += cw[j] * bf16r(v[j]);
+                    if (g.qkv16) {   // the bf16 rows themselves: their f32 values, exactly what bf16r8 gives
+                        const uint16_t* __restrict v = g.qkv16 + static_cast<size_t>(s) * g.ld16;
+                        for (; j + 8 <= nch; j += 8) {
+                            const __m256 x = _mm256_castsi256_ps(_mm256_slli_epi32(
+                                _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v + j))), 16));
+                            _mm256_storeu_ps(c.data() + j, _mm256_add_ps(_mm256_loadu_ps(c.data() + j), _mm256_mul_ps(_mm256_loadu_ps(cw + j), x)));
+                        }
+                        for (; j < nch; ++j) c[j] += cw[j] * bf16_to_f32(v[j]);
+                    } else {
+                        const float* __restrict v = qkv + static_cast<size_t>(s) * nch;
+                        for (; j + 8 <= nch; j += 8)
+                            _mm256_storeu_ps(c.data() + j, _mm256_add_ps(_mm256_loadu_ps(c.data() + j),
+                                                                         _mm256_mul_ps(_mm256_loadu_ps(cw + j), bf16r8(v + j))));
+                        for (; j < nch; ++j) c[j] += cw[j] * bf16r(v[j]);
+                    }
                 }
             }
             {   // silu, 16 lanes at a time (nch is a multiple of 16 at every Qwen3.5 width)
@@ -711,8 +721,12 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
         } else if (s < 0) {
             std::copy(conv_state + (R + r) * nch, conv_state + (R + r + 1) * nch, conv_state + r * nch);
         } else {
-            const float* row = qkv + static_cast<size_t>(s) * nch;
-            for (size_t j = 0; j < nch; ++j) conv_state[r * nch + j] = f32_to_bf16(row[j]);
+            if (g.qkv16) {
+                std::copy(g.qkv16 + static_cast<size_t>(s) * g.ld16, g.qkv16 + static_cast<size_t>(s) * g.ld16 + nch, conv_state + r * nch);
+            } else {
+                const float* row = qkv + static_cast<size_t>(s) * nch;
+                for (size_t j = 0; j < nch; ++j) conv_state[r * nch + j] = f32_to_bf16(row[j]);
+            }
         }
     }
 

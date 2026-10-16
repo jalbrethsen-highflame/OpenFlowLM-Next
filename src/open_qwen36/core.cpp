@@ -1304,6 +1304,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
 
 void Core::reset() {
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: reset before load_weights");
+    hist_ids_.clear();
     // The linear layers' state must start at zero. The KV rows need not: the window
     // read is [0, max(pos, 1)) and row 0 at position 0 is a dummy the kernel masks.
     // A blocked attention kernel (manifest `rb`) reads a few rows at or past `pos` as
@@ -2899,14 +2900,14 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
                 const bool add = kn_of(ci) < KT;
                 for (size_t r = 0; r < R; ++r)
                     for (size_t t = 0; t < nc / 128; ++t)
-                        for (size_t cbk = 0; cbk < 16; ++cbk)
-                            for (size_t j = 0; j < 8; ++j) {
-                                const size_t at = crb ? (r / 8) * NS * 1024 + t * 1024 + cbk * 64 + (r % 8) * 8 + j
-                                                      : t * 4096 + ((r / 8) * 16 + cbk) * 64 + (r % 8) * 8 + j;
-                                const float v = bf16_to_f32(c16[at]);
-                                float& o = out[r * npad + off + t * 128 + cbk * 8 + j];
-                                o = add ? o + v : v;
-                            }
+                        for (size_t cbk = 0; cbk < 16; ++cbk) {   // 8 contiguous bf16 -> 8 contiguous floats
+                            const size_t at = crb ? (r / 8) * NS * 1024 + t * 1024 + cbk * 64 + (r % 8) * 8
+                                                  : t * 4096 + ((r / 8) * 16 + cbk) * 64 + (r % 8) * 8;
+                            float* o = out.data() + r * npad + off + t * 128 + cbk * 8;
+                            const __m256 v = _mm256_castsi256_ps(_mm256_slli_epi32(
+                                _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c16 + at))), 16));
+                            _mm256_storeu_ps(o, add ? _mm256_add_ps(_mm256_loadu_ps(o), v) : v);
+                        }
             }
             timing_.moe_read_ms += ms_since(tr);
             timing_.part0_ms += ms_since(tg);
@@ -3250,8 +3251,10 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
     size_t pslot = P - 1;
     int tok = tok0;
     verify_save_ = true;
-    size_t passes = 0, drafted = 0, accepted = 0;
+    size_t passes = 0, drafted = 0, accepted = 0, pld_passes = 0;
     double t_draft = 0, t_verify = 0, t_roll = 0;
+    static const bool pld_on = [] { const char* e = std::getenv("OFLM_OPEN_PLD"); return !(e && *e == '0'); }();
+    static const size_t pld_len = [] { const char* e = std::getenv("OFLM_OPEN_PLD_LEN"); return std::max<size_t>(1, std::min<size_t>(7, e ? std::strtoul(e, nullptr, 10) : 7)); }();
     auto t0 = std::chrono::steady_clock::now();
     while (static_cast<int>(out.size()) < n) {
         auto td = std::chrono::steady_clock::now();
@@ -3260,6 +3263,23 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
         mtp_forward(ph.data(), pt.data(), pt.size(), pslot - mtp_.kv0, pxn.data());
         std::copy(pxn.end() - static_cast<long>(hid), pxn.end(), xn.begin());
         std::vector<int> d;
+        // OFLM_OPEN_PLD (default on): a prompt-lookup draft -- the tokens that followed the latest
+        // earlier match of the last 4..2 tokens (prompt + output) -- taken instead of the MTP chain
+        // when its first token is MTP's first draft too, up to OFLM_OPEN_PLD_LEN (7: 8 verify rows)
+        std::vector<int> pld;
+        if (pld_on) {
+            std::vector<int> h(hist_ids_);
+            h.insert(h.end(), out.begin(), out.end());
+            for (size_t m = 4; m >= 2 && pld.empty(); --m) {
+                if (h.size() <= m) continue;
+                const size_t e = h.size() - m;
+                for (size_t j = e; j-- > 0;) {
+                    if (!std::equal(h.begin() + static_cast<long>(e), h.end(), h.begin() + static_cast<long>(j))) continue;
+                    for (size_t t = j + m; t < e + m && pld.size() < pld_len && t < h.size(); ++t) pld.push_back(h[t]);
+                    break;
+                }
+            }
+        }
         for (int j = 0; j < k; ++j) {
             // mtp.norm applied: the head direct (its int4 copy when there: only the top token matters),
             // over the first OFLM_OPEN_MTP_DRAFT_VOCAB ids (default 65536: 99 % of generated tokens on
@@ -3273,6 +3293,8 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
             }
             const auto top = std::max_element(lg.begin(), lg.begin() + static_cast<long>(nv));
             d.push_back(static_cast<int>(top - lg.begin()));
+            // only when longer than the chain: a short lookup draft saves nothing over k MTP drafts
+            if (j == 0 && pld.size() > static_cast<size_t>(k) && pld[0] == d[0]) { d = pld; ++pld_passes; break; }
             // OFLM_OPEN_MTP_TAU: stop drafting once a draft's probability (softmax over the draft
             // vocabulary) falls under tau -- a likely-rejected draft would cost a verify row
             if (tau > 0 && j + 1 < k) {
@@ -3316,6 +3338,8 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
         tok = b;
     }
     verify_save_ = false;
+    hist_ids_.insert(hist_ids_.end(), out.begin(), out.end() - 1);   // every output but the last was fed
+    if (pld_on) std::fprintf(stderr, "PLD: %zu of %zu passes took a prompt-lookup draft\n", pld_passes, passes);
     // every linear layer's current S back in state_[l] (prefill and the NPU route read it there)
     for (int l = 0; l < nl_ && static_cast<size_t>(l) < s_in_alt_.size(); ++l)
         if (s_in_alt_[l]) {
@@ -4165,6 +4189,7 @@ void Core::step_block_moe(const std::vector<int>& ids, size_t t_real, bool want_
 // slot, so the result is bit-for-bit the block-major one.
 void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
     apply_thread_budget();
+    hist_ids_.insert(hist_ids_.end(), ids.begin(), ids.end());   // generate_mtp's prompt-lookup drafts
     if (pipe_ok()) {
         step_prompt_pipe(ids, want_logits);
         return;
@@ -4706,10 +4731,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     yb.resize(M * vw);
                     og.resize(M * vw);
 #pragma omp parallel for
-                    for (long long t = 0; t < static_cast<long long>(t_real); ++t) {
-                        bf16_row_f32(q16 + t * nq, nch, ya.data() + t * nch);
-                        bf16_row_f32(q16 + t * nq + nch, vw, yb.data() + t * vw);
-                    }
+                    for (long long t = 0; t < static_cast<long long>(t_real); ++t) bf16_row_f32(q16 + t * nq + nch, vw, yb.data() + t * vw);
                     mid_prof[2] += ms_since(tm); tm = std::chrono::steady_clock::now();
                     host::DeltaGeom g;
                     g.T = M; g.hid = hid;
@@ -4717,6 +4739,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
                     g.t_real = t_real;
                     g.reset = packed ? rflag.data() + r0 : nullptr;
+                    g.qkv16 = q16; g.ld16 = nq;                    // qkv read as the C rows (z converted above)
                     double ph[2] = {0, 0};
                     host::deltanet_block(g, ya.data(), yb.data(), xc, hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
                                          hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),

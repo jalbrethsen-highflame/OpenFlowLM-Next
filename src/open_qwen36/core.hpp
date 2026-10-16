@@ -653,6 +653,7 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     } mtp_;
     std::vector<float> mtp_prompt_x_;   ///< the prompt's last rows (OFLM_OPEN_MTP_CTX) for MTP's context
     std::vector<int> mtp_prompt_ids_;
+    std::vector<int> hist_ids_;   // every id fed since reset (prompt-lookup drafts)
     void load_mtp(const std::string& shard);
     /// R MTP rows (main hidden after the final norm, the next token) at slots pos0..: xn [R, hidden]
     void mtp_forward(const float* hn, const int* toks, size_t R, size_t pos0, float* xn);

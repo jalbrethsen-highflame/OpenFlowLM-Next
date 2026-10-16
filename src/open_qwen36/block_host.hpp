@@ -52,9 +52,13 @@ struct DeltaGeom {
     /// instead of the f32 ones (half the bytes; CPU decode)
     const uint16_t* wa16 = nullptr;
     const uint16_t* wb16 = nullptr;
-    /// optional: S read from here and written to the S argument (one token, T = 1 only) -- the
-    /// MTP verify pass keeps the state before it intact without copying it
+    /// optional: S read from here and written to the S argument (one chunk: T <= 4) -- the MTP
+    /// verify pass keeps the state before it intact without copying it
     const float* s_in = nullptr;
+    /// optional: qkv as the bf16 rows themselves (row stride ld16 elements) instead of the f32
+    /// qkv argument -- the prompt pipe's GEMM output, read without an f32 copy (same result)
+    const uint16_t* qkv16 = nullptr;
+    size_t ld16 = 0;
 };
 
 /// The linear-attention layer's middle over a block. qkv [T, 2*key_w + vw] and z [T, vw]
