@@ -9,6 +9,7 @@
 #include "open_qwen36/block_host.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <immintrin.h>
 #include <omp.h>
 #include <chrono>
@@ -423,7 +424,7 @@ void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, 
         }
         return;
     }
-    if (g.s_in && (R != 1 || std::getenv("OFLM_OPEN_DN_RECURRENT"))) throw std::runtime_error("open_qwen36: DeltaGeom.s_in needs one token on the chunk4 path");
+    if (g.s_in && (R > 4 || std::getenv("OFLM_OPEN_DN_RECURRENT"))) throw std::runtime_error("open_qwen36: DeltaGeom.s_in needs one chunk (<= 4 tokens) on the chunk4 path");
     if (std::getenv("OFLM_OPEN_DN_RECURRENT") == nullptr) {
         delta_rule_chunk4(g, R, grp, inv_sqrt, Qp, Kp, Vp, decayp, betap, z, nw, S, og);
         return;
@@ -1738,6 +1739,88 @@ void lmhead_q8_cpu_rows(const uint8_t* W, size_t N, size_t K, const float* x, si
         const size_t T = static_cast<size_t>(omp_get_num_threads()), i = static_cast<size_t>(omp_get_thread_num());
         fn(W, K, hp, G * i / T, G * (i + 1) / T, y, N);
     }
+}
+
+HeadTwoStats g_head2{};
+
+void lmhead_two_stage_rows(const uint8_t* W8, const uint8_t* W4, size_t N, size_t K, const float* x, size_t R, float* y,
+                           size_t NR, size_t topk, bool check) {
+    if (R < 1 || R > 8) throw std::runtime_error("open_qwen36: lmhead_two_stage_rows: 1 to 8 rows");
+    // 1. int4 logits for every row (one read of the int4 head)
+    gemv_b4_rows(W4, N, K, x, R, y, N);
+    std::vector<float> ref;
+    std::vector<std::vector<float>> i4;
+    if (check) {
+        ref.resize(R * N);
+        lmhead_q8_cpu_rows(W8, N, K, x, R, ref.data());
+        for (size_t r = 0; r < R; ++r) i4.emplace_back(y + r * N, y + r * N + NR);
+    }
+    static thread_local std::vector<HeadX> hx;
+    hx.resize(8);
+    for (size_t r = 0; r < R; ++r) head_prep(x + r * K, K, hx[r]);
+    const HeadFn fn = kHeadFn[R - 1];
+    // 2. each row's top-k (int4) -> their 16-row q8 groups, the union over the rows
+    std::vector<uint8_t> done(N / 16, 0);
+    std::vector<size_t> groups;
+    std::vector<float> best(R, -INFINITY);
+    for (size_t r = 0; r < R; ++r) {
+        const float* yr = y + r * N;
+        std::vector<std::pair<float, uint32_t>> top;
+        top.reserve(topk + 1);
+        float floor_v = -INFINITY;
+        for (size_t v = 0; v < NR; ++v) {
+            if (yr[v] <= floor_v && top.size() >= topk) continue;
+            top.emplace_back(yr[v], static_cast<uint32_t>(v));
+            std::push_heap(top.begin(), top.end(), std::greater<>());
+            if (top.size() > topk) { std::pop_heap(top.begin(), top.end(), std::greater<>()); top.pop_back(); }
+            if (top.size() >= topk) floor_v = top.front().first;
+        }
+        for (const auto& [val, v] : top)
+            if (!done[v / 16]) { done[v / 16] = 1; groups.push_back(v / 16); }
+    }
+    // 3. the q8 values of those groups for every row (the full head's own kernel: bit-identical
+    // values), then 4. any token whose int4 logit still reaches a row's best q8 one rescored too
+    static thread_local std::vector<float> tmp;
+    tmp.resize(R * N);
+    // plain pointers: inside the parallel loop the thread_local names would be each worker's own
+    const HeadX* hxp = hx.data();
+    float* tp = tmp.data();
+    auto rescore = [&](const std::vector<size_t>& gs) {
+        const size_t* gp = gs.data();
+#pragma omp parallel for schedule(dynamic, 4)
+        for (long long i = 0; i < static_cast<long long>(gs.size()); ++i) fn(W8, K, hxp, gp[i], gp[i] + 1, tp, N);
+        for (size_t g : gs)
+            for (size_t r = 0; r < R; ++r)
+                for (size_t j = 0; j < 16; ++j) {
+                    y[r * N + g * 16 + j] = tmp[r * N + g * 16 + j];
+                    if (g * 16 + j < NR) best[r] = std::max(best[r], tmp[r * N + g * 16 + j]);
+                }
+    };
+    rescore(groups);
+    g_head2.groups += groups.size();
+    for (int round = 0; round < 8; ++round) {
+        std::vector<size_t> more;
+        for (size_t r = 0; r < R; ++r)
+            for (size_t v = 0; v < NR; ++v)
+                if (!done[v / 16] && y[r * N + v] >= best[r]) { done[v / 16] = 1; more.push_back(v / 16); }
+        if (more.empty()) break;
+        g_head2.extra += more.size();
+        rescore(more);
+    }
+    ++g_head2.calls;
+    g_head2.rows += R;
+    if (check)
+        for (size_t r = 0; r < R; ++r) {
+            const float* a = y + r * N;
+            const float* b = ref.data() + r * N;
+            const size_t ia = static_cast<size_t>(std::max_element(a, a + NR) - a);
+            const size_t ib = static_cast<size_t>(std::max_element(b, b + NR) - b);
+            if (ia != ib) ++g_head2.mismatch;
+            size_t rank = 0;   // the q8 argmax's rank in the int4 order
+            for (size_t v = 0; v < NR; ++v) rank += i4[r][v] > i4[r][ib];
+            g_head2.max_rank = std::max(g_head2.max_rank, rank);
+            ++g_head2.checked;
+        }
 }
 
 void par_copy(void* dst, const void* src, size_t bytes) {

@@ -630,6 +630,10 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// last row's. With verify_save_ the linear layers' states before the rows are kept, so
     /// cpu_rollback(keep, R) can return to after the first `keep` rows.
     void step_cpu_rows(const int* toks, size_t R, bool want_logits);
+    static bool verify_chunk_on();
+    bool head2_on() const;
+    static size_t head2_k();
+    static bool head2_check();
     void cpu_rollback(size_t keep, size_t R);
     struct VerifySave { std::vector<uint8_t> conv; std::vector<float> qkv, z, xn; };
     std::vector<std::vector<float>> s_alt_;   ///< per linear layer: the alternate DeltaNet S (verify passes)

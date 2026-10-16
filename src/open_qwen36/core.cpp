@@ -2888,17 +2888,22 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             timing_.attn_ms += ms_since(tw);
             // each chunk's tiles: tile t = column strip off / 128 + t, [row block 4][column block 16][8][8]
             auto tr = std::chrono::steady_clock::now();
+            // C "rb" (row-block major, [rb 4][strip NS][16][8][8]): the row blocks with rows < R only;
+            // else [strip][rb 4][16][8][8], all of it
+            const bool crb = S2->value("c_layout", std::string()) == "rb";
             for (size_t ci = 0; ci < chunks.size(); ++ci) {
                 xrt::bo& cb = globals_.at("dec2_c" + std::to_string(ci));
-                read_back(cb, 32 * 32 * 128 * 2, 0);
+                const size_t off = chunks[ci][0].get<size_t>(), nc = chunks[ci][1].get<size_t>(), NS = nc / 128;
+                read_back(cb, crb ? (R + 7) / 8 * NS * 2048 : 32 * 32 * 128 * 2, 0);
                 const uint16_t* c16 = cb.map<const uint16_t*>();
-                const size_t off = chunks[ci][0].get<size_t>(), nc = chunks[ci][1].get<size_t>();
                 const bool add = kn_of(ci) < KT;
                 for (size_t r = 0; r < R; ++r)
                     for (size_t t = 0; t < nc / 128; ++t)
                         for (size_t cbk = 0; cbk < 16; ++cbk)
                             for (size_t j = 0; j < 8; ++j) {
-                                const float v = bf16_to_f32(c16[t * 4096 + ((r / 8) * 16 + cbk) * 64 + (r % 8) * 8 + j]);
+                                const size_t at = crb ? (r / 8) * NS * 1024 + t * 1024 + cbk * 64 + (r % 8) * 8 + j
+                                                      : t * 4096 + ((r / 8) * 16 + cbk) * 64 + (r % 8) * 8 + j;
+                                const float v = bf16_to_f32(c16[at]);
                                 float& o = out[r * npad + off + t * 128 + cbk * 8 + j];
                                 o = add ? o + v : v;
                             }
@@ -3011,10 +3016,14 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             g.t_real = 1;
             if (!hc.Wa16.empty()) { g.wa16 = hc.Wa16.data(); g.wb16 = hc.Wb16.data(); }
             double ph[2] = {0, 0};
-            // one token at a time even in a verify pass: a T > 1 block orders the delta rule's sums
-            // differently (~2e-7), which over 64 layers flips near-ties -- the pass must match decode
-            for (size_t r = 0; r < R; ++r) {
+            // a verify pass's rows as chunks of up to 4 tokens (the first reading the pre-pass state,
+            // s_in). The chunk orders the delta rule's sums differently from one token at a time
+            // (~2e-7; prefill's NPU formats differ from decode by ~1e-2), so MTP output is no longer
+            // bit-identical to plain decode. OFLM_OPEN_VERIFY_CHUNK=0: one token at a time (exact).
+            const size_t step = verify_chunk_on() ? 4 : 1;
+            for (size_t r = 0; r < R; r += step) {
                 host::DeltaGeom gr = g;
+                gr.T = gr.t_real = std::min(step, R - r);
                 if (save && r == 0) gr.s_in = s_cur;
                 host::deltanet_block(gr, ya.data() + r * nch, yb.data() + r * vw, xn.data() + r * hid, hc.convw.data(), hc.Wa.data(),
                                      hc.Wb.data(), hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
@@ -3067,7 +3076,9 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
         hn.resize(R * hid);
         host::rmsnorm_rows(x.data(), R, hid, normw_f_.data(), types_[0]->gemm_block.eps, hn.data());
         rows_logits_.resize(R * w_->vocab);
-        host::lmhead_q8_cpu_rows(lm_cpu_.data(), w_->vocab, hid, hn.data(), R, rows_logits_.data());
+        if (head2_on()) host::lmhead_two_stage_rows(lm_cpu_.data(), lm_b4_.data(), w_->vocab, hid, hn.data(), R, rows_logits_.data(),
+                                                    w_->real_vocab ? w_->real_vocab : w_->vocab, head2_k(), head2_check());
+        else host::lmhead_q8_cpu_rows(lm_cpu_.data(), w_->vocab, hid, hn.data(), R, rows_logits_.data());
         std::copy(rows_logits_.end() - static_cast<long>(w_->vocab), rows_logits_.end(), logits_host_.begin());
         timing_.lmhead_ms = ms_since(tl);
     } else if (want_logits) {
@@ -3313,11 +3324,39 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
             s_in_alt_[l] = 0;
         }
     const double ms = ms_since(t0);
+    if (head2_on()) {
+        const host::HeadTwoStats& h = host::g_head2;
+        std::fprintf(stderr, "head2: %zu calls, %zu rows, %.1f groups a call + %.2f extra; checked %zu rows, %zu argmax mismatches, "
+                             "worst int4 rank of the q8 argmax %zu\n", h.calls, h.rows, h.calls ? double(h.groups) / h.calls : 0.0,
+                     h.calls ? double(h.extra) / h.calls : 0.0, h.checked, h.mismatch, h.max_rank);
+    }
     std::fprintf(stderr, "MTP k=%d: %zu tokens in %zu passes (%.2f a pass), drafts accepted %zu / %zu (%.1f %%); %.1f ms/token (%.2f tok/s) | "
                          "a pass: draft %.1f verify %.1f rollback %.1f ms\n",
                  k, out.size() - 1, passes, (out.size() - 1) / double(passes), accepted, drafted, 100.0 * accepted / std::max<size_t>(1, drafted),
                  ms / (out.size() - 1), 1000.0 * (out.size() - 1) / ms, t_draft / passes, t_verify / passes, t_roll / passes);
     return out;
+}
+
+// OFLM_OPEN_HEAD2 (default on; 0 off): the CPU head in two stages (int4 logits, the top OFLM_OPEN_HEAD2_K = 64 rescored
+// with q8; host::lmhead_two_stage_rows), when the int4 copy exists (MTP on). The other logits stay
+// int4 approximations: greedy only. 4 prompts x 200 tokens, 1108 rows: the q8 argmax every time (its
+// worst int4 rank 2); a 4-row pass's head 13.2 -> 8.0 ms. OFLM_OPEN_HEAD2_CHECK=1 also runs the full q8 head and counts.
+bool Core::head2_on() const {
+    static const bool on = [] { const char* e = std::getenv("OFLM_OPEN_HEAD2"); return !(e && *e == '0'); }();
+    return on && !lm_b4_.empty() && !lm_cpu_.empty();
+}
+size_t Core::head2_k() {
+    static const size_t k = [] { const char* e = std::getenv("OFLM_OPEN_HEAD2_K"); return e ? std::strtoul(e, nullptr, 10) : 64ul; }();
+    return k;
+}
+bool Core::head2_check() {
+    static const bool on = std::getenv("OFLM_OPEN_HEAD2_CHECK") != nullptr;
+    return on;
+}
+
+bool Core::verify_chunk_on() {
+    static const bool on = [] { const char* e = std::getenv("OFLM_OPEN_VERIFY_CHUNK"); return !(e && *e == '0'); }();
+    return on;
 }
 
 void Core::cpu_rollback(size_t keep, size_t R) {
@@ -3344,15 +3383,17 @@ void Core::cpu_rollback(size_t keep, size_t R) {
             std::memcpy(s_cur, s_pre, s_alt_[l].size() * 4);
             continue;
         }
-        std::vector<float> og(gb.vw);
+        std::vector<float> og(4 * gb.vw);
         host::DeltaGeom g;
         g.T = 1; g.hid = hid;
         g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
         g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
         g.t_real = 1;
         double ph[2] = {0, 0};
-        for (size_t r = 0; r < keep; ++r) {   // token by token, as the pass and decode ran them
+        const size_t step = verify_chunk_on() ? 4 : 1;   // as the pass ran them
+        for (size_t r = 0; r < keep; r += step) {
             host::DeltaGeom gr = g;
+            gr.T = gr.t_real = std::min(step, keep - r);
             if (r == 0) gr.s_in = s_pre;
             host::deltanet_block(gr, v.qkv.data() + r * gb.qkv_dim, v.z.data() + r * gb.vw, v.xn.data() + r * hid, hc.convw.data(),
                                  hc.Wa.data(), hc.Wb.data(), hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
@@ -3376,6 +3417,8 @@ void Core::tail_logits(const float* row) {
         xn.resize(hid);
         host::rmsnorm_rows(row, 1, hid, normw_f_.data(), types_[0]->gemm_block.eps, xn.data());
         if (head_b4_main_) host::gemv_b4(lm_b4_.data(), w_->vocab, hid, xn.data(), logits_host_.data());
+        else if (head2_on()) host::lmhead_two_stage_rows(lm_cpu_.data(), lm_b4_.data(), w_->vocab, hid, xn.data(), 1, logits_host_.data(),
+                                                         w_->real_vocab ? w_->real_vocab : w_->vocab, head2_k(), head2_check());
         else host::lmhead_q8_cpu(lm_cpu_.data(), w_->vocab, hid, xn.data(), logits_host_.data());
         timing_.lmhead_ms = ms_since(t1);
         if (!cpu_head_check_) return;

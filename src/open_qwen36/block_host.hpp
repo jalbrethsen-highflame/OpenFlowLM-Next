@@ -145,6 +145,14 @@ size_t lmhead_q8_cpu_bytes(size_t N, size_t K);
 void lmhead_q8_repack(const uint8_t* pool, size_t N, size_t K, uint8_t* out);
 void lmhead_q8_cpu(const uint8_t* W, size_t N, size_t K, const float* x, float* y);
 /// R rows (1..8) at once: x [R, K], y [R, N]; the head read once.
+// The head in two stages: int4 logits for all N (W4, dit2 int4 blocks), then the top `topk` of each
+// row's first NR -- and any token whose int4 logit still reaches the row's best -- rescored with the
+// q8 head W8 (its own kernel: those values bit-identical to lmhead_q8_cpu_rows). The argmax is the
+// q8 one unless the q8 argmax sits outside the int4 top-k (check: counted against the full q8 head).
+struct HeadTwoStats { size_t calls, rows, groups, extra, checked, mismatch, max_rank; };
+extern HeadTwoStats g_head2;
+void lmhead_two_stage_rows(const uint8_t* W8, const uint8_t* W4, size_t N, size_t K, const float* x, size_t R, float* y,
+                           size_t NR, size_t topk, bool check);
 void lmhead_q8_cpu_rows(const uint8_t* W, size_t N, size_t K, const float* x, size_t R, float* y);
 /// memcpy over the OpenMP threads (the MTP state snapshots: ~154 MB a pass on the 27B)
 void par_copy(void* dst, const void* src, size_t bytes);
