@@ -4384,21 +4384,39 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     static const bool cb_on = [] { const char* e = std::getenv("OFLM_OPEN_FA_CB"); return !(e && *e == '0'); }();
     static const size_t cb_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_CB_MIN"); return e ? std::strtoul(e, nullptr, 10) : 1024ul; }();
     static const size_t cbs_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_CBS_MIN"); return e ? std::strtoul(e, nullptr, 10) : 512ul; }();
-    const bool cb_ok = cb_on && !noncausal_ && pos0 == 0 && D.contains("fa");
+    const bool cb_ok = cb_on && !noncausal_ && !packed && D.contains("fa");
     const bool cbs_m = cb_ok && D["fa"].contains("cbs") && D["fa"].value("cbs_m", size_t{0}) == M;
     const nlohmann::json& FCB = cb_ok && full_m && D["fa"].contains("cb") ? D["fa"]["cb"] : cbs_m ? D["fa"]["cbs"] : kEmpty;
     const size_t fcb_min = full_m ? cb_min : cbs_min;
-    const size_t lkc = (pos0 + N + M - 1) / M * M;           // the causal packs' key capacity
+    const size_t lkc = (pos0 + C * M + M - 1) / M * M;       // the causal packs' key capacity (the last chunk's stream)
+    // a prompt after earlier turns (pos0 > 0): chunk c's queries are positions pos0 + c M ..; its
+    // fa.cb stream the one for the key count rounded up to M, its query offset patched in (the
+    // q_off sentinel, fa.cb_qoff)
     auto fa_kernel = [&](size_t c) -> std::string {
-        const size_t lk = pos0 + (c + 1) * M;
+        const size_t lk = pos0 + (c + 1) * M, lkr = (lk + M - 1) / M * M;
         if (!fa_on) return {};
-        if (FCB.contains(std::to_string(lk)) && lk >= fcb_min) return FCB[std::to_string(lk)].get<std::string>();
+        const bool patchable = pos0 == 0 || D["fa"].contains("cb_qoff");
+        if (patchable && FCB.contains(std::to_string(lkr)) && lkr >= fcb_min) return FCB[std::to_string(lkr)].get<std::string>();
         if (!full_m || lk < fa_min || !FA.contains(std::to_string(lk))) return {};
         return FA[std::to_string(lk)].get<std::string>();
     };
     auto is_cb = [](const std::string& k) { return k.rfind("fa256bc", 0) == 0; };
     bool any_cb = false;
     for (size_t c = 0; c < C; ++c) any_cb = any_cb || is_cb(fa_kernel(c));
+    if (any_cb && D["fa"].contains("cb_qoff")) {
+        // each chunk's stream (a distinct key count a chunk) gets its query offset
+        const uint32_t sent = D["fa"]["cb_qoff"].get<uint32_t>();
+        for (size_t c = 0; c < C; ++c) {
+            const std::string fk = fa_kernel(c);
+            if (!is_cb(fk)) continue;
+            Kern& k = kerns_.at(fk);
+            size_t hits = 0;
+            for (size_t i = 0; i < k.words.size(); ++i)
+                if (k.words[i] == sent) { k.iw()[i] = static_cast<uint32_t>(pos0 + c * M); ++hits; }
+            if (!hits) throw std::runtime_error("open_qwen36: " + fk + " carries no q_off sentinel");
+            k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+    }
     // per chunk device buffers (named globals, so start_run binds them), kept across requests
     auto need = [&](const std::string& name, size_t bytes) {
         auto it = globals_.find(name);
@@ -4753,26 +4771,30 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         const std::string par = std::to_string(full_ord[l] % 2), fo = std::to_string(full_ord[l]);
                         xrt::bo& kbuf = buffer(cbk ? "fabc_k" + fo : "fab_k" + par, 0);
                         xrt::bo& vbuf = buffer(cbk ? "fabc_v" + fo : "fab_v" + par, 0);
-                        const uint16_t* kvr = st.map<const uint16_t*>() + (pos0 + r0) * (row / 2);
-                        // fa.ncb: [kv head][lkn / 64 chunks]; fa.cb: [chunk][kv head] (DF_KV_INTER)
+                        // fa.ncb: [kv head][lkn / 64 chunks]; fa.cb: [chunk][kv head] (DF_KV_INTER). fa.cb
+                        // packs keys [k0, pos0 + r0 + t_real): from the 64-key chunk the rows start in (its
+                        // earlier rows from the cache), from key 0 on a later turn's first chunk
+                        const size_t k0 = cbk ? (c == 0 ? 0 : (pos0 + r0) / 64 * 64) : pos0 + r0;
+                        const size_t kn_rows = cbk ? pos0 + r0 + t_real - k0 : t_real, kT = cbk ? (kn_rows + 63) / 64 * 64 : M;
+                        const uint16_t* kvr = st.map<const uint16_t*>() + k0 * (row / 2);
                         const size_t kv_head = cbk ? kFabChunk : (lkn / 64) * kFabChunk;
                         const size_t cstep = cbk ? kvh * kFabChunk : kFabChunk;
-                        const size_t at = (r0 / 64) * cstep, span = (M / 64) * kFabChunk;
+                        const size_t at = cbk ? (k0 / 64) * cstep : (r0 / 64) * cstep, span = (M / 64) * kFabChunk;
 #pragma omp parallel for schedule(dynamic, 1)
                         for (long long w = 0; w < static_cast<long long>(nh + 2 * kvh); ++w) {
                             const size_t u = static_cast<size_t>(w);
                             if (u < nh)
                                 fab_pack_q(og.data(), qw, u * hd, M, t_real, 1.4426950408889634f, qm + u * qb_head);
                             else if (u < nh + kvh)
-                                fab_pack_k(kvr, row / 2, (u - nh) * hd, M, t_real, kbuf.map<uint8_t*>() + (u - nh) * kv_head + at, cstep);
+                                fab_pack_k(kvr, row / 2, (u - nh) * hd, kT, kn_rows, kbuf.map<uint8_t*>() + (u - nh) * kv_head + at, cstep);
                             else
-                                fab_pack_v(kvr, row / 2, kvh * hd + (u - nh - kvh) * hd, M, t_real,
+                                fab_pack_v(kvr, row / 2, kvh * hd + (u - nh - kvh) * hd, kT, kn_rows,
                                            vbuf.map<uint8_t*>() + (u - nh - kvh) * kv_head + at, cstep);
                         }
                         qbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, nh * qb_head, 0);
-                        if (cbk) {   // this chunk's rows: one contiguous span over all kv heads
-                            kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, kvh * span, at);
-                            vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, kvh * span, at);
+                        if (cbk) {   // the packed keys: one contiguous span over all kv heads
+                            kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (kT / 64) * cstep, at);
+                            vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (kT / 64) * cstep, at);
                         } else {
                             for (size_t g2 = 0; g2 < kvh; ++g2) {
                                 kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, span, g2 * kv_head + at);
@@ -4819,22 +4841,24 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     if (!noncausal_ && any_cb && !cbk) {
                         // a chunk under OFLM_OPEN_FA_CB_MIN: its K / V rows into the fa.cb packs too,
                         // for the later chunks' kernels
-                        const size_t kvh = gb.kvh, hd = gb.hd, cstep = kvh * kFabChunk, at = (r0 / 64) * cstep;
+                        const size_t kvh = gb.kvh, hd = gb.hd, cstep = kvh * kFabChunk;
+                        const size_t k0 = c == 0 ? 0 : (pos0 + r0) / 64 * 64, kn_rows = pos0 + r0 + t_real - k0;
+                        const size_t kT = (kn_rows + 63) / 64 * 64, at = (k0 / 64) * cstep;
                         const std::string fo = std::to_string(full_ord[l]);
                         xrt::bo& kbuf = buffer("fabc_k" + fo, 0);
                         xrt::bo& vbuf = buffer("fabc_v" + fo, 0);
-                        const uint16_t* kvr = st.map<const uint16_t*>() + (pos0 + r0) * (row / 2);
+                        const uint16_t* kvr = st.map<const uint16_t*>() + k0 * (row / 2);
 #pragma omp parallel for schedule(dynamic, 1)
                         for (long long w = 0; w < static_cast<long long>(2 * kvh); ++w) {
                             const size_t u = static_cast<size_t>(w);
                             if (u < kvh)
-                                fab_pack_k(kvr, row / 2, u * hd, M, t_real, kbuf.map<uint8_t*>() + u * kFabChunk + at, cstep);
+                                fab_pack_k(kvr, row / 2, u * hd, kT, kn_rows, kbuf.map<uint8_t*>() + u * kFabChunk + at, cstep);
                             else
-                                fab_pack_v(kvr, row / 2, kvh * hd + (u - kvh) * hd, M, t_real,
+                                fab_pack_v(kvr, row / 2, kvh * hd + (u - kvh) * hd, kT, kn_rows,
                                            vbuf.map<uint8_t*>() + (u - kvh) * kFabChunk + at, cstep);
                         }
-                        kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (M / 64) * cstep, at);
-                        vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (M / 64) * cstep, at);
+                        kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (kT / 64) * cstep, at);
+                        vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (kT / 64) * cstep, at);
                     }
                     st.sync(XCL_BO_SYNC_BO_TO_DEVICE, t_real * row, (pos0 + r0) * row);
                 }

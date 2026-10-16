@@ -92,6 +92,7 @@ void dump_pos(const std::string& prefix, int pos, const std::vector<float>& v) {
 struct Args {
     CoreConfig cfg;
     std::vector<int> ids;
+    std::vector<int> ids2;   // --ids-file2: a second turn's prompt, prefilled after the first's decode
     int max_tokens = 16;
     std::string dump_prefix;
     bool twice = false;
@@ -174,6 +175,10 @@ Args parse(int argc, char** argv) {
             std::ifstream f(val());
             std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
             a.ids = parse_ids(s);
+        } else if (k == "--ids-file2") {
+            std::ifstream f(val());
+            std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            a.ids2 = parse_ids(s);
         } else if (k == "--max-tokens") a.max_tokens = std::atoi(val().c_str());
         else if (k == "--layers") a.cfg.num_layers = std::atoi(val().c_str());
         else if (k == "--max-ctx") a.cfg.max_ctx = static_cast<size_t>(std::atoll(val().c_str()));
@@ -380,6 +385,15 @@ std::vector<int> request(Core& core, const Args& a) {
     if (out.size() > 1)
         std::fprintf(stderr, "decode %zu tokens: %.0f ms/token (%.2f tok/s)\n", out.size() - 1, dec_ms / (out.size() - 1),
                      1000.0 * (out.size() - 1) / dec_ms);
+    if (!a.ids2.empty() && a.gemm_block && core.layer_major_ok()) {
+        // a second turn: its prompt at the position the first turn's decode reached (no reset)
+        const int at = core.position();
+        auto t2 = clock::now();
+        core.step_gemm_prompt(a.ids2, true);
+        const double ms2 = std::chrono::duration<double, std::milli>(clock::now() - t2).count();
+        std::fprintf(stderr, "turn 2: prefill %zu tokens at position %d: %.0f ms (%.0f tok/s); next token %d\n", a.ids2.size(), at, ms2,
+                     1000.0 * a.ids2.size() / ms2, argmax(core.logits(), core.real_vocab()));
+    }
     return out;
 }
 

@@ -300,6 +300,9 @@ FA_NCB = _os.environ.get("OPEN_QWEN35_FA_NCB", "1") != "0"
 # core's rows skipped, the diagonal masked): the causal prompt's attention, ~3x dit_fa256's.
 # OPEN_QWEN35_FA_CB=0 off.
 FA_CB = _os.environ.get("OPEN_QWEN35_FA_CB", "1") != "0"
+# Its query offset as a sentinel word the engine patches per chunk (a prompt after earlier turns
+# starts anywhere): fa.cb_qoff.
+FA_CB_QOFF = 0x0C0FF5E7
 # The causal kernel at GEMM_SMALL_M query rows (one 512-row pass) for the small tier's chunks, key
 # lengths up to FA_CBS_MAX (the engine's OFLM_OPEN_SMALL_MAX); same image.
 FA_CBS_MAX = int(_os.environ.get("OPEN_QWEN35_FA_CBS_MAX", 2048))
@@ -419,6 +422,7 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             fa["nc_valid"] = FA_NC_VALID
         if FA_CB:
             fa["cb"] = {str(lk): f"fa256bc_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)}
+            fa["cb_qoff"] = FA_CB_QOFF
             if 0 < GEMM_SMALL_M < DIT_M and GEMM_SMALL_M % 512 == 0:
                 fa["cbs"] = {str(lk): f"fa256bcs_lk{lk}" for lk in range(GEMM_SMALL_M, FA_CBS_MAX + 1, GEMM_SMALL_M)}
                 fa["cbs_m"] = GEMM_SMALL_M
@@ -588,13 +592,13 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
                                "DF_CAUSAL": "0", "DF_VALID": str(FA_NC_VALID),
                                "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
         for lk, name in d.get("fa", {}).get("cb", {}).items():
-            b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{DIT_M}_lk{lk}_causal_kvi",
-                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_CAUSAL": "1", "DF_QOFF": str(int(lk) - DIT_M), "DF_KV_INTER": "1",
+            b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{DIT_M}_lk{lk}_causal_kvi_qs",
+                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_CAUSAL": "1", "DF_QOFF": str(FA_CB_QOFF), "DF_KV_INTER": "1",
                                "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
         for lk, name in d.get("fa", {}).get("cbs", {}).items():
             sm = d["fa"]["cbs_m"]
-            b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{sm}_lk{lk}_causal_kvi",
-                       "env": {"DF_L": str(sm), "DF_LK": lk, "DF_CAUSAL": "1", "DF_QOFF": str(int(lk) - sm), "DF_KV_INTER": "1",
+            b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{sm}_lk{lk}_causal_kvi_qs",
+                       "env": {"DF_L": str(sm), "DF_LK": lk, "DF_CAUSAL": "1", "DF_QOFF": str(FA_CB_QOFF), "DF_KV_INTER": "1",
                                "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
         for lk, name in d.get("fa", {}).get("ncb", {}).items():
             b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{DIT_M}_lk{lk}",

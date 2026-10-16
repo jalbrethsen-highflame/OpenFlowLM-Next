@@ -25,6 +25,7 @@ def main() -> int:
     ap.add_argument("--valid", type=int, default=0)
     ap.add_argument("--qk-scale", type=float, default=1.0, help="score spread (Q multiplier)")
     ap.add_argument("--causal", action="store_true", help="queries are the last L positions of the lk keys")
+    ap.add_argument("--qoff", type=int, default=-1, help="causal: the queries' first position (default lk - L)")
     ap.add_argument("--kv-inter", action="store_true", help="K / V as [chunk][kv head] (DF_KV_INTER=1)")
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--runs", type=int, default=3)
     a = ap.parse_args()
@@ -43,7 +44,8 @@ def main() -> int:
         kb = kb.reshape(KVH, a.lk // 64, -1).transpose(1, 0, 2).copy().reshape(-1)
         vb = vb.reshape(KVH, a.lk // 64, -1).transpose(1, 0, 2).copy().reshape(-1)
     qb.tofile(out / "q.bin"); kb.tofile(out / "k.bin"); vb.tofile(out / "v.bin")
-    np.savez(out / "ref.npz", q=q, k=k, v=v, valid=valid, causal=int(a.causal), q_off=a.lk - a.L if a.causal else 0)
+    np.savez(out / "ref.npz", q=q, k=k, v=v, valid=valid, causal=int(a.causal),
+             q_off=(a.qoff if a.qoff >= 0 else a.lk - a.L) if a.causal else 0)
     ob = a.L * HEADS * D * 2
     cfg = ["device", f"xclbin G {Path(a.xclbin).resolve()}", f"kernelx k G {Path(a.insts).resolve()}",
            f"buf q {qb.nbytes} {out / 'q.bin'}", f"buf k {kb.nbytes} {out / 'k.bin'}",
