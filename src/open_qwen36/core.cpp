@@ -4279,14 +4279,21 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     static const bool small_on = [] { const char* e = std::getenv("OFLM_OPEN_SMALL_M"); return !(e && *e == '0'); }();
     static const size_t small_max = [] { const char* e = std::getenv("OFLM_OPEN_SMALL_MAX"); return e ? std::strtoul(e, nullptr, 10) : 2048ul; }();
     // gemm_dit.tiny: the same at its M on 64-row core tiles (its own image) up to OFLM_OPEN_TINY_MAX
-    // tokens (default 256: one chunk, the 512-row result bit for bit, d3 median 0.96 -> 0.69 s;
-    // two chunks for 257-512 only -4 %); OFLM_OPEN_TINY_MAX=0 off
-    static const size_t tiny_max = [] { const char* e = std::getenv("OFLM_OPEN_TINY_MAX"); return e ? std::strtoul(e, nullptr, 10) : 256ul; }();
+    // tokens (default 512: one chunk up to 256, the 512-row result bit for bit, d3 median 0.96 ->
+    // 0.69 s; two chunks for 257-512, with fa.cbs attention padded to 512 queries: the causal 27B at
+    // 512 tokens 1122 -> 1055 ms, the chunks' host and NPU work overlapping); OFLM_OPEN_TINY_MAX=0 off
+    static const size_t tiny_max = [] { const char* e = std::getenv("OFLM_OPEN_TINY_MAX"); return e ? std::strtoul(e, nullptr, 10) : 512ul; }();
     static const bool small_ffn = [] { const char* e = std::getenv("OFLM_OPEN_FFN_DEVICE"); return !(e && *e == '0'); }();
     const nlohmann::json* Dp = &man_.gemm_dit;
     nlohmann::json Dsmall;
     const size_t want = static_cast<size_t>(pos_) + ids.size();
     const char* tier = Dp->contains("tiny") && want <= tiny_max ? "tiny" : Dp->contains("small") && want <= small_max ? "small" : nullptr;
+    // past OFLM_OPEN_TINY_MAX, up to 1024 tokens: the tiny tier still when its chunks cost less than the
+    // small tier's padded ones (a 256-row chunk ~0.63 of a 512-row one: 768 tokens 1680 -> 1321 ms)
+    if (tier && std::string(tier) == "small" && Dp->contains("tiny") && want <= 1024 && tiny_max > 0) {
+        const size_t n = ids.size();
+        if (0.63 * static_cast<double>((n + 255) / 256) < static_cast<double>((n + 511) / 512)) tier = "tiny";
+    }
     if (small_on && small_ffn && dit_hs_ && tier) {
         const nlohmann::json& S = (*Dp)[tier];
         Dsmall = *Dp;
@@ -4410,15 +4417,21 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     static const size_t cb_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_CB_MIN"); return e ? std::strtoul(e, nullptr, 10) : 1024ul; }();
     static const size_t cbs_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_CBS_MIN"); return e ? std::strtoul(e, nullptr, 10) : 512ul; }();
     const bool cb_ok = cb_on && !noncausal_ && !packed && D.contains("fa");
-    const bool cbs_m = cb_ok && D["fa"].contains("cbs") && D["fa"].value("cbs_m", size_t{0}) == M;
+    // fa.cbs also serves a smaller M (the tiny tier's 256): the chunk's rows padded to cbs_m queries
+    const size_t cbs_mm = cb_ok && D["fa"].contains("cbs") ? D["fa"].value("cbs_m", size_t{0}) : 0;
+    // (a padded stream only with two chunks or more: one 256-row chunk's host attention is cheaper than
+    // the NPU's image switches, 688 against 701 ms at 256 tokens)
+    const bool cbs_m = cbs_mm && !full_m && cbs_mm >= M && cbs_mm % M == 0 && (cbs_mm == M || C > 1);
     const nlohmann::json& FCB = cb_ok && full_m && D["fa"].contains("cb") ? D["fa"]["cb"] : cbs_m ? D["fa"]["cbs"] : kEmpty;
     const size_t fcb_min = full_m ? cb_min : cbs_min;
-    const size_t lkc = (pos0 + C * M + M - 1) / M * M;       // the causal packs' key capacity (the last chunk's stream)
+    const size_t MQ = cbs_m ? cbs_mm : M;                    // the causal stream's query rows (M, or padded)
+    const size_t KSTEP = cbs_m ? cbs_mm : M;                 // its key counts' step
+    const size_t lkc = (pos0 + C * M + KSTEP - 1) / KSTEP * KSTEP;   // the causal packs' key capacity
     // a prompt after earlier turns (pos0 > 0): chunk c's queries are positions pos0 + c M ..; its
     // fa.cb stream the one for the key count rounded up to M, its query offset patched in (the
     // q_off sentinel, fa.cb_qoff)
     auto fa_kernel = [&](size_t c) -> std::string {
-        const size_t lk = pos0 + (c + 1) * M, lkr = (lk + M - 1) / M * M;
+        const size_t lk = pos0 + (c + 1) * M, lkr = (lk + KSTEP - 1) / KSTEP * KSTEP;
         if (!fa_on) return {};
         const bool patchable = pos0 == 0 || D["fa"].contains("cb_qoff");
         if (patchable && FCB.contains(std::to_string(lkr)) && lkr >= fcb_min) return FCB[std::to_string(lkr)].get<std::string>();
@@ -4428,20 +4441,21 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     auto is_cb = [](const std::string& k) { return k.rfind("fa256bc", 0) == 0; };
     bool any_cb = false;
     for (size_t c = 0; c < C; ++c) any_cb = any_cb || is_cb(fa_kernel(c));
-    if (any_cb && D["fa"].contains("cb_qoff")) {
-        // each chunk's stream (a distinct key count a chunk) gets its query offset
+    // a causal stream's query offset, patched in right before its dispatch (two chunks of the tiny
+    // tier can share one stream), skipped when it already carries that offset
+    auto cb_qoff = [&](const std::string& fk, uint32_t qoff) {
+        if (!D["fa"].contains("cb_qoff")) return;
+        auto it = cb_patched_.find(fk);
+        if (it != cb_patched_.end() && it->second == qoff) return;
         const uint32_t sent = D["fa"]["cb_qoff"].get<uint32_t>();
-        for (size_t c = 0; c < C; ++c) {
-            const std::string fk = fa_kernel(c);
-            if (!is_cb(fk)) continue;
-            Kern& k = kerns_.at(fk);
-            size_t hits = 0;
-            for (size_t i = 0; i < k.words.size(); ++i)
-                if (k.words[i] == sent) { k.iw()[i] = static_cast<uint32_t>(pos0 + c * M); ++hits; }
-            if (!hits) throw std::runtime_error("open_qwen36: " + fk + " carries no q_off sentinel");
-            k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        }
-    }
+        Kern& k = kerns_.at(fk);
+        size_t hits = 0;
+        for (size_t i = 0; i < k.words.size(); ++i)
+            if (k.words[i] == sent) { k.iw()[i] = qoff; ++hits; }
+        if (!hits) throw std::runtime_error("open_qwen36: " + fk + " carries no q_off sentinel");
+        k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        cb_patched_[fk] = qoff;
+    };
     // per chunk device buffers (named globals, so start_run binds them), kept across requests
     auto need = [&](const std::string& name, size_t bytes) {
         auto it = globals_.find(name);
@@ -4465,8 +4479,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             need("fa_q_" + cs, M * wmid * 2);
             need("fa_o_" + cs, M * wmid * 2);
         }
-        if (nc_b || any_cb) need("fab_q_" + cs, fab_nh * (M / 32) * kFabQBlock);
-        if (any_cb) { need("fa_o_" + cs, M * wmid * 2); }
+        if (nc_b || any_cb) need("fab_q_" + cs, fab_nh * (MQ / 32) * kFabQBlock);
+        if (any_cb) { need("fa_o_" + cs, MQ * wmid * 2); }
     }
     if (nc_b)
         for (const char* nm : {"fab_k0", "fab_k1", "fab_v0", "fab_v1"})
@@ -4587,6 +4601,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     const std::string fk = fa_kernel(c);
                     if (is_cb(fk)) {
                         const std::string fo = std::to_string(full_ord[l]);
+                        cb_qoff(fk, static_cast<uint32_t>(pos0 + c * M));
                         run(fk, {"fab_q_" + cs, "fabc_k" + fo, "fabc_v" + fo, "fa_o_" + cs});
                     } else {
                         run(fk, {"fa_q_" + cs, "state", "state", "fa_o_" + cs});
@@ -4789,7 +4804,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
                                              man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
                         timing_.attn_ms += ms_since(ta);
-                        const size_t nh = gb.nh, kvh = gb.kvh, hd = gb.hd, qb_head = (M / 32) * kFabQBlock;
+                        const size_t MQr = cbk ? MQ : M;            // the stream's query rows (padded past M)
+                        const size_t nh = gb.nh, kvh = gb.kvh, hd = gb.hd, qb_head = (MQr / 32) * kFabQBlock;
                         xrt::bo& qbuf = buffer("fab_q_" + cs, 0);
                         uint8_t* qm = qbuf.map<uint8_t*>();
                         const std::string par = std::to_string(full_ord[l] % 2), fo = std::to_string(full_ord[l]);
@@ -4808,7 +4824,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         for (long long w = 0; w < static_cast<long long>(nh + 2 * kvh); ++w) {
                             const size_t u = static_cast<size_t>(w);
                             if (u < nh)
-                                fab_pack_q(og.data(), qw, u * hd, M, t_real, 1.4426950408889634f, qm + u * qb_head);
+                                fab_pack_q(og.data(), qw, u * hd, MQr, t_real, 1.4426950408889634f, qm + u * qb_head);
                             else if (u < nh + kvh)
                                 fab_pack_k(kvr, row / 2, (u - nh) * hd, kT, kn_rows, kbuf.map<uint8_t*>() + (u - nh) * kv_head + at, cstep);
                             else
