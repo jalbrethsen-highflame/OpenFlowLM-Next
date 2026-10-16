@@ -4972,9 +4972,22 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
                 read_back(yb2, t_real * hid * 2, 0);
                 const uint16_t* y16 = yb2.map<const uint16_t*>();
+                // the residual add and the post-attention norm in one pass a row (rms_vec's order: the
+                // same bits as add, then rmsnorm_rows)
+                const float* pw = hc.postln.data();
+                const double peps = gb.eps;
 #pragma omp parallel for
-                for (long long i = 0; i < static_cast<long long>(t_real * hid); ++i) rs[i] = xr[i] + bf16_to_f32(y16[i]);
-                host::rmsnorm_rows(rs, t_real, hid, hc.postln.data(), gb.eps, xc);
+                for (long long tt = 0; tt < static_cast<long long>(t_real); ++tt) {
+                    const size_t o = static_cast<size_t>(tt) * hid;
+                    double ss = 0;
+                    for (size_t j = 0; j < hid; ++j) {
+                        const float v = xr[o + j] + bf16_to_f32(y16[o + j]);
+                        rs[o + j] = v;
+                        ss += static_cast<double>(v) * v;
+                    }
+                    const float r = static_cast<float>(1.0 / std::sqrt(ss / static_cast<double>(hid) + peps));
+                    for (size_t j = 0; j < hid; ++j) xc[o + j] = rs[o + j] * r * pw[j];
+                }
                 if (up2) to_bfp2(xc, hid, "pp_a2_" + cs, t_real);
                 else to_bf16(xc, M, hid, "pp_a_" + cs);
             } else if (op == HPACK) {
