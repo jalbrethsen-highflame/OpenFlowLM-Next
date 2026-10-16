@@ -405,7 +405,7 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             if ks:
                 split[key] = {"chunks": [[i * 4096, 4096, f"dit2dec_kt{t}_off{i * 4096}_kr{k}", t] for i, t in enumerate(ks)]}
         if split:
-            decode2 = {"m": 32, "k": hid, "split": split,
+            decode2 = {"m": 32, "k": hid, "split": split, "c_layout": "rb",
                        "a_steps": max(c[3] for v in split.values() for c in v["chunks"])}
     fa = None
     if GEMM_DIT2 and FA_MAX_LK >= DIT_M and spec.has_full and spec.head_dim == 256:

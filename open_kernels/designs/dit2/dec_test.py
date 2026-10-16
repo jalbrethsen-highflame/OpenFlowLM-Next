@@ -15,14 +15,18 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--build"); ap.add_argument("--K", type=int); ap.add_argument("--NT", type=int); ap.add_argument("--N", type=int)
 ap.add_argument("--OFF", type=int, default=0); ap.add_argument("--out"); ap.add_argument("--runs", type=int, default=30)
 ap.add_argument("--check", action="store_true")
+ap.add_argument("--rb", action="store_true", help="C row-block major ([rb][strip][cb][8][8], dec.py's layout)")
 ap.add_argument("--KROW", type=int, default=0, help="the weight's full K (a K-split kernel reads the first K)")
 a = ap.parse_args(); out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
 K, N, OFF = a.K, a.N, a.OFF
 KR = a.KROW or K
 if a.check:
     ref = np.load(out / "ref.npy")
-    raw = np.fromfile(out / "c.bin", dtype=bfloat16).astype(np.float64).reshape(N // 128, 4, 16, 8, 8)   # [strip][rb][cb][8][8]
-    c = raw.transpose(1, 3, 0, 2, 4).reshape(32, N)          # [rb][r8][strip][cb][c8] -> rows x cols
+    raw = np.fromfile(out / "c.bin", dtype=bfloat16).astype(np.float64)
+    if a.rb:
+        c = raw.reshape(4, N // 128, 16, 8, 8).transpose(0, 3, 1, 2, 4).reshape(32, N)   # [rb][strip][cb][8][8]
+    else:
+        c = raw.reshape(N // 128, 4, 16, 8, 8).transpose(1, 3, 0, 2, 4).reshape(32, N)   # [strip][rb][cb][8][8]
     rel = np.linalg.norm(c - ref) / np.linalg.norm(ref)
     r0 = np.linalg.norm(c[0] - ref[0]) / np.linalg.norm(ref[0])
     print(("PASS" if rel < 3e-2 and np.isfinite(c).all() else "FAIL"), f"rel_fro {rel:.3e} row0 {r0:.3e}")

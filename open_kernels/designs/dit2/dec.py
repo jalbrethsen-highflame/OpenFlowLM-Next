@@ -5,8 +5,9 @@ Unlike dit2, B is SPLIT over the cores, not broadcast: one 128-column strip per 
 8, 16, 24 or 32 strips: 8 columns of 1-4 cores), so every weight byte is read once; A -- 32 rows,
 the most one hs_b4_call takes -- is read from DRAM once and broadcast to every core one 64-K
 quarter at a time (pack_a.py order2 with mt = 32: [K / 64][2304 B]). The cores walk K and keep
-their C tile in L1. Decode fills row 0, a verify pass rows 0..k; the host reads those rows of each
-strip's tile ([row block 4][column block 16][8][8], rows 0-7 in the first 2 KB).
+their C tile in L1. Decode fills row 0, a verify pass rows 0..k; C goes out row-block major
+([row block 4][strip][column block 16][8][8]): the host reads back rows 0-7 of every strip as the
+first NS x 2 KB.
 
 The K-step count is a run-time parameter (one RTP word a core, set by each instruction stream), so
 one image serves every K, K range and column offset: a new product or share is a new stream only.
@@ -128,9 +129,12 @@ def dit2_dec(A: In, B: In, C: Out, *, K: CompileTime[int], N: CompileTime[int], 
                 tap = TensorAccessPattern((b_size,), (strip0 * KTR + k0) * B4_TILE, [kn, rows, 3, B4_TILE // 3],
                                           [B4_TILE, KTR * B4_TILE, B4_TILE // 3, 1])
                 b_prods[col].fill(b, tap=tap, group=tg, wait=False)
+        # C row-block major: [row block 4][strip NS][16 column blocks][8][8], so a pass of <= 8 rows
+        # reads back the first NS x 2 KB only (a core's tile is [row block 4][1024 elements])
+        NS = COLS * rows
         for col in range(COLS):
-            c_conses[col].drain(c, tap=TensorAccessPattern((COLS * rows * C_T,), col * rows * C_T, [1, 1, 1, rows * C_T],
-                                                          [0, 0, 0, 1]), group=tg, wait=True)
+            c_conses[col].drain(c, tap=TensorAccessPattern((COLS * rows * C_T,), col * rows * (C_T // 4), [1, rows, 4, C_T // 4],
+                                                          [0, C_T // 4, NS * (C_T // 4), 1]), group=tg, wait=True)
         tg.finish()
 
     rt = Runtime(sequence, [A_ty, B_ty, C_ty, a_l3.prod(), [f.prod() for f in b_l3], [f.cons() for f in c_l3]])
