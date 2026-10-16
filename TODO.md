@@ -21,7 +21,10 @@ mean (15.4 / 19.7 / 15.9 / 19.1), the code-edit prompt **23.4 tok/s**.
 **Server:** `oflm serve qwen3.8:27b` with `OFLM_OPEN_CPU_DECODE=1 OFLM_OPEN_MTP=<shard>` runs the
 same decode through Core::spec_step (any sampler, exact). 24-token chat prompt: first token 0.66 s,
 14.3 tok/s greedy, 12.5 at temperature 0.7; 1817-token code prompt: first token 3.3 s, 19.8 tok/s;
-a second turn reuses the first. Idle threads sleep (GOMP_SPINCOUNT). The launch line used:
+a second turn reuses the first. Idle threads sleep (GOMP_SPINCOUNT). The family default
+freq_penalty 1.0 (modeling_qwen3_5vl.cpp) moves greedy picks off the argmax, so fewer drafts hold:
+2.22 -> 2.47 tokens a pass, 14.4 -> 16.1 tok/s with `"frequency_penalty": 0` in the request
+(left to clients; the default stays). The launch line used:
 npu-scratch/serve/serve.sh (OFLM_MODEL_PATH holds models/<name>; it downloads what is missing).
 
 ## Status (2026-10-16)
