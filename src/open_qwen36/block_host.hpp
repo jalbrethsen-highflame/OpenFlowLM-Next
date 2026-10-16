@@ -145,6 +145,8 @@ void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y,
 /// (kt0, kt1: only those 64-K tiles of every strip, a partial sum; kt1 = 0 means all)
 /// R rows at once (1..8; an MTP verify pass): x [R, K] row-major, y [R, ldy] (columns 0..npad);
 /// each weight block unpacked once for all rows. The int8 path; the bf16 one loops gemv_b4.
+/// the decode attention kernel: -1 OFLM_OPEN_ATTN_FLASH decides (default flash), 0 split, 1 flash (tests)
+extern int g_attn_flash;
 extern double g_dn_prof[6];
 extern double g_dn_p1[4];   // deltanet_block's phases (us, summed; see block_host.cpp)
 void gemv_b4_rows(const uint8_t* B, size_t npad, size_t K, const float* x, size_t R, float* y, size_t ldy,

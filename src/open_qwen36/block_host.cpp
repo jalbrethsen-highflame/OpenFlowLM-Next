@@ -524,6 +524,7 @@ void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, 
 
 // deltanet_block's phases (us, summed): setup, phase 1 (conv, silu, q / k norm), phase 1b
 // (alpha / beta), window; read by the prompt pipe's OFLM_OPEN_MID_PROF
+int g_attn_flash = -1;
 double g_dn_prof[6] = {0, 0, 0, 0, 0, 0};
 double g_dn_p1[4] = {0, 0, 0, 0};   // phase 1 on thread 0 (us): taps, silu, q / k norm, V copy
 #define DN_MARK(i) do { auto _n = std::chrono::steady_clock::now(); g_dn_prof[i] += std::chrono::duration<double, std::micro>(_n - dn_t).count(); dn_t = _n; } while (0)
@@ -1069,6 +1070,241 @@ void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, fl
 }  // namespace
 
 namespace {
+// exp for x <= 0 (softmax terms): 2^(x log2 e) as 2^f (degree-7 polynomial, f in [0, 1), relative
+// error < 1e-6) scaled by 2^floor; lanes under -87 give 0
+__attribute__((target("avx512f,avx512dq,fma")))
+inline __m512 exp512_neg(__m512 x) {
+    const __m512 t = _mm512_mul_ps(_mm512_max_ps(x, _mm512_set1_ps(-87.f)), _mm512_set1_ps(1.44269504088896341f));
+    const __m512 fi = _mm512_roundscale_ps(t, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+    const __m512 f = _mm512_sub_ps(t, fi);
+    __m512 p = _mm512_set1_ps(1.5252733804059840e-5f);
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.5403530393381609e-4f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.3333558146428443e-3f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(9.6181291076284772e-3f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(5.5504108664821580e-2f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(2.4022650695910071e-1f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(6.9314718055994531e-1f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.f));
+    const __m512 r = _mm512_scalef_ps(p, fi);
+    return _mm512_maskz_mov_ps(_mm512_cmp_ps_mask(x, _mm512_set1_ps(-87.f), _CMP_GT_OQ), r);
+}
+
+// 16 bf16 -> 16 floats
+__attribute__((target("avx512f,avx512bw,avx512dq,fma")))
+inline __m512 ld_bf16x16(const uint16_t* p) {
+    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p))), 16));
+}
+// 16 x 16 floats transposed in registers: r[i] lane j -> r[j] lane i
+__attribute__((target("avx512f,avx512dq,fma")))
+inline void transpose16(__m512 r[16]) {
+    __m512 t[16];
+    for (int i = 0; i < 16; i += 2) {
+        t[i] = _mm512_unpacklo_ps(r[i], r[i + 1]);
+        t[i + 1] = _mm512_unpackhi_ps(r[i], r[i + 1]);
+    }
+    for (int i = 0; i < 16; i += 4) {
+        r[i] = _mm512_shuffle_ps(t[i], t[i + 2], _MM_SHUFFLE(1, 0, 1, 0));
+        r[i + 1] = _mm512_shuffle_ps(t[i], t[i + 2], _MM_SHUFFLE(3, 2, 3, 2));
+        r[i + 2] = _mm512_shuffle_ps(t[i + 1], t[i + 3], _MM_SHUFFLE(1, 0, 1, 0));
+        r[i + 3] = _mm512_shuffle_ps(t[i + 1], t[i + 3], _MM_SHUFFLE(3, 2, 3, 2));
+    }
+    for (int i = 0; i < 16; i += 8)
+        for (int j = 0; j < 4; ++j) {
+            t[i + j] = _mm512_shuffle_f32x4(r[i + j], r[i + j + 4], _MM_SHUFFLE(2, 0, 2, 0));
+            t[i + j + 4] = _mm512_shuffle_f32x4(r[i + j], r[i + j + 4], _MM_SHUFFLE(3, 1, 3, 1));
+        }
+    for (int j = 0; j < 8; ++j) {
+        r[j] = _mm512_shuffle_f32x4(t[j], t[j + 8], _MM_SHUFFLE(2, 0, 2, 0));
+        r[j + 8] = _mm512_shuffle_f32x4(t[j], t[j + 8], _MM_SHUFFLE(3, 1, 3, 1));
+    }
+}
+
+// Decode-sized causal attention (1-8 query rows) as flash decoding over long caches: a work item
+// is (kv head, 512-key chunk) with every query that reads that head -- R rows x grp heads, at most
+// 64 -- so each K / V row is converted once for all of them. In the item, 32-key blocks: K
+// transposed to floats, the scores 32 at a time per query, an online softmax with the
+// accumulators in registers (64 dims a pass), a vector exp. One partial (max, sum, sum p v) per
+// (row, head, chunk), merged in chunk order. Chunks are fixed from key 0, so a row's result
+// depends only on its own position (the same bits alone or in a verify pass), as the split path.
+// At 16K keys, 4 rows, the 27B: the split path's partials (one per 32 keys, ~50 MB a layer) and
+// per-key accumulator traffic made a verify pass's attention ~330 ms.
+__attribute__((target("avx512f,avx512bw,avx512dq,fma")))
+void attention_decode_flash(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
+                            const uint16_t* kv, size_t kvr, float* og) {
+    constexpr size_t CK = 512, KB = 32, MAXQ = 64;
+    const size_t grp = nh / kvh, qw = nh * hd, Kmax = pos0 + R, NC = (Kmax + CK - 1) / CK, NQ = R * grp, PS = hd + 2;
+    if (NQ > MAXQ || hd % 64 || hd > 512) throw std::runtime_error("open_qwen36: attention_decode_flash: geometry");
+    static thread_local std::vector<float> part_tl;
+    std::vector<float>& part = part_tl;
+    part.resize(R * nh * NC * PS);
+    float* pp = part.data();
+#pragma omp parallel
+    {
+        // per thread: the scaled queries, their accumulators, K transposed and V as floats
+        std::vector<float, std::allocator<float>> buf(MAXQ * hd * 2 + hd * KB + KB * hd + MAXQ * KB + 64);
+        float* base = reinterpret_cast<float*>((reinterpret_cast<uintptr_t>(buf.data()) + 63) & ~uintptr_t(63));
+        float* qs = base;                       // [NQ][hd]
+        float* acc = qs + MAXQ * hd;            // [NQ][hd]
+        float* KT = acc + MAXQ * hd;            // [hd][KB]
+        float* Vf = KT + hd * KB;               // [KB][hd]
+        float* pr = Vf + KB * hd;               // [NQ][KB]
+        float m[MAXQ], l[MAXQ];
+#pragma omp for schedule(dynamic, 1)
+        for (long long it = 0; it < static_cast<long long>(kvh * NC); ++it) {
+            const size_t kh = static_cast<size_t>(it) % kvh, c = static_cast<size_t>(it) / kvh;
+            const size_t k0 = c * CK, k1 = std::min(k0 + CK, Kmax);
+            // query qi = t grp + g: row t, head kh grp + g, sees keys < pos0 + t + 1
+            for (size_t t = 0; t < R; ++t)
+                for (size_t g2 = 0; g2 < grp; ++g2) {
+                    const size_t qi = t * grp + g2;
+                    const float* qp = Q + t * qw + (kh * grp + g2) * hd;
+                    for (size_t d = 0; d < hd; d += 16)
+                        _mm512_store_ps(qs + qi * hd + d, _mm512_mul_ps(_mm512_loadu_ps(qp + d), _mm512_set1_ps(scale)));
+                    std::fill(acc + qi * hd, acc + (qi + 1) * hd, 0.f);
+                    m[qi] = -INFINITY;
+                    l[qi] = 0.f;
+                }
+            for (size_t b0 = k0; b0 < k1; b0 += KB) {
+                const size_t nk = std::min(KB, k1 - b0);
+                // K as floats transposed (KT [hd][KB], 16 x 16 tiles in registers), V as floats [KB][hd]
+                for (size_t jg = 0; jg < KB; jg += 16)
+                    for (size_t d = 0; d < hd; d += 16) {
+                        __m512 r[16];
+                        for (size_t i = 0; i < 16; ++i)
+                            r[i] = jg + i < nk ? ld_bf16x16(kv + (b0 + jg + i) * kvr + kh * hd + d) : _mm512_setzero_ps();
+                        transpose16(r);
+                        for (size_t i = 0; i < 16; ++i) _mm512_store_ps(KT + (d + i) * KB + jg, r[i]);
+                    }
+                for (size_t j = 0; j < KB; ++j) {
+                    float* vd = Vf + j * hd;
+                    if (j < nk) {
+                        const uint16_t* vp = kv + (b0 + j) * kvr + kvh * hd + kh * hd;
+                        // the next block's K and V slices of this key slot: every line (the slices are
+                        // 4 KB apart, too far for the hardware prefetcher to run ahead)
+                        if (b0 + KB + j < k1) {
+                            const char* nkp = reinterpret_cast<const char*>(kv + (b0 + KB + j) * kvr + kh * hd);
+                            const char* nvp = reinterpret_cast<const char*>(kv + (b0 + KB + j) * kvr + kvh * hd + kh * hd);
+                            for (size_t l = 0; l < hd * 2; l += 64) {
+                                _mm_prefetch(nkp + l, _MM_HINT_T0);
+                                _mm_prefetch(nvp + l, _MM_HINT_T0);
+                            }
+                        }
+                        for (size_t d = 0; d < hd; d += 16) _mm512_store_ps(vd + d, ld_bf16x16(vp + d));
+                    } else {
+                        std::fill(vd, vd + hd, 0.f);
+                    }
+                }
+                // scores, 4 queries at a time: 8 independent accumulator chains share each K load
+                alignas(64) float sc[MAXQ][KB];
+                for (size_t q0 = 0; q0 < NQ; q0 += 4) {
+                    const size_t nq4 = std::min<size_t>(4, NQ - q0);
+                    __m512 s[4][2];
+                    for (int u = 0; u < 4; ++u) s[u][0] = s[u][1] = _mm512_setzero_ps();
+                    const float* qa = qs + q0 * hd;
+                    for (size_t d = 0; d < hd; ++d) {
+                        const __m512 k0v = _mm512_load_ps(KT + d * KB), k1v = _mm512_load_ps(KT + d * KB + 16);
+                        for (int u = 0; u < 4; ++u) {
+                            const __m512 qd = _mm512_set1_ps(qa[(u < static_cast<int>(nq4) ? u : 0) * hd + d]);
+                            s[u][0] = _mm512_fmadd_ps(qd, k0v, s[u][0]);
+                            s[u][1] = _mm512_fmadd_ps(qd, k1v, s[u][1]);
+                        }
+                    }
+                    for (size_t u = 0; u < nq4; ++u) {
+                        _mm512_store_ps(sc[q0 + u], s[u][0]);
+                        _mm512_store_ps(sc[q0 + u] + 16, s[u][1]);
+                    }
+                }
+                // the online softmax per query: p for this block, the old accumulator's factor
+                float corr[MAXQ];
+                size_t nvq[MAXQ];
+                for (size_t qi = 0; qi < NQ; ++qi) {
+                    const size_t t = qi / grp, lim = pos0 + t + 1;         // keys < lim
+                    const size_t nv = b0 >= lim ? 0 : std::min(nk, lim - b0);
+                    nvq[qi] = nv;
+                    float* pq = pr + qi * KB;
+                    if (!nv) { corr[qi] = 1.f; std::fill(pq, pq + KB, 0.f); continue; }
+                    const __mmask16 v0 = nv >= 16 ? __mmask16(0xFFFF) : __mmask16((1u << nv) - 1);
+                    const __mmask16 v1 = nv >= 32 ? __mmask16(0xFFFF) : nv > 16 ? __mmask16((1u << (nv - 16)) - 1) : __mmask16(0);
+                    const __m512 s0 = _mm512_mask_mov_ps(_mm512_set1_ps(-INFINITY), v0, _mm512_load_ps(sc[qi]));
+                    const __m512 s1 = _mm512_mask_mov_ps(_mm512_set1_ps(-INFINITY), v1, _mm512_load_ps(sc[qi] + 16));
+                    const float bm = std::max(_mm512_reduce_max_ps(s0), _mm512_reduce_max_ps(s1));
+                    const float mn = std::max(m[qi], bm);
+                    corr[qi] = m[qi] == -INFINITY ? 0.f : std::exp(m[qi] - mn);
+                    const __m512 p0 = _mm512_maskz_mov_ps(v0, exp512_neg(_mm512_sub_ps(s0, _mm512_set1_ps(mn))));
+                    const __m512 p1 = _mm512_maskz_mov_ps(v1, exp512_neg(_mm512_sub_ps(s1, _mm512_set1_ps(mn))));
+                    l[qi] = l[qi] * corr[qi] + (_mm512_reduce_add_ps(p0) + _mm512_reduce_add_ps(p1));
+                    m[qi] = mn;
+                    _mm512_store_ps(pq, p0);
+                    _mm512_store_ps(pq + 16, p1);
+                }
+                // sum p v, 2 queries x 64 dims at a time (8 chains sharing each V load); p is 0 past a
+                // query's valid keys, so the pair runs to the longer of the two
+                for (size_t q0 = 0; q0 < NQ; q0 += 2) {
+                    const size_t q1 = std::min(q0 + 1, NQ - 1), nv = std::max(nvq[q0], nvq[q1]);
+                    const bool two = q1 != q0;
+                    if (!nv) continue;
+                    float* a0p = acc + q0 * hd;
+                    float* a1p = acc + q1 * hd;
+                    const float* p0q = pr + q0 * KB;
+                    const float* p1q = pr + q1 * KB;
+                    const __m512 c0 = _mm512_set1_ps(corr[q0]), c1 = _mm512_set1_ps(corr[q1]);
+                    for (size_t d = 0; d < hd; d += 64) {
+                        __m512 x0 = _mm512_mul_ps(_mm512_load_ps(a0p + d), c0), x1 = _mm512_mul_ps(_mm512_load_ps(a0p + d + 16), c0);
+                        __m512 x2 = _mm512_mul_ps(_mm512_load_ps(a0p + d + 32), c0), x3 = _mm512_mul_ps(_mm512_load_ps(a0p + d + 48), c0);
+                        __m512 y0 = _mm512_mul_ps(_mm512_load_ps(a1p + d), c1), y1 = _mm512_mul_ps(_mm512_load_ps(a1p + d + 16), c1);
+                        __m512 y2 = _mm512_mul_ps(_mm512_load_ps(a1p + d + 32), c1), y3 = _mm512_mul_ps(_mm512_load_ps(a1p + d + 48), c1);
+                        for (size_t j = 0; j < nv; ++j) {
+                            const float* vr = Vf + j * hd + d;
+                            const __m512 v0 = _mm512_load_ps(vr), v1 = _mm512_load_ps(vr + 16), v2 = _mm512_load_ps(vr + 32), v3 = _mm512_load_ps(vr + 48);
+                            const __m512 pa = _mm512_set1_ps(p0q[j]), pb = _mm512_set1_ps(p1q[j]);
+                            x0 = _mm512_fmadd_ps(pa, v0, x0); x1 = _mm512_fmadd_ps(pa, v1, x1);
+                            x2 = _mm512_fmadd_ps(pa, v2, x2); x3 = _mm512_fmadd_ps(pa, v3, x3);
+                            y0 = _mm512_fmadd_ps(pb, v0, y0); y1 = _mm512_fmadd_ps(pb, v1, y1);
+                            y2 = _mm512_fmadd_ps(pb, v2, y2); y3 = _mm512_fmadd_ps(pb, v3, y3);
+                        }
+                        _mm512_store_ps(a0p + d, x0); _mm512_store_ps(a0p + d + 16, x1);
+                        _mm512_store_ps(a0p + d + 32, x2); _mm512_store_ps(a0p + d + 48, x3);
+                        if (two) {
+                            _mm512_store_ps(a1p + d, y0); _mm512_store_ps(a1p + d + 16, y1);
+                            _mm512_store_ps(a1p + d + 32, y2); _mm512_store_ps(a1p + d + 48, y3);
+                        }
+                    }
+                }
+            }
+            for (size_t qi = 0; qi < NQ; ++qi) {
+                const size_t t = qi / grp, h = kh * grp + qi % grp;
+                float* P = pp + ((t * nh + h) * NC + c) * PS;
+                P[0] = m[qi]; P[1] = l[qi];
+                std::copy(acc + qi * hd, acc + (qi + 1) * hd, P + 2);
+            }
+        }
+        // merge the chunks in order
+#pragma omp for schedule(static) collapse(2)
+        for (long long tt = 0; tt < static_cast<long long>(R); ++tt)
+            for (long long hh = 0; hh < static_cast<long long>(nh); ++hh) {
+                const size_t t = static_cast<size_t>(tt), h = static_cast<size_t>(hh);
+                const float* P0 = pp + (t * nh + h) * NC * PS;
+                const size_t nc = (pos0 + t + 1 + CK - 1) / CK;           // the row's chunks
+                float M = -INFINITY;
+                for (size_t c = 0; c < nc; ++c) M = std::max(M, P0[c * PS]);
+                float L = 0.f;
+                float* o = og + t * qw + h * hd;
+                std::fill(o, o + hd, 0.f);
+                for (size_t c = 0; c < nc; ++c) {
+                    const float* P = P0 + c * PS;
+                    if (P[0] == -INFINITY) continue;
+                    const float w = std::exp(P[0] - M);
+                    L += P[1] * w;
+                    for (size_t i = 0; i < hd; ++i) o[i] += P[2 + i] * w;
+                }
+                const float inv = 1.f / L;
+                for (size_t i = 0; i < hd; ++i) o[i] *= inv;
+            }
+    }
+}
+}  // namespace
+
+namespace {
 // Decode-sized causal attention (1-8 query rows: a decode step or an MTP verify pass), split over
 // (kv head, 64-key block) work items so a step's few queries still fill the threads ("flash
 // decoding"): each item keeps a partial softmax (max, sum, sum p v) per (row, head), merged in
@@ -1229,7 +1465,14 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
     // them (GQA), with an online softmax over 64-row key chunks.
     // OFLM_OPEN_ATTN_SPLIT=0 keeps the tiled path for decode-sized blocks too
     static const bool split = [] { const char* e = std::getenv("OFLM_OPEN_ATTN_SPLIT"); return !(e && *e == '0'); }();
-    if (split && R <= 8 && g.hd % 8 == 0 && grp <= 8)
+    // OFLM_OPEN_ATTN_FLASH (default on with AVX-512; 0 off): the flash-decoding kernel for these
+    // blocks; g_attn_flash (tests) overrides
+    static const bool flash_cpu = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq");
+    static const bool flash_env = [] { const char* e = std::getenv("OFLM_OPEN_ATTN_FLASH"); return !(e && *e == '0'); }();
+    const bool flash = flash_cpu && (g_attn_flash < 0 ? flash_env : g_attn_flash > 0) && R * grp <= 64 && g.hd % 64 == 0 && g.hd <= 512;
+    if (flash && split && R <= 8)
+        attention_decode_flash(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og);
+    else if (split && R <= 8 && g.hd % 8 == 0 && grp <= 8)
         attention_decode_split(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og);
     else
         attention_tiles(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og);
