@@ -85,6 +85,17 @@ Causal prefill, warm, int4, quiet CPU (2026-10-15):
 
 ### Decode (target 10 tok/s) -- met with MTP
 
+**2026-10-15, after the CPU kernels' full prefetch (a97351a): 15.5 tok/s mean at k = 3 (default
+now), 8 cores, greedy-exact.** Plain decode 146 -> 130 ms/token; verify 3 rows 180 -> 156 ms.
+
+| k | explain | code | list | math | mean tok/s |
+|---|---|---|---|---|---|
+| 2 | 13.3 | 16.7 | 13.6 | 13.2 (disturbed run) | 14.2 |
+| 3 | 13.7 | 18.0 | 13.7 | 16.7 | 15.5 |
+| 4 | 12.2 | 18.9 | 12.4 | 16.7 | 15.0 |
+
+The table below is from before that change.
+
 `OFLM_OPEN_CPU_DECODE=1 OFLM_OPEN_MTP=<HF model-00018-of-00018.safetensors>` (2026-10-15): greedy
 decode **exactly** equal to plain decode, k = 2 drafts a pass (`OFLM_OPEN_MTP_K`):
 

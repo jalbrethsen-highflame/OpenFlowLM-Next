@@ -342,9 +342,9 @@ std::vector<int> request(Core& core, const Args& a) {
     };
     bool mtp_done = false;
     if (core.mtp_on() && a.max_tokens > 1) {
-        // OFLM_OPEN_MTP: greedy decode with MTP drafts (OFLM_OPEN_MTP_K a pass, default 2)
+        // OFLM_OPEN_MTP: greedy decode with MTP drafts (OFLM_OPEN_MTP_K a pass, default 3: 4 prompts, 8 cores, mean 14.2 / 15.5 / 15.0 tok/s at k = 2 / 3 / 4)
         const char* ke = std::getenv("OFLM_OPEN_MTP_K");
-        out = core.generate_mtp(tok, a.max_tokens, ke ? std::atoi(ke) : 2);
+        out = core.generate_mtp(tok, a.max_tokens, ke ? std::atoi(ke) : 3);
         for (int t : out) std::printf("token %d\n", t);
         std::fflush(stdout);
         const double ms = std::chrono::duration<double, std::milli>(clock::now() - t1).count();
