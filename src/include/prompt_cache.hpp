@@ -174,9 +174,13 @@ public:
         // produced by other backends (cloud) to be appended without
         // invalidating the locally-built KV cache prefix.
         const size_t prefix_len = messages.size() - 2;
+        // a retry of the last request (the same messages, e.g. after a client timeout cancelled its
+        // reply) reuses it too: the engine resumes from its post-prompt state with nothing to prefill
+        const bool retry = !message_checksums_.empty() && matched == message_checksums_.size() &&
+                           new_checksums.size() == message_checksums_.size();
         const bool can_use_message =
-            message_checksums_.size() <= prefix_len &&
-            matched == message_checksums_.size();
+            retry || (message_checksums_.size() <= prefix_len &&
+                      matched == message_checksums_.size());
         const bool can_use_tools = tool_checksums_ == new_tool_checksums;
         info.tools_matched = can_use_tools;
 

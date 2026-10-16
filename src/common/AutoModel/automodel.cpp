@@ -225,6 +225,15 @@ bool AutoModel::_shared_insert(chat_meta_info_t& meta_info, std::vector<int>& to
         header_print("WARNING", "Max length reached, stopping prefilling...");
         return false;
     }
+    // Nothing new (a retry of the last request: the engine is back at its post-prompt state): no
+    // prefill and no logits to sample, so the first token is the one sampled from the same prompt
+    // last time.
+    if (tokens.empty() && insert_last_token_ != -1) {
+        meta_info.prefill_duration = 0;
+        meta_info.prompt_tokens = 0;
+        this->last_token = insert_last_token_;
+        return true;
+    }
     for (int token : tokens){
         this->token_history.push_back(token);
     }
@@ -249,6 +258,7 @@ bool AutoModel::_shared_insert(chat_meta_info_t& meta_info, std::vector<int>& to
     this->profiler_list[SAMPLING_TIME].start();
     this->last_token = this->sampler->sample(y);
     this->profiler_list[SAMPLING_TIME].stop(1);
+    insert_last_token_ = this->last_token;
     return true;
 }
 
@@ -512,6 +522,7 @@ StreamResult AutoModel::_shared_think_tool_calling_pasrsed(const std::string con
 /// \note The function will clear the context
 /// \note The function will reset the total tokens
 void AutoModel::clear_context() {
+    insert_last_token_ = -1;
     this->total_tokens = 0;
     this->last_token = -1;
     this->token_history.clear();

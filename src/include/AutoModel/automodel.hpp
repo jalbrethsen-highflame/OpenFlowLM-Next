@@ -157,6 +157,8 @@ protected:
 	bool enable_think = false;
 
 	bool default_enable_think_ = false;
+	/// the token sampled at the end of the last prompt insert (a retry with nothing new reuses it)
+	int insert_last_token_ = -1;
 	std::string default_user_system_prompt_;
 	nlohmann::json default_extra_context_;
 

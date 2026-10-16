@@ -1755,8 +1755,10 @@ void RestHandler::handle_openai_chat_completion(const json& request,
                 return;
             }
             if (meta_info.stop_reason == CANCEL_DETECTED) {
-                header_print("❌ ", "Generation Cancelled!");
-                this->prompt_cache.reset();
+                // The cached prompt stays: the engine's restore point is the state right after
+                // the prompt, which the cancelled reply did not touch, so a retry (the same
+                // messages) or the next turn resumes from it instead of re-reading the prompt.
+                header_print("❌ ", "Generation Cancelled! (the prompt stays cached)");
             }
                         
             ostream.finalize(meta_info);
@@ -1830,7 +1832,7 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             };
             if (meta_info.stop_reason == CANCEL_DETECTED) {
                 header_print("❌ ", "Generation Cancelled!");
-                this->prompt_cache.reset();
+                // the cached prompt stays (see the streamed path)
             }
             send_response(response);
         }
