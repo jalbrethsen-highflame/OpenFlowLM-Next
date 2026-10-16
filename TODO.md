@@ -13,6 +13,20 @@ with d3.
 - 512-row and 256-row GEMM tiers for short prompts, host stages on real rows only.
 - The tiled host attention, one host thread per physical core.
 
+## Status (2026-10-16)
+
+**Decode, 8 cores, greedy:** MTP k = 3 + prompt-lookup drafts, two-stage CPU head, chunked delta
+rule in verify passes. 4 short prompts: **16.9 tok/s** mean (14.2 / 19.9 / 15.1 / 18.4); a
+1114-token code-edit prompt: **22.1 tok/s** (16.8 without prompt lookup). Plain decode 130
+ms/token. Not bit-identical to plain decode any more (the chunked rule): 2 of 4 prompts differ,
+each at its closest top-2 call (gaps 0.049 / 0.012).
+
+**Prefill, warm, int4:** 256 / 512 / 768 / 1024 / 2048 / 4096 / 8192 tokens: 380 / 487 / 580 /
+596 / 705 / 719 / 737 tok/s. Later turns (pos0 > 0) use the NPU attention too (1500 tokens at
+1519: 4428 -> 3616 ms).
+
+The history below is kept for the numbers behind the defaults.
+
 ## Status (2026-10-15)
 
 Decode with `OFLM_OPEN_CPU_DECODE=1` (CLI pins 8 threads, 4 per CPU die): products on the CPU from
@@ -48,8 +62,10 @@ Tried and left off (switches kept):
 - [ ] Causal prefill with the new tiers: compare logits against the bfp16 set and the fp64
       replica (`open_kernels/model/replica_prompt.py --layers N`) at 128, 256, 512, 1K, 4K
       tokens.
-- [ ] A prompt that continues an earlier turn (`pos_ > 0`) on every tier: the tier choice uses
-      `pos_ + N`.
+- [x] A prompt that continues an earlier turn (`pos_ > 0`): CLI --ids-file2. Against host
+      attention with the same context: 1024-row tier KL 0.0025, 512-row KL 0.0016, 256-row KL
+      0.0022. (Comparing with turn-1 decode between the turns is unfair: a near-tie in the first
+      turn's tokens changes the second turn's context.)
 - [ ] int4 accuracy on generated text: NLL / KL against bf16 on a text set, and greedy tokens
       against the bfp16 set. int4 was measured only on d3 decisions.
 - [ ] Exact bf16 prompt weights: the model dir has no `bf16_map.json`, so the prompt GEMMs
@@ -74,14 +90,23 @@ Causal prefill, warm, int4, quiet CPU (2026-10-15):
       so one buffer per full layer serves every chunk. From 1024 keys (OFLM_OPEN_FA_CB_MIN) and
       512 (OFLM_OPEN_FA_CBS_MIN). NLL against host attention: 4K +0.0011 +- 0.0011 (the old
       dit_fa256 path +0.0010), 2K +0.0046 +- 0.0019. OFLM_OPEN_FA_CB=0 off.
-- [ ] Image switches: each switch between the attention image (fab) and the GEMM image (dit2)
-      costs ~2.5 ms (512 tokens: 32 switches, ~80 ms of 1.2 s). One combined image would remove
-      them.
+- [x] Causal attention after earlier turns: a q_off sentinel (fa.cb_qoff) patched per dispatch;
+      the K / V packs start at key 0 or the 64-key chunk the rows start in.
+- [x] The 256-row tier with fa.cbs attention padded to 512 queries (two chunks or more), and a
+      padding-aware tier choice up to 1024 tokens: 512 tokens 1122 -> 1051 ms, 768 1680 -> 1324.
+- [x] Host mixer: padding-only zeroing, AVX-512 alpha / beta, qkv read as bf16, an AVX-512 clone
+      of deltanet_block (its silu ran as AVX2 halves: phase 1 59 -> 33 ms at 512). Reading z as
+      bf16 inside the rule (strided from the C buffer) was 11x slower: z keeps its f32 copy.
+- [ ] Image switches: each switch between the attention image (fab) and the GEMM image costs
+      ~2.5 ms; with 256-row chunks, 32 attention calls cost ~160 ms of switches at 512 tokens.
+      One combined image would remove them.
+- [ ] The TAIL step (residual add, norm, pack) is ~50 ms at 512 tokens: fuse it.
 - [ ] Host / NPU overlap in a one-chunk prompt (<= 512 tokens): the chunk's GEMMs and host
       stages run in turn. Two 256-row chunks gain nothing on a quiet CPU (1196 vs 1199 ms at
       512: the second pass reads the weights again). A head-group split inside each layer
       (qkv by column groups, out by K halves) would overlap without reading the weights twice.
 - [ ] Re-tune OFLM_OPEN_SMALL_MAX (2048) now that the small tier has NPU attention.
+- [ ] 4K / 8K prefill re-measured after the host changes (719 / 737 tok/s are from before).
 
 ### Decode (target 10 tok/s) -- met with MTP
 
@@ -112,6 +137,19 @@ prompt's last 256 rows as context (OFLM_OPEN_MTP_CTX, 22-55 ms once). The delta 
 by token in verify passes and rollbacks: a T > 1 block sums differently (~2e-7) and flips
 near-ties over 64 layers.
 
+- [x] Prefetch in the CPU int4 / q8 kernels (every line of the next tile): 1 / 4 / 6 rows 9.9 /
+      11.8 / 16.8 -> 8.6 / 9.1 / 10.2 ms a GB; plain decode 146 -> 130 ms/token.
+- [x] Two-stage CPU head: int4 logits, the top 64 rescored with q8 (bit-identical values); 1108
+      rows checked, 0 argmax mismatches, worst int4 rank of the q8 argmax 2. Head 13 -> 8 ms.
+- [x] Chunked delta rule in verify passes (chunks of <= 4): mixer 32 -> 20 ms a 4-row pass.
+      OFLM_OPEN_VERIFY_CHUNK=0 restores token-by-token (bit-exact).
+- [x] Prompt-lookup drafts (OFLM_OPEN_PLD): taken when longer than k and their first token is
+      MTP's first draft. Code edit 16.8 -> 22.1 tok/s.
+- [x] dit2_dec C row-block major (read back 64 of 256 KB a chunk) and the read-back converted 8
+      at a time: post 5.2 -> 2.8 ms a 4-row pass.
+- [ ] Product overhead left: the CPU reads ~87 GB/s with the NPU share running (100 alone, 111
+      in the kernel benchmark); the NPU's ~80 us a dispatch is ~31 ms a pass. Reusing xrt::run
+      objects or packing A in parallel did not help (launch cost is the submit itself).
 - [ ] Adaptive k: k = 3 wins on code / math (12.9 / 12.4 tok/s) and loses on prose; pick k
       per pass from the recent acceptance.
 - [x] Tree drafts (top-2 first drafts): measured not worth it (2026-10-15). Teacher forced on the
