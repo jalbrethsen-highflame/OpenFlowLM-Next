@@ -62,6 +62,62 @@ void rope(float* x, size_t half, const double* inv_freq, double pos) {
     }
 }
 
+// The conv window a run of R tokens leaves behind: the last `pre` of the first R qkv rows,
+// with the carried state standing in where that runs before the block (a run shorter than the
+// window keeps what the shift would have left in front of it). In place over the state rows,
+// and every s < 0 read is at an index above the one being written, so the order is safe.
+void conv_state_tail(size_t pre, size_t nch, const float* qkv, size_t R, uint16_t* conv_state) {
+    for (size_t r = 0; r < pre; ++r) {
+        const long long s = static_cast<long long>(R) - static_cast<long long>(pre) + static_cast<long long>(r);
+        if (s < 0) {
+            std::copy(conv_state + (R + r) * nch, conv_state + (R + r + 1) * nch, conv_state + r * nch);
+        } else {
+            const float* row = qkv + static_cast<size_t>(s) * nch;
+            for (size_t j = 0; j < nch; ++j) conv_state[r * nch + j] = f32_to_bf16(row[j]);
+        }
+    }
+}
+
+// One token's gated delta-rule update of one head's S, in place. `o`, when given, also gets
+// S^T q for the same token (the decayed-and-updated S, as the layer's output reads it); a
+// rollback replays the state and passes nullptr for it and for `qq`. The two inner loops
+// compute `s` with the same statement so the replayed state is bit-identical to the forward
+// pass's -- block_host_test holds them to that.
+//
+// The decay is applied twice and stored once instead of stored twice: the first pass only needs
+// the decayed value to accumulate tv, and recomputing Si[j] * dc in the second pass is one
+// multiply against a whole 64 KB write of S per token per head. Same operands, same operation,
+// so the same float -- and the second pass then adds the same k delta to the same number the
+// first pass would have left there.
+void delta_token(size_t dim, float* Sh, const float* kk, const float* qq, const float* v, float dc, float bt,
+                 float* tv, float* delta, float* o) {
+    std::fill(tv, tv + dim, 0.f);
+    for (size_t i = 0; i < dim; ++i) {
+        const float* Si = Sh + i * dim;
+        const float ki = kk[i];
+        for (size_t j = 0; j < dim; ++j) tv[j] += ki * (Si[j] * dc);
+    }
+    for (size_t j = 0; j < dim; ++j) delta[j] = bt * (v[j] - tv[j]);
+    if (o) std::fill(o, o + dim, 0.f);
+    for (size_t i = 0; i < dim; ++i) {
+        float* Si = Sh + i * dim;
+        const float ki = kk[i];
+        if (o) {
+            const float qi = qq[i];
+            for (size_t j = 0; j < dim; ++j) {
+                const float s = Si[j] * dc + ki * delta[j];
+                Si[j] = s;
+                o[j] += s * qi;
+            }
+        } else {
+            for (size_t j = 0; j < dim; ++j) {
+                const float s = Si[j] * dc + ki * delta[j];
+                Si[j] = s;
+            }
+        }
+    }
+}
+
 }  // namespace
 
 __attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
@@ -563,7 +619,7 @@ __attribute__((target("avx512f"))) void dn_alpha_beta_512(size_t hid, size_t lan
 __attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const float* xn, const float* convw,
                     const float* Wa, const float* Wb, const float* A, const float* dtb, const float* nw,
-                    uint16_t* conv_state, float* S, float* og, double* phase_ms) {
+                    uint16_t* conv_state, float* S, float* og, double* phase_ms, DeltaTape* tape) {
     const auto tp0 = std::chrono::steady_clock::now();
     const size_t dim = g.head_dim, key_w = g.key_heads * dim, vw = g.value_heads * dim, nch = 2 * key_w + vw;
     auto dn_t = tp0;
@@ -584,6 +640,12 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
     if (g.reset)
         for (size_t t = 0; t < R; ++t)
             seg0[t] = g.reset[t] ? static_cast<long long>(t) : t ? seg0[t - 1] : LLONG_MIN;
+    if (tape) {
+        tape->t_real = R;
+        tape->conv_state0.assign(conv_state, conv_state + pre * nch);
+        const float* s0 = g.s_in ? g.s_in : S;   // the state the block starts from
+        tape->S0.assign(s0, s0 + g.value_heads * g.s_rows * dim);
+    }
     std::vector<float> carry(pre * nch);
     for (size_t r = 0; r < pre; ++r)
         for (size_t j = 0; j < nch; ++j) carry[r * nch + j] = bf16_to_f32(conv_state[r * nch + j]);
@@ -790,6 +852,12 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                 for (size_t j = 0; j < nch; ++j) conv_state[r * nch + j] = f32_to_bf16(row[j]);
             }
         }
+    }
+    if (tape) {   // phase 1's per-token outputs are all a rollback needs to replay phase 2
+        tape->key = Kk;
+        tape->val = V;
+        tape->decay = decay;
+        tape->beta = beta;
     }
 
     DN_MARK(3);
@@ -1171,6 +1239,33 @@ void attention_decode_split(size_t hd, size_t nh, size_t kvh, size_t R, size_t p
     }
 }
 }  // namespace
+
+void deltanet_rollback(const DeltaGeom& g, const DeltaTape& tape, size_t k, const float* qkv,
+                       uint16_t* conv_state, float* S) {
+    const size_t dim = g.head_dim, key_w = g.key_heads * dim, vw = g.value_heads * dim, nch = 2 * key_w + vw;
+    const size_t pre = g.taps - 1;
+    if (!g.key_heads || g.value_heads % g.key_heads || g.s_rows < dim || g.t_real != tape.t_real ||
+        k > tape.t_real || tape.conv_state0.size() != pre * nch ||
+        tape.S0.size() != g.value_heads * g.s_rows * dim || tape.key.size() != tape.t_real * key_w ||
+        tape.val.size() != tape.t_real * vw || tape.decay.size() != tape.t_real * g.value_heads ||
+        tape.beta.size() != tape.t_real * g.value_heads)
+        throw std::runtime_error("open_qwen36: deltanet_rollback: the tape does not match the geometry");
+    const size_t grp = g.value_heads / g.key_heads;
+
+    std::copy(tape.conv_state0.begin(), tape.conv_state0.end(), conv_state);
+    conv_state_tail(pre, nch, qkv, k, conv_state);
+    std::copy(tape.S0.begin(), tape.S0.end(), S);
+#pragma omp parallel for
+    for (long long hh = 0; hh < static_cast<long long>(g.value_heads); ++hh) {
+        const size_t h = static_cast<size_t>(hh);
+        std::vector<float> tv(dim), delta(dim);
+        float* Sh = S + h * g.s_rows * dim;
+        for (size_t t = 0; t < k; ++t)
+            delta_token(dim, Sh, tape.key.data() + t * key_w + (h / grp) * dim, nullptr,
+                        tape.val.data() + t * vw + h * dim, tape.decay[t * g.value_heads + h],
+                        tape.beta[t * g.value_heads + h], tv.data(), delta.data(), nullptr);
+    }
+}
 
 void attention_block(const AttnGeom& g, const float* q, const float* k, const float* v, const float* gate,
                      const float* qn, const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
