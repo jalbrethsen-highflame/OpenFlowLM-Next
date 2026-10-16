@@ -267,7 +267,8 @@ public:
     void set_block_logits_all(bool on) { block_logits_all_ = on; }
     const std::vector<std::vector<float>>& block_logits() const { return block_logits_; }
 
-    int position() const { return pos_; }
+    /// the next fed token's position (during an MTP pass, the rows not yet fed back do not count)
+    int position() const { return spec_.active && !spec_.rows.empty() ? static_cast<int>(spec_.P + spec_.served) : pos_; }
     /// Test hook: place the next token at `pos` without decoding up to it.
     void seek(int pos);
     size_t max_ctx() const { return cfg_.max_ctx; }
@@ -635,9 +636,16 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     static size_t head2_k();
     static bool head2_check();
     void cpu_rollback(size_t keep, size_t R);
-    struct VerifySave { std::vector<uint8_t> conv; std::vector<float> qkv, z, xn; };
+    /// a verify pass's linear-layer inputs (conv window before it, rows' qkv / z / xn) and, on the
+    /// fast path, each row's k / d / decay and which S buffers hold the state before the pass (pre),
+    /// after its first chunk (o1) and after its second (o2)
+    struct VerifySave {
+        std::vector<uint8_t> conv; std::vector<float> qkv, z, xn, k, d, a;
+        int pre = 0, o1 = 0, o2 = 0; size_t R = 0; bool fast = false;
+    };
     std::vector<std::vector<float>> s_alt_;   ///< per linear layer: the alternate DeltaNet S (verify passes)
-    std::vector<uint8_t> s_in_alt_;           ///< per layer: the current S is s_alt_[l]
+    std::vector<std::vector<float>> s_alt2_;  ///< per linear layer: a third S (the fast rollback's chunk 1)
+    std::vector<uint8_t> s_in_alt_;           ///< per layer: the current S: 0 state_[l], 1 s_alt_[l], 2 s_alt2_[l]
     std::vector<VerifySave> ver_;
     bool verify_save_ = false;
     std::vector<float> rows_x_, rows_logits_;
@@ -654,6 +662,27 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     std::vector<float> mtp_prompt_x_;   ///< the prompt's last rows (OFLM_OPEN_MTP_CTX) for MTP's context
     std::vector<int> mtp_prompt_ids_;
     std::vector<int> hist_ids_;
+    struct Spec {
+        bool active = false;
+        int k = 3;
+        size_t P = 0;                 ///< the current pass's first row's position
+        std::vector<int> rows;        ///< the pass's rows (the fed token, then the drafts); empty: none
+        size_t served = 0;            ///< rows whose logits went out
+        std::vector<float> ph;        ///< MTP's pending rows: main hiddens (normed) from slot pslot ...
+        std::vector<int> pt;          ///< ... and the tokens after them
+        size_t pslot = 0;
+        std::vector<float> dp;        ///< the pass's draft probabilities (the per-pass log)
+        bool took_pld = false;
+        double vms = 0;
+        size_t passes = 0, drafted = 0, accepted = 0, pld_passes = 0, fed = 0;
+        double t_draft = 0, t_verify = 0, t_roll = 0;
+        std::chrono::steady_clock::time_point t0;
+    } spec_;
+    int spec_k_ = 3;
+    void spec_begin();
+    void spec_settle(size_t keep);
+    void spec_norm(const float* x, float* out);
+    static FILE* spec_log();
     std::map<std::string, uint32_t> cb_patched_;   // fa.cb streams' current q_off   // every id fed since reset (prompt-lookup drafts)
     void load_mtp(const std::string& shard);
     /// R MTP rows (main hidden after the final norm, the next token) at slots pos0..: xn [R, hidden]
@@ -663,6 +692,20 @@ public:
     /// greedy decode with MTP drafts from the prompt's end: tok0 (the prompt's next token) first,
     /// n tokens in all; stats to stderr
     std::vector<int> generate_mtp(int tok0, int n, int k);
+    /// MTP decode for a caller that samples (the server): feed one token, logits() then holds the
+    /// next one's. A pass verifies the fed token and MTP's drafts; while the caller feeds the drafts
+    /// back their logits are ready, the first other token rolls the pass back and starts the next.
+    /// Exact for any sampler. Needs OFLM_OPEN_MTP and OFLM_OPEN_CPU_DECODE=1 (spec_ok).
+    bool spec_ok() const;
+    void spec_step(int tok);
+    /// the pass settled (rows past the fed ones rolled back) and S back in state_: before a prompt,
+    /// a reset, a snapshot or a plain step
+    void spec_flush();
+    void spec_set_k(int k) { spec_k_ = k; }
+    /// a short prompt through the CPU decode route, up to 8 rows a pass (OFLM_OPEN_CPU_DECODE=1)
+    void step_cpu_prompt(const std::vector<int>& ids);
+    bool cpu_decode_on() const { return cpu_decode_on_; }
+    void spec_report(size_t tokens, double ms) const;
 private:
     bool cpu_decode_ok() const;
     bool cpu_decode_on_ = false;

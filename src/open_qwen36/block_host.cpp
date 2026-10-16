@@ -287,6 +287,7 @@ void delta_rule_chunk4(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt,
                     for (size_t s2 = 0; s2 < t; ++s2) x = x - dn_bc(r[t][s2] * KK[t][s2]) * dn_ld(&dl[s2][j]);
                     dn_st(&dl[t][j], dn_bc(b[t]) * x);
                 }
+                if (g.sv_d) std::memcpy(g.sv_d + (t0 + t) * vw + h * D, dl[t], D * 4);
             }
             for (size_t t = 0; t < nt; ++t) {
                 for (size_t j = 0; j < D; j += 16) {
@@ -373,6 +374,53 @@ void delta_rule_chunk4(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt,
                     dn_st(&P[u][jq], p0[u]); dn_st(&P[u][jq + 16], p1[u]);
                     dn_st(&Qs[u][jq], q0[u]); dn_st(&Qs[u][jq + 16], q1[u]);
                 }
+            }
+        }
+    }
+}
+
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
+void delta_rollback(const DeltaGeom& g, size_t m, const float* S0, const float* kp, const float* dp, const float* ap, float* S) {
+    constexpr size_t D = 128, CN = 4;
+    if (g.head_dim != D || m < 1 || m >= CN) throw std::runtime_error("open_qwen36: delta_rollback: head_dim 128, 1..3 rows");
+    const size_t key_w = g.key_heads * D, vw = g.value_heads * D, nv = g.value_heads, grp = nv / g.key_heads;
+#pragma omp parallel for schedule(static)
+    for (long long hh = 0; hh < static_cast<long long>(nv); ++hh) {
+        const size_t h = static_cast<size_t>(hh), kh = h / grp;
+        float a[CN], G[CN], r[CN][CN];
+        for (size_t u = 0; u < m; ++u) {
+            a[u] = ap[u * nv + h];
+            G[u] = (u ? G[u - 1] : 1.f) * a[u];
+        }
+        for (size_t t = 0; t < m; ++t) {
+            r[t][t] = 1.f;
+            for (size_t s2 = t; s2-- > 0;) r[t][s2] = r[t][s2 + 1] * a[s2 + 1];
+        }
+        const size_t last = m - 1;
+        float cs[CN];
+        for (size_t s2 = 0; s2 < m; ++s2) cs[s2] = r[last][s2];
+        const dnv gl = dn_bc(G[last]);
+        const float* kt[CN];
+        for (size_t s2 = 0; s2 < m; ++s2) kt[s2] = kp + s2 * key_w + kh * D;
+        const float* Shi = S0 + h * g.s_rows * D;
+        float* Sh = S + h * g.s_rows * D;
+        for (size_t jq = 0; jq < D; jq += 32) {
+            dnv e0[CN], e1[CN];
+            for (size_t s2 = 0; s2 < CN; ++s2) {
+                e0[s2] = s2 < m ? dn_ld(dp + s2 * vw + h * D + jq) : dnv{};
+                e1[s2] = s2 < m ? dn_ld(dp + s2 * vw + h * D + jq + 16) : dnv{};
+            }
+            for (size_t i = 0; i < D; ++i) {
+                float* Si = Sh + i * D + jq;
+                const float* Sr = Shi + i * D + jq;
+                dnv s0 = gl * dn_ld(Sr), s1 = gl * dn_ld(Sr + 16);
+                for (size_t s2 = 0; s2 < m; ++s2) {
+                    const dnv w = dn_bc(cs[s2] * kt[s2][i]);
+                    s0 = s0 + w * e0[s2];
+                    s1 = s1 + w * e1[s2];
+                }
+                dn_st(Si, s0);
+                dn_st(Si + 16, s1);
             }
         }
     }
@@ -723,6 +771,8 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
         }
     }
     DN_MARK(2);
+    if (g.sv_k) std::memcpy(g.sv_k, Kk.data(), R * key_w * 4);
+    if (g.sv_a) std::memcpy(g.sv_a, decay.data(), R * g.value_heads * 4);
     // the window the next block starts from: the last `pre` rows, short blocks keeping what
     // the shift would have left in front of them
     const long long last0 = R ? seg0[R - 1] : LLONG_MIN;   // the sequence the next block continues
@@ -1528,20 +1578,12 @@ void b4_strip_vnni_rows(const uint8_t* st, const B4XQ* q, size_t t0, size_t t1, 
 using RowsFn = void (*)(const uint8_t*, const B4XQ*, size_t, size_t, float* const*);
 constexpr RowsFn kRowsFn[8] = {b4_strip_vnni_rows<1>, b4_strip_vnni_rows<2>, b4_strip_vnni_rows<3>, b4_strip_vnni_rows<4>,
                                b4_strip_vnni_rows<5>, b4_strip_vnni_rows<6>, b4_strip_vnni_rows<7>, b4_strip_vnni_rows<8>};
-}  // namespace
 
-void gemv_b4_rows(const uint8_t* B, size_t npad, size_t K, const float* x, size_t R, float* y, size_t ldy, size_t kt0, size_t kt1) {
-    if (R == 0) return;
-    if (R > 8) throw std::runtime_error("open_qwen36: gemv_b4_rows: at most 8 rows");
-    static const bool int8 = [] {
-        const char* e = std::getenv("OFLM_OPEN_DECODE_GEMV");
-        return !(e && std::string(e) == "bf16") && __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512bw");
-    }();
-    if (!int8 || R == 1) {
-        for (size_t r = 0; r < R; ++r) gemv_b4(B, npad, K, x + r * K, y + r * ldy, nullptr, kt0, kt1);
-        return;
-    }
-    if (npad % 128 || K % 64) throw std::runtime_error("open_qwen36: gemv_b4_rows: N % 128 or K % 64");
+// the strips (128 columns each, tile bytes `tb` a 64-K tile) of R rows over threads: x rounded to
+// int8 per 64-K tile, the work split along K too when there are fewer strips than ~4 a thread
+template <class Fn>
+void rows_driver(const uint8_t* B, size_t tb, size_t npad, size_t K, const float* x, size_t R, float* y, size_t ldy, size_t kt0,
+                 size_t kt1, Fn&& fn) {
     static thread_local std::vector<B4XQ> xq_tl;
     std::vector<B4XQ>& xq = xq_tl;
     xq.resize(8);
@@ -1553,7 +1595,6 @@ void gemv_b4_rows(const uint8_t* B, size_t npad, size_t K, const float* x, size_
     static thread_local std::vector<float> part_tl;
     std::vector<float>& part = part_tl;
     if (ks > 1) part.resize(ks * R * npad);
-    const RowsFn fn = kRowsFn[R - 1];
 #pragma omp parallel
     {
 #pragma omp for schedule(static) collapse(2)
@@ -1569,7 +1610,7 @@ void gemv_b4_rows(const uint8_t* B, size_t npad, size_t K, const float* x, size_
                 acc[r] = ks == 1 ? y + r * ldy + s * 128 : part.data() + (rr * R + r) * npad + s * 128;
                 std::fill(acc[r], acc[r] + 128, 0.f);
             }
-            fn(B + s * KT * kB4Tile, xq.data(), t0, t1, acc);
+            fn(B + s * KT * tb, xq.data(), t0, t1, acc);
         }
         if (ks > 1) {
 #pragma omp for schedule(static) collapse(2)
@@ -1581,6 +1622,22 @@ void gemv_b4_rows(const uint8_t* B, size_t npad, size_t K, const float* x, size_
                 }
         }
     }
+}
+}  // namespace
+
+void gemv_b4_rows(const uint8_t* B, size_t npad, size_t K, const float* x, size_t R, float* y, size_t ldy, size_t kt0, size_t kt1) {
+    if (R == 0) return;
+    if (R > 8) throw std::runtime_error("open_qwen36: gemv_b4_rows: at most 8 rows");
+    static const bool int8 = [] {
+        const char* e = std::getenv("OFLM_OPEN_DECODE_GEMV");
+        return !(e && std::string(e) == "bf16") && __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512bw");
+    }();
+    if (!int8 || R == 1) {
+        for (size_t r = 0; r < R; ++r) gemv_b4(B, npad, K, x + r * K, y + r * ldy, nullptr, kt0, kt1);
+        return;
+    }
+    if (npad % 128 || K % 64) throw std::runtime_error("open_qwen36: gemv_b4_rows: N % 128 or K % 64");
+    rows_driver(B, kB4Tile, npad, K, x, R, y, ldy, kt0, kt1, kRowsFn[R - 1]);
 }
 
 void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y, const std::function<void()>& side, size_t kt0,

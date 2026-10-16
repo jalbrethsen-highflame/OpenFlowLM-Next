@@ -13,6 +13,17 @@ with d3.
 - 512-row and 256-row GEMM tiers for short prompts, host stages on real rows only.
 - The tiled host attention, one host thread per physical core.
 
+## Status (2026-10-16, afternoon)
+
+**Decode, 8 cores, greedy (CLI):** as below plus the fast rollback: 4 short prompts **17.5 tok/s**
+mean (15.4 / 19.7 / 15.9 / 19.1), the code-edit prompt **23.4 tok/s**.
+
+**Server:** `oflm serve qwen3.8:27b` with `OFLM_OPEN_CPU_DECODE=1 OFLM_OPEN_MTP=<shard>` runs the
+same decode through Core::spec_step (any sampler, exact). 24-token chat prompt: first token 0.66 s,
+14.3 tok/s greedy, 12.5 at temperature 0.7; 1817-token code prompt: first token 3.3 s, 19.8 tok/s;
+a second turn reuses the first. Idle threads sleep (GOMP_SPINCOUNT). The launch line used:
+npu-scratch/serve/serve.sh (OFLM_MODEL_PATH holds models/<name>; it downloads what is missing).
+
 ## Status (2026-10-16)
 
 **Decode, 8 cores, greedy:** MTP k = 3 + prompt-lookup drafts, two-stage CPU head, chunked delta
@@ -155,20 +166,38 @@ near-ties over 64 layers.
       at a time: post 5.2 -> 2.8 ms a 4-row pass.
 - [x] NPU share re-swept after the prefetch fix (k = 3): 0.22 / 0.25 / 0.28 / 0.31 / 0.34 / 0.37
       -> 16.3 / 16.9 / 17.1 / 17.3 / 16.7 / 16.3 tok/s: default 0.31.
-- [ ] Draft + rollback ~17 ms a pass: a 32768-id draft vocabulary covers only 94 % of output
-      tokens (65536: 99 %); the MTP layer's products could split with the idle NPU (~2 ms).
+- [x] Fast rollback (OFLM_OPEN_FAST_ROLLBACK, default on): the verify pass saves each row's k,
+      delta and decay and keeps the state after its first chunk (a third S buffer); rollback is
+      then one pass over S (host::delta_rollback), or nothing at a chunk boundary. Same tokens as
+      the replay on all 5 prompts; 4-7 -> 1.4-3.4 ms a pass, 17.1 -> 17.5 tok/s mean.
+- [ ] Draft ~12 ms a pass: a 32768-id draft vocabulary covers only 94 % of output tokens (65536:
+      99 %); the MTP layer's products could split with the idle NPU (~2 ms).
 - [ ] Product overhead left: the CPU reads ~87 GB/s with the NPU share running (100 alone, 111
       in the kernel benchmark); the NPU's ~80 us a dispatch is ~31 ms a pass. Reusing xrt::run
       objects or packing A in parallel did not help (launch cost is the submit itself).
-- [ ] Adaptive k: k = 3 wins on code / math (12.9 / 12.4 tok/s) and loses on prose; pick k
-      per pass from the recent acceptance.
+- [x] Adaptive k (OFLM_OPEN_MTP_PCUM, off): up to k drafts while the product of their MTP
+      probabilities stays over the threshold. A k = 7 calibration (OFLM_OPEN_MTP_LOG, sim.py in
+      npu-scratch/ak) predicted +12 %; measured at k = 7: 0.5 -> 17.7 tok/s mean, 0.6 -> 17.5,
+      against 17.5 at k = 3 (edit 23.4 / 23.3 / 23.4): each extra row costs more than the model
+      assumed. k = 3 stays.
+- [x] More NPU DMA channels for dit2_dec: no -- the NPU's DDR read tops out at 52-54 GB/s in
+      aggregate (cab398a, designs/peak/bw.py), and dit2_dec already reads ~55.
+- [x] 3-bit weights (OFLM_OPEN_B3, a fake-quant in dit_encode_b4: 8 of the int4 levels, the
+      exponent searched): no layer type is free. All 64 layers, dNLL code / docs text (4096 tokens
+      each): FFN down +0.027 / +0.026 (top-1 agree 0.90 / 0.93), FFN up|gate +0.052 / +0.054,
+      attention +0.092 / +0.062, all +0.19 / +0.15. The po2-scaled int4 is already 11-12 % off
+      the q4_1 weights; a usable 3-bit needs finer scales (a new NPU format) and error-corrected
+      quantization from bf16. (npu-scratch/b3)
 - [x] Tree drafts (top-2 first drafts): measured not worth it (2026-10-15). Teacher forced on the
       4 prompts, tokens a pass 2.55 (chain k = 2, 3 rows) -> 2.63 (top-2, 4 rows) / 2.68 (both
       branches chained, 5 rows); verify 182 / 210 / 219 ms at 3 / 4 / 5 rows, so ~76 -> 86 / 90
       ms a token. The top-1 draft is right 77-96 % of the time; an extra row costs more than the
       second branch rescues. Revisit only if a verify row gets much cheaper. (tree_eval.py in
       npu-scratch/mtp.)
-- [ ] Sampling (temperature / top-p) with MTP: rejection sampling instead of greedy matching.
+- [x] Sampling with MTP: not needed as rejection sampling -- spec_step hands out each verified
+      row's logits as the sampler feeds the drafts back, and any other token rolls the pass back,
+      so the logits are the model's own whatever the sampler picks (temperature 0.7: 12.5 tok/s
+      against 14.3 greedy). The non-top logits come from the two-stage head's int4 stage.
 - [ ] The MTP weights from a converted model file rather than the HF shard.
 - [x] An NPU decode kernel without the 255 padding rows: designs/dit2/dec.py (gemm_dit.decode2),
       32 rows, B split over the 32 cores, ~80 us a dispatch then ~55 GB/s, verified against numpy
@@ -186,11 +215,18 @@ near-ties over 64 layers.
 - [ ] Per-dispatch cost: A flush 184 KB and C read-back 256 KB per dispatch (pre 3.2 ms + post
       1.4 ms a token); read back only the rows used.
 - [ ] The load peak (17.7 GB): the q8 head pool and its CPU repack are both alive for a moment.
-- [ ] Server use: the threads spin (ACTIVE) and are pinned; a server must let them sleep
-      between requests.
+- [x] Server use: oflm re-execs with the CLI's OMP pinning and GOMP_SPINCOUNT=20000000, so the
+      threads spin inside a request and sleep ~0.2 s after it.
 
 ### Integration
-- [ ] A chat / serve entry point for the causal model (`chat.py`, the oflm app).
+- [x] The oflm server (`oflm serve`): Engine::forward goes through Core::spec_step when MTP and CPU
+      decode are on; prompts of <= 24 tokens (OFLM_OPEN_CPU_PROMPT_MAX) run as 8-row CPU passes
+      (first token 3.0 -> 0.66 s at 24 tokens), longer ones on the NPU prompt route from 25.
+- [ ] The MTP weights packed beside model.q4nx and found there (no OFLM_OPEN_MTP), and the
+      model_list entry updated, so `oflm pull` gets everything.
+- [ ] CPU decode on by default for this model when the open kernels and the MTP weights are there.
+- [ ] Release: a PR upstream (origin, Atomic-Germ), then a release branch with the kernel set
+      staged (RELEASE.md). The notes must carry the GPU + NPU warning below.
 
 ### Operations
 - [ ] Never run NPU and GPU jobs together on the Strix Halo: AGESA 1.0.0.2 has a Data Fabric

@@ -59,7 +59,19 @@ struct DeltaGeom {
     /// qkv argument -- the prompt pipe's GEMM output, read without an f32 copy (same result)
     const uint16_t* qkv16 = nullptr;
     size_t ld16 = 0;
+    /// optional (an MTP verify pass, the chunk4 path): each row's normalised k [t_real, key_heads *
+    /// head_dim], delta d [t_real, value_heads * head_dim] and decay [t_real, value_heads] saved
+    /// here, so delta_rollback can rebuild the state after a prefix of the rows in one pass over S
+    float* sv_k = nullptr;
+    float* sv_d = nullptr;
+    float* sv_a = nullptr;
 };
+
+/// The state after the first m (1..3) rows of one chunk4 chunk, from the state before it (S0) and
+/// the rows' saved k, d, decay (DeltaGeom.sv_*): S = G_m S0 + sum_s r_{m-1,s} k_s d_s^T, the
+/// chunk kernel's update in the same order (so the same values as re-running the m rows). k, d,
+/// a point at the chunk's first row.
+void delta_rollback(const DeltaGeom& g, size_t m, const float* S0, const float* k, const float* d, const float* a, float* S);
 
 /// The linear-attention layer's middle over a block. qkv [T, 2*key_w + vw] and z [T, vw]
 /// are the fused projection's outputs (pre-activation), xn [T, hid] the normed layer

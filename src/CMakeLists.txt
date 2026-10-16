@@ -549,8 +549,12 @@ else()
     # plain line reader via the FASTFLOWLM_USE_READLINE guard) so the portable
     # tarball carries no readline/ncurses runtime dependency.
     if(NOT OFLM_PORTABLE_BUILD)
-        pkg_check_modules(readline REQUIRED IMPORTED_TARGET readline)
-        pkg_check_modules(ncurses REQUIRED IMPORTED_TARGET ncursesw)
+        # optional: without the readline headers the CLI uses its plain line reader
+        pkg_check_modules(readline IMPORTED_TARGET readline)
+        pkg_check_modules(ncurses IMPORTED_TARGET ncursesw)
+        if(NOT readline_FOUND OR NOT ncurses_FOUND)
+            message(STATUS "readline / ncursesw not found: the CLI uses its plain line reader")
+        endif()
     endif()
 endif()
 
@@ -805,7 +809,7 @@ if(NOT WIN32)
 
     # readline is only linked for non-portable builds (see the discovery block);
     # the CLI compiles a plain line-reader fallback when the macro is undefined.
-    if(NOT OFLM_PORTABLE_BUILD)
+    if(NOT OFLM_PORTABLE_BUILD AND readline_FOUND AND ncurses_FOUND)
         target_compile_definitions(oflm PUBLIC FASTFLOWLM_USE_READLINE=1)
         target_link_libraries(oflm PUBLIC PkgConfig::readline PkgConfig::ncurses)
     endif()

@@ -124,8 +124,14 @@ void Engine::ensure_alive() {
     poisoned_ = false;
 }
 
+// With OFLM_OPEN_MTP and OFLM_OPEN_CPU_DECODE=1 a token goes through Core::spec_step: MTP passes,
+// the drafts' logits handed out as the sampler feeds them back (exact for any sampler)
 buffer<bf16> Engine::forward(int id) {
-    return guarded([&] { core_->step(id, true); return logits_view(); });
+    return guarded([&] {
+        if (core_->spec_ok()) core_->spec_step(id);
+        else core_->step(id, true);
+        return logits_view();
+    });
 }
 
 void Engine::ensure_vit() {
@@ -171,6 +177,16 @@ buffer<bf16> Engine::prefill(std::vector<int>& ids, void* payload) {
             // A prompt that has had an image is on the (t, h, w) counter, and the
             // gemm-block route writes no position records - it would place these
             // tokens at the wrong positions, so stay sequential.
+            // CPU decode: a short prompt as rows on the CPU (8 a pass) rather than one step a token;
+            // above OFLM_OPEN_CPU_PROMPT_MAX (default 24, ~3 passes) the NPU prompt route is cheaper
+            if (core_->cpu_decode_on() && !core_->mrope_active()) {
+                static const size_t cpu_max = [] { const char* e = std::getenv("OFLM_OPEN_CPU_PROMPT_MAX"); return e ? std::strtoul(e, nullptr, 10) : 24ul; }();
+                if (ids.size() <= cpu_max) {
+                    core_->step_cpu_prompt(ids);
+                    return logits_view();
+                }
+                min_prompt = std::min(min_prompt, cpu_max + 1);
+            }
             if (gemm_block_on && ids.size() >= min_prompt && !core_->mrope_active()) {
                 // B(2) of .claude/plans/prefill-parity.md: on a MoE kernel set, run the
                 // whole prompt through each layer before the next, so the layer's expert
@@ -327,6 +343,7 @@ int Engine::get_current_context_length() { return core_->position(); }
 
 int Engine::checkpoint() {
     if (poisoned_) return 0;
+    core_->spec_flush();   // the snapshot holds the fed tokens only
     snapshot_ = core_->checkpoint();
     has_snapshot_ = true;
     return snapshot_.pos;

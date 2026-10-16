@@ -255,10 +255,16 @@ void dit_encode(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, c
 // a weight is mantissa (-8..7) x 2^(exponent - 133), the exponent the smallest that keeps the
 // column's 64 values within +-7, or one less when clipping to -8..7 there gives a lower squared
 // error. colmap as dit_encode.
+// b3 (OFLM_OPEN_B3, a 3-bit test): the mantissas limited to the 8 int4 levels in b3->lv, the
+// exponent the best of 4 by squared error; still stored as b4, so every route reads the same
+// values. err (when set): the squared error and the squared weights, summed.
+struct B3Code { int lv[8]; int8_t near[32]; int maxabs; };
 constexpr size_t kB4Tile = 4096 + 128;
-void dit_encode_b4(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, const int64_t* colmap = nullptr) {
+void dit_encode_b4(const float* W, size_t n, size_t k, size_t npad, uint8_t* out, const int64_t* colmap = nullptr,
+                   const B3Code* b3 = nullptr, double* err = nullptr) {
     const size_t KT = k / 64, NT = npad / 128;
-#pragma omp parallel for
+    double e_sum = 0, w_sum = 0;
+#pragma omp parallel for reduction(+ : e_sum, w_sum)
     for (long long tt = 0; tt < static_cast<long long>(NT * KT); ++tt) {
         const size_t nt = static_cast<size_t>(tt) / KT, kt = static_cast<size_t>(tt) % KT;
         uint8_t* tile = out + (nt * KT + kt) * kB4Tile;
@@ -269,10 +275,26 @@ void dit_encode_b4(const float* W, size_t n, size_t k, size_t npad, uint8_t* out
             const float* w = (src >= 0 && static_cast<size_t>(src) < n) ? W + static_cast<size_t>(src) * k + kt * 64 : nullptr;
             float amax = 0.f;
             if (w) for (size_t j = 0; j < 64; ++j) amax = std::max(amax, std::fabs(w[j]));
-            int e2 = amax > 0.f ? static_cast<int>(std::ceil(std::log2(static_cast<double>(amax) / 7.0))) : -133;
+            int e2 = amax > 0.f ? static_cast<int>(std::ceil(std::log2(static_cast<double>(amax) / (b3 ? b3->maxabs : 7.0)))) : -133;
             e2 = std::min(std::max(e2, -133), 122);
-            auto q = [](float x, double inv) { return std::min(7.0, std::max(-8.0, std::nearbyint(x * inv))); };
-            if (w && e2 > -133) {
+            auto q4 = [](float x, double inv) { return std::min(7.0, std::max(-8.0, std::nearbyint(x * inv))); };
+            // b3: the nearest level -- the half-integer intervals hold every boundary between integer levels
+            auto q3 = [b3](float x, double inv) {
+                const int hb = std::min(31, std::max(0, static_cast<int>(std::floor(x * inv * 2.0)) + 16));
+                return static_cast<double>(b3->near[hb]);
+            };
+            auto q = [&](float x, double inv) { return b3 ? q3(x, inv) : q4(x, inv); };
+            if (w && e2 > -133 && b3) {
+                double best = 1e300; int be = e2;
+                for (int d = -2; d <= 1; ++d) {
+                    const int e = std::min(std::max(e2 + d, -132), 122);
+                    const double inv = std::ldexp(1.0, -e), sc = std::ldexp(1.0, e);
+                    double er = 0;
+                    for (size_t j = 0; j < 64; ++j) { const double r = q(w[j], inv) * sc - static_cast<double>(w[j]); er += r * r; }
+                    if (er < best) { best = er; be = e; }
+                }
+                e2 = be;
+            } else if (w && e2 > -133) {
                 double err[2] = {0.0, 0.0};
                 for (int d = 0; d < 2; ++d) {
                     const double inv = std::ldexp(1.0, -(e2 - d)), s = std::ldexp(1.0, e2 - d);
@@ -287,13 +309,71 @@ void dit_encode_b4(const float* W, size_t n, size_t k, size_t npad, uint8_t* out
             const double inv = std::ldexp(1.0, -e2);
             const size_t pair = cl / 16, n2 = (cl / 8) % 2, g = cl % 8;
             for (size_t j = 0; j < 64; ++j) {
-                const int m = w ? static_cast<int>(q(w[j], inv)) : 0;
+                const int m = (w && e2 > -133) ? static_cast<int>(q(w[j], inv)) : 0;
+                if (err && w) { const double r = m * std::ldexp(1.0, e2) - static_cast<double>(w[j]); e_sum += r * r; w_sum += double(w[j]) * w[j]; }
                 const size_t kb = j / 8, t = j % 8;
                 const size_t i = (((pair * 8 + kb) * 2 + n2) * 64) + g * 8 + t;
                 tile[i / 2] |= static_cast<uint8_t>((m & 15) << ((i & 1) * 4));
             }
         }
     }
+    if (err) { err[0] += e_sum; err[1] += w_sum; }
+}
+
+// OFLM_OPEN_B3="<weight>:<l0>-<l1>;...": those weights ("*" every one) of layers l0..l1 as 3-bit (b3);
+// OFLM_OPEN_B3_CB: the 8 levels (default -8,-6,-4,-2,0,2,4,6: int3 at twice the scale);
+// OFLM_OPEN_B3_ERR=1: each weight's relative error logged
+const B3Code* b3_for(const std::string& name, int l) {
+    static const B3Code code = [] {
+        B3Code c{};
+        std::vector<int> v;
+        const char* e = std::getenv("OFLM_OPEN_B3_CB");
+        std::string str = e ? e : "-8,-6,-4,-2,0,2,4,6";
+        for (size_t a = 0; a < str.size();) {
+            size_t b = str.find(',', a);
+            if (b == std::string::npos) b = str.size();
+            v.push_back(std::stoi(str.substr(a, b - a)));
+            a = b + 1;
+        }
+        if (v.size() != 8) throw std::runtime_error("open_qwen36: OFLM_OPEN_B3_CB needs 8 levels");
+        std::sort(v.begin(), v.end());
+        c.maxabs = 0;
+        for (int i = 0; i < 8; ++i) {
+            if (v[i] < -8 || v[i] > 7) throw std::runtime_error("open_qwen36: OFLM_OPEN_B3_CB levels are -8..7");
+            c.lv[i] = v[i];
+            c.maxabs = std::max(c.maxabs, std::abs(v[i]));
+        }
+        for (int hb = 0; hb < 32; ++hb) {
+            const double t = (hb - 16) * 0.5 + 0.25;       // the half-interval's middle
+            int best = v[0];
+            for (int x : v) if (std::fabs(x - t) < std::fabs(best - t)) best = x;
+            c.near[hb] = static_cast<int8_t>(best);
+        }
+        return c;
+    }();
+    static const std::vector<std::tuple<std::string, int, int>> rules = [] {
+        std::vector<std::tuple<std::string, int, int>> r;
+        const char* e = std::getenv("OFLM_OPEN_B3");
+        if (!e) return r;
+        std::string str = e;
+        for (size_t a = 0; a < str.size();) {
+            size_t b = str.find(';', a);
+            if (b == std::string::npos) b = str.size();
+            const std::string it = str.substr(a, b - a);
+            const size_t c = it.find(':'), d = it.find('-', c);
+            if (c == std::string::npos || d == std::string::npos) throw std::runtime_error("open_qwen36: OFLM_OPEN_B3 rule " + it);
+            r.emplace_back(it.substr(0, c), std::stoi(it.substr(c + 1, d - c - 1)), std::stoi(it.substr(d + 1)));
+            a = b + 1;
+        }
+        return r;
+    }();
+    for (const auto& [w, l0, l1] : rules)
+        if ((w == "*" || w == name) && l >= l0 && l <= l1) return &code;
+    return nullptr;
+}
+bool b3_err_on() {
+    static const bool on = std::getenv("OFLM_OPEN_B3_ERR") != nullptr;
+    return on;
 }
 
 void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8_t* out,
@@ -1036,7 +1116,13 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                     if (dit_b4_) {
                         std::vector<float> Wq(n * k);
                         dit_decode_q4(host + off0, n, k, Wq.data());
-                        dit_encode_b4(Wq.data(), n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data());
+                        const B3Code* b3 = b3_for(name, l);
+                        double er[2] = {0, 0};
+                        dit_encode_b4(Wq.data(), n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data(), b3,
+                                      b3_err_on() ? er : nullptr);
+                        if (b3_err_on())
+                            log("b4 err: layer " + std::to_string(l) + " " + name + (b3 ? " b3" : " b4") + ": " +
+                                std::to_string(std::sqrt(er[0] / std::max(er[1], 1e-30))));
                     } else {
                         dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data(), dit_hs_);
                     }
@@ -1303,6 +1389,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
 }
 
 void Core::reset() {
+    spec_flush();
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: reset before load_weights");
     hist_ids_.clear();
     // The linear layers' state must start at zero. The KV rows need not: the window
@@ -2300,7 +2387,10 @@ void Core::arm_route_records() {
         }
 }
 
-void Core::step(int token, bool want_logits) { step_impl(token, nullptr, want_logits, nullptr); }
+void Core::step(int token, bool want_logits) {
+    spec_flush();   // a plain step after MTP passes: the pass settled first
+    step_impl(token, nullptr, want_logits, nullptr);
+}
 
 void Core::embedding_row(size_t token, float* out) const {
     file_->embed_row(w_->embed_tensor, token, w_->hidden, out);
@@ -2311,6 +2401,7 @@ void Core::embedding_row(size_t token, float* out) const {
 
 void Core::step_embed(const float* x, bool want_logits, const int64_t mpos[3],
                       const float* deepstack, int n_deepstack) {
+    spec_flush();
     if (!has_mrope()) throw std::runtime_error("open_qwen36: step_embed on a model without M-RoPE");
     if (n_deepstack > nl_)
         throw std::runtime_error("open_qwen36: " + std::to_string(n_deepstack) +
@@ -2977,7 +3068,7 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
     // rows' DeltaNet inputs, so cpu_rollback can keep a prefix
     const bool save = verify_save_ && R > 1;
     if (save && ver_.size() != static_cast<size_t>(nl_)) ver_.assign(nl_, {});
-    if (s_alt_.size() != static_cast<size_t>(nl_)) { s_alt_.assign(nl_, {}); s_in_alt_.assign(nl_, 0); }
+    if (s_alt_.size() != static_cast<size_t>(nl_)) { s_alt_.assign(nl_, {}); s_alt2_.assign(nl_, {}); s_in_alt_.assign(nl_, 0); }
     static thread_local std::vector<float> x, xn, y, og, h, ya, yb, yc, yd, mid;
     x.resize(R * hid); xn.resize(R * hid);
     for (size_t r = 0; r < R; ++r) file_->bf16_row(w_->embed_tensor, static_cast<size_t>(toks[r]), hid, x.data() + r * hid);
@@ -3002,13 +3093,26 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             // cpu_rollback without a copy; only the conv window (bytes [0, state_s_off)) is kept.
             const size_t sbytes = lt.state_bytes - gb.state_s_off;
             if (save && s_alt_[l].size() != sbytes / 4) s_alt_[l].assign(sbytes / 4, 0.f);
+            // the fast rollback (OFLM_OPEN_FAST_ROLLBACK, default on; chunks of 4, <= 8 rows): chunk 0
+            // writes o1, chunk 1 o2, so the states before the pass and after chunk 0 both stay
+            static const bool fast_rb = [] { const char* e = std::getenv("OFLM_OPEN_FAST_ROLLBACK"); return !(e && *e == '0'); }();
+            const bool fast = save && fast_rb && verify_chunk_on() && R <= 8 && gb.head_dim == 128;
+            if (fast && s_alt2_[l].size() != sbytes / 4) s_alt2_[l].assign(sbytes / 4, 0.f);
             float* s_bo = reinterpret_cast<float*>(sp + gb.state_s_off);
-            float* s_cur = s_in_alt_[l] ? s_alt_[l].data() : s_bo;
-            float* s_oth = s_in_alt_[l] ? s_bo : s_alt_[l].data();
+            float* sbuf[3] = {s_bo, s_alt_[l].empty() ? nullptr : s_alt_[l].data(), s_alt2_[l].empty() ? nullptr : s_alt2_[l].data()};
+            const int pre = s_in_alt_[l];
+            const int o1 = fast ? (pre + 1) % 3 : (pre == 0 ? 1 : 0), o2 = fast ? (pre + 2) % 3 : o1;
+            float* s_cur = sbuf[pre];
             if (save) {
                 VerifySave& v = ver_[l];
                 v.conv.assign(sp, sp + gb.state_s_off);
                 v.qkv = ya; v.z = yb; v.xn = xn;
+                v.pre = pre; v.o1 = o1; v.o2 = o2; v.R = R; v.fast = fast;
+                if (fast) {
+                    v.k.resize(R * gb.key_heads * gb.head_dim);
+                    v.d.resize(R * vw);
+                    v.a.resize(R * gb.value_heads);
+                }
             }
             host::DeltaGeom g;
             g.T = 1; g.hid = hid;
@@ -3025,12 +3129,23 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             for (size_t r = 0; r < R; r += step) {
                 host::DeltaGeom gr = g;
                 gr.T = gr.t_real = std::min(step, R - r);
-                if (save && r == 0) gr.s_in = s_cur;
+                float* dst = s_cur;
+                if (save) {
+                    // chunk 0: pre -> o1; fast, chunk 1: o1 -> o2; else in place in o1
+                    gr.s_in = r == 0 ? s_cur : (fast ? sbuf[o1] : nullptr);
+                    dst = (fast && r > 0) ? sbuf[o2] : sbuf[o1];
+                }
+                if (fast) {
+                    VerifySave& v = ver_[l];
+                    gr.sv_k = v.k.data() + r * gb.key_heads * gb.head_dim;
+                    gr.sv_d = v.d.data() + r * vw;
+                    gr.sv_a = v.a.data() + r * gb.value_heads;
+                }
                 host::deltanet_block(gr, ya.data() + r * nch, yb.data() + r * vw, xn.data() + r * hid, hc.convw.data(), hc.Wa.data(),
                                      hc.Wb.data(), hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
-                                     save ? s_oth : s_cur, og.data() + r * vw, ph);
+                                     dst, og.data() + r * vw, ph);
             }
-            if (save) s_in_alt_[l] ^= 1;
+            if (save) s_in_alt_[l] = static_cast<uint8_t>(fast && R > 4 ? o2 : o1);
         } else {
             const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
             ya.resize(R * qw); yb.resize(R * kvw); yc.resize(R * kvw); yd.resize(R * qw); og.resize(R * qw);
@@ -3211,143 +3326,235 @@ void Core::mtp_forward(const float* hn, const int* toks, size_t R, size_t pos0, 
     host::rmsnorm_rows(res.data(), R, hid, m.n_out.data(), 1e-6, xn);
 }
 
-std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
-    if (!mtp_.on || !cpu_head_) throw std::runtime_error("open_qwen36: generate_mtp without OFLM_OPEN_MTP / the CPU head");
-    if (k < 1 || k > 7) throw std::runtime_error("open_qwen36: MTP k must be 1..7");
-    const size_t hid = w_->hidden, V = w_->vocab, RV = w_->real_vocab ? w_->real_vocab : V;
-    auto argmax = [&](const float* lg) { return static_cast<int>(std::max_element(lg, lg + RV) - lg); };
-    auto fnorm = [&](const float* x, float* out) {
-        if (normw_f_.empty()) tail_logits(x);      // fills normw_f_
-        host::rmsnorm_rows(x, 1, hid, normw_f_.data(), types_[0]->gemm_block.eps, out);
-    };
-    const int saved_threads = omp_get_max_threads();
-    static const int dthreads = [] { const char* e = std::getenv("OFLM_OPEN_DECODE_THREADS"); return std::max(1, std::min(16, e ? std::atoi(e) : 8)); }();
-    static const size_t dvocab_env = [] { const char* e = std::getenv("OFLM_OPEN_MTP_DRAFT_VOCAB"); return e ? std::strtoul(e, nullptr, 10) : 65536ul; }();
-    const size_t dvocab = std::max<size_t>(128, std::min(RV, dvocab_env) / 128 * 128);
-    static const double tau = [] { const char* e = std::getenv("OFLM_OPEN_MTP_TAU"); return e ? std::atof(e) : 0.0; }();
-    std::vector<int> out{tok0};
-    size_t P = static_cast<size_t>(pos_);           // tok0's position
-    mtp_.kv0 = P - 1;
+// MTP decode one fed token at a time (spec_step): a pass verifies [tok, drafts] and keeps every
+// row's logits; while the caller feeds the drafts back, their rows' logits go out with no work.
+// The first other token ends the pass (the rows past the fed ones rolled back) and starts the next
+// from it, so the logits are the model's own for whatever the caller samples. generate_mtp is
+// greedy on top of it.
+namespace {
+int spec_dthreads() {
+    static const int t = [] { const char* e = std::getenv("OFLM_OPEN_DECODE_THREADS"); return std::max(1, std::min(16, e ? std::atoi(e) : 8)); }();
+    return t;
+}
+}  // namespace
+
+bool Core::spec_ok() const { return mtp_.on && cpu_head_ && cpu_decode_on_; }
+
+void Core::spec_norm(const float* x, float* out) {
+    if (normw_f_.empty()) tail_logits(x);      // fills normw_f_
+    host::rmsnorm_rows(x, 1, w_->hidden, normw_f_.data(), types_[0]->gemm_block.eps, out);
+}
+
+void Core::spec_begin() {
+    const size_t hid = w_->hidden;
+    Spec& sp = spec_;
+    sp = Spec{};
+    sp.k = spec_k_;
+    sp.P = static_cast<size_t>(pos_);           // the first fed token's position
+    mtp_.kv0 = sp.P - 1;
     // the prompt's context first (when step_prompt_pipe kept it): MTP rows (hidden at i, id at i + 1)
     // for the kept rows but the last, 8 at a time; their slots precede P - 1
     const size_t C = mtp_prompt_ids_.size();
-    if (C >= 2 && mtp_prompt_x_.size() == C * hid) {
+    if (C >= 2 && mtp_prompt_x_.size() == C * hid && sp.P >= C) {
         auto tc = std::chrono::steady_clock::now();
-        omp_set_num_threads(dthreads);
-        mtp_.kv0 = P - C;
+        const int saved = omp_get_max_threads();
+        omp_set_num_threads(spec_dthreads());
+        mtp_.kv0 = sp.P - C;
         std::vector<float> hn(8 * hid), tmp(8 * hid);
         for (size_t i0 = 0; i0 + 1 < C; i0 += 8) {
             const size_t R = std::min<size_t>(8, C - 1 - i0);
-            for (size_t r = 0; r < R; ++r) fnorm(mtp_prompt_x_.data() + (i0 + r) * hid, hn.data() + r * hid);
+            for (size_t r = 0; r < R; ++r) spec_norm(mtp_prompt_x_.data() + (i0 + r) * hid, hn.data() + r * hid);
             mtp_forward(hn.data(), mtp_prompt_ids_.data() + i0 + 1, R, i0, tmp.data());
         }
-        omp_set_num_threads(saved_threads);
-        std::fprintf(stderr, "MTP: %zu prompt rows of context in %.0f ms\n", C - 1, ms_since(tc));
+        omp_set_num_threads(saved);
+        if (cfg_.verbose) std::fprintf(stderr, "MTP: %zu prompt rows of context in %.0f ms\n", C - 1, ms_since(tc));
     }
-    // the pending MTP rows: (main hidden at position i, the token at i + 1), slots from pslot
-    std::vector<float> ph(hid), xn(hid), lg(V);
-    fnorm(last_x_.data(), ph.data());
-    std::vector<int> pt{tok0};
-    size_t pslot = P - 1;
-    int tok = tok0;
+    // the pending MTP rows: (main hidden at position i, the token at i + 1), slots from pslot; the
+    // first fed token completes the last one
+    sp.ph.assign(hid, 0.f);
+    spec_norm(last_x_.data(), sp.ph.data());
+    sp.pslot = sp.P - 1;
     verify_save_ = true;
-    size_t passes = 0, drafted = 0, accepted = 0, pld_passes = 0;
-    double t_draft = 0, t_verify = 0, t_roll = 0;
-    static const bool pld_on = [] { const char* e = std::getenv("OFLM_OPEN_PLD"); return !(e && *e == '0'); }();
-    static const size_t pld_len = [] { const char* e = std::getenv("OFLM_OPEN_PLD_LEN"); return std::max<size_t>(1, std::min<size_t>(7, e ? std::strtoul(e, nullptr, 10) : 7)); }();
-    auto t0 = std::chrono::steady_clock::now();
-    while (static_cast<int>(out.size()) < n) {
-        auto td = std::chrono::steady_clock::now();
-        omp_set_num_threads(dthreads);
-        std::vector<float> pxn(pt.size() * hid);
-        mtp_forward(ph.data(), pt.data(), pt.size(), pslot - mtp_.kv0, pxn.data());
-        std::copy(pxn.end() - static_cast<long>(hid), pxn.end(), xn.begin());
-        std::vector<int> d;
-        // OFLM_OPEN_PLD (default on): a prompt-lookup draft -- the tokens that followed the latest
-        // earlier match of the last 4..2 tokens (prompt + output) -- taken instead of the MTP chain
-        // when its first token is MTP's first draft too, up to OFLM_OPEN_PLD_LEN (7: 8 verify rows)
-        std::vector<int> pld;
-        if (pld_on) {
-            std::vector<int> h(hist_ids_);
-            h.insert(h.end(), out.begin(), out.end());
-            for (size_t m = 4; m >= 2 && pld.empty(); --m) {
-                if (h.size() <= m) continue;
-                const size_t e = h.size() - m;
-                for (size_t j = e; j-- > 0;) {
-                    if (!std::equal(h.begin() + static_cast<long>(e), h.end(), h.begin() + static_cast<long>(j))) continue;
-                    for (size_t t = j + m; t < e + m && pld.size() < pld_len && t < h.size(); ++t) pld.push_back(h[t]);
-                    break;
-                }
-            }
-        }
-        for (int j = 0; j < k; ++j) {
-            // mtp.norm applied: the head direct (its int4 copy when there: only the top token matters),
-            // over the first OFLM_OPEN_MTP_DRAFT_VOCAB ids (default 65536: 99 % of generated tokens on
-            // the test prompts) -- the int4 head's 128-row strips make that a prefix of it
-            size_t nv = RV;
-            if (!lm_b4_.empty()) {
-                host::gemv_b4(lm_b4_.data(), dvocab, hid, xn.data(), lg.data());
-                nv = dvocab;
-            } else {
-                host::lmhead_q8_cpu(lm_cpu_.data(), V, hid, xn.data(), lg.data());
-            }
-            const auto top = std::max_element(lg.begin(), lg.begin() + static_cast<long>(nv));
-            d.push_back(static_cast<int>(top - lg.begin()));
-            // only when longer than the chain: a short lookup draft saves nothing over k MTP drafts
-            if (j == 0 && pld.size() > static_cast<size_t>(k) && pld[0] == d[0]) { d = pld; ++pld_passes; break; }
-            // OFLM_OPEN_MTP_TAU: stop drafting once a draft's probability (softmax over the draft
-            // vocabulary) falls under tau -- a likely-rejected draft would cost a verify row
-            if (tau > 0 && j + 1 < k) {
-                double z = 0;
-                const float mx = *top;
-                for (size_t i = 0; i < nv; ++i) z += std::exp(static_cast<double>(lg[i] - mx));
-                if (1.0 / z < tau) break;
-            }
-            if (j + 1 < k) {
-                std::vector<float> nx(hid);
-                mtp_forward(xn.data(), &d.back(), 1, P + j - mtp_.kv0, nx.data());
-                xn = nx;
-            }
-        }
-        omp_set_num_threads(saved_threads);
-        t_draft += ms_since(td);
-        // verify [tok, d1 .. dk] at P .. P + k
-        auto tv = std::chrono::steady_clock::now();
-        std::vector<int> rows{tok};
-        rows.insert(rows.end(), d.begin(), d.end());
-        step_cpu_rows(rows.data(), rows.size(), true);
-        t_verify += ms_since(tv);
-        size_t a = 0;
-        while (a < d.size() && argmax(rows_logits_.data() + a * V) == d[a]) ++a;
-        const int b = argmax(rows_logits_.data() + a * V);
-        auto tr = std::chrono::steady_clock::now();
-        cpu_rollback(a + 1, rows.size());
-        t_roll += ms_since(tr);
-        ++passes; drafted += d.size(); accepted += a;
-        for (size_t i = 0; i < a && static_cast<int>(out.size()) < n; ++i) out.push_back(d[i]);
-        if (static_cast<int>(out.size()) < n) out.push_back(b);
-        // the next pending rows: the true hiddens of P .. P + a with the tokens that follow them
-        ph.assign((a + 1) * hid, 0.f);
-        pt.clear();
-        for (size_t i = 0; i <= a; ++i) {
-            fnorm(rows_x_.data() + i * hid, ph.data() + i * hid);
-            pt.push_back(i < a ? d[i] : b);
-        }
-        pslot = P;
-        P += a + 1;
-        tok = b;
+    sp.active = true;
+    sp.t0 = std::chrono::steady_clock::now();
+}
+
+// the current pass ends after its first `keep` rows: the rest rolled back, MTP's pending rows the
+// kept rows' hiddens with the tokens after them (the next fed token last)
+void Core::spec_settle(size_t keep) {
+    Spec& sp = spec_;
+    const size_t hid = w_->hidden, R = sp.rows.size();
+    auto tr = std::chrono::steady_clock::now();
+    cpu_rollback(keep, R);
+    const double rms_ = ms_since(tr);
+    sp.t_roll += rms_;
+    sp.accepted += keep - 1;
+    if (spec_log()) {
+        std::fprintf(spec_log(), "%zu %zu %d %.2f %.2f", R, keep - 1, sp.took_pld ? 1 : 0, sp.vms, rms_);
+        for (float p : sp.dp) std::fprintf(spec_log(), " %.4f", p);
+        std::fprintf(spec_log(), "\n");
     }
+    sp.ph.assign(keep * hid, 0.f);
+    sp.pt.clear();
+    for (size_t i = 0; i < keep; ++i) {
+        spec_norm(rows_x_.data() + i * hid, sp.ph.data() + i * hid);
+        if (i + 1 < keep) sp.pt.push_back(sp.rows[i + 1]);
+    }
+    last_x_.assign(rows_x_.begin() + static_cast<long>((keep - 1) * hid), rows_x_.begin() + static_cast<long>(keep * hid));
+    sp.pslot = sp.P;
+    sp.P += keep;
+    sp.rows.clear();
+    sp.served = 0;
+}
+
+FILE* Core::spec_log() {
+    // OFLM_OPEN_MTP_LOG=<file>: one line a pass -- rows, accepted, PLD, verify ms, rollback ms, the drafts' probabilities
+    static FILE* f = [] { const char* e = std::getenv("OFLM_OPEN_MTP_LOG"); return e ? std::fopen(e, "a") : nullptr; }();
+    return f;
+}
+
+void Core::spec_step(int tok) {
+    if (!spec_ok()) throw std::runtime_error("open_qwen36: spec_step without OFLM_OPEN_MTP / CPU decode / the CPU head");
+    const size_t hid = w_->hidden, V = w_->vocab, RV = w_->real_vocab ? w_->real_vocab : V;
+    // a pass holds up to 8 rows: near the context's end, plain steps
+    if (pos_ == 0 || static_cast<size_t>(pos_) + 9 > max_ctx()) {
+        spec_flush();
+        step(tok, true);
+        return;
+    }
+    if (!spec_.active) spec_begin();
+    Spec& sp = spec_;
+    ++sp.fed;
+    hist_ids_.push_back(tok);           // prompt + every fed id (prompt-lookup drafts)
+    if (!sp.rows.empty()) {
+        if (sp.served < sp.rows.size() && tok == sp.rows[sp.served]) {
+            // the caller fed the draft: its row's logits are ready
+            std::copy(rows_logits_.begin() + static_cast<long>(sp.served * V), rows_logits_.begin() + static_cast<long>((sp.served + 1) * V),
+                      logits_host_.begin());
+            ++sp.served;
+            return;
+        }
+        spec_settle(sp.served);
+    }
+    sp.pt.push_back(tok);
+    const int k = sp.k;
+    const int saved_threads = omp_get_max_threads();
+    static const size_t dvocab_env = [] { const char* e = std::getenv("OFLM_OPEN_MTP_DRAFT_VOCAB"); return e ? std::strtoul(e, nullptr, 10) : 65536ul; }();
+    const size_t dvocab = std::max<size_t>(128, std::min(RV, dvocab_env) / 128 * 128);
+    static const double tau = [] { const char* e = std::getenv("OFLM_OPEN_MTP_TAU"); return e ? std::atof(e) : 0.0; }();
+    // OFLM_OPEN_MTP_PCUM: adaptive k -- stop drafting once the product of the drafts' probabilities
+    // (softmax over the draft vocabulary) falls under it; k is then the most drafts a pass
+    static const double pcum_min = [] { const char* e = std::getenv("OFLM_OPEN_MTP_PCUM"); return e ? std::atof(e) : 0.0; }();
+    static const bool pld_on = [] { const char* e = std::getenv("OFLM_OPEN_PLD"); return !(e && *e == '0'); }();
+    // a lookup draft needs at least OFLM_OPEN_PLD_MIN tokens (default: k + 1 at a fixed k; 4 with
+    // OFLM_OPEN_MTP_PCUM, where k is only the most): a short one saves nothing over the MTP chain
+    static const size_t pld_min_env = [] { const char* e = std::getenv("OFLM_OPEN_PLD_MIN"); return e ? std::strtoul(e, nullptr, 10) : 0ul; }();
+    const size_t pld_min = pld_min_env ? pld_min_env : (pcum_min > 0 ? 4 : static_cast<size_t>(k) + 1);
+    static const size_t pld_len = [] { const char* e = std::getenv("OFLM_OPEN_PLD_LEN"); return std::max<size_t>(1, std::min<size_t>(7, e ? std::strtoul(e, nullptr, 10) : 7)); }();
+    const bool want_p = tau > 0 || pcum_min > 0 || spec_log();
+    std::vector<float> xn(hid), lg(V);
+    auto td = std::chrono::steady_clock::now();
+    omp_set_num_threads(spec_dthreads());
+    std::vector<float> pxn(sp.pt.size() * hid);
+    mtp_forward(sp.ph.data(), sp.pt.data(), sp.pt.size(), sp.pslot - mtp_.kv0, pxn.data());
+    std::copy(pxn.end() - static_cast<long>(hid), pxn.end(), xn.begin());
+    std::vector<int> d;
+    sp.dp.clear();
+    sp.took_pld = false;
+    double pcum = 1.0;
+    // OFLM_OPEN_PLD (default on): a prompt-lookup draft -- the tokens that followed the latest
+    // earlier match of the last 4..2 tokens (prompt + output) -- taken instead of the MTP chain
+    // when its first token is MTP's first draft too, up to OFLM_OPEN_PLD_LEN (7: 8 verify rows)
+    std::vector<int> pld;
+    if (pld_on) {
+        const std::vector<int>& h = hist_ids_;
+        for (size_t m = 4; m >= 2 && pld.empty(); --m) {
+            if (h.size() <= m) continue;
+            const size_t e = h.size() - m;
+            for (size_t j = e; j-- > 0;) {
+                if (!std::equal(h.begin() + static_cast<long>(e), h.end(), h.begin() + static_cast<long>(j))) continue;
+                for (size_t t = j + m; t < e + m && pld.size() < pld_len && t < h.size(); ++t) pld.push_back(h[t]);
+                break;
+            }
+        }
+    }
+    for (int j = 0; j < k; ++j) {
+        // mtp.norm applied: the head direct (its int4 copy when there: only the top token matters),
+        // over the first OFLM_OPEN_MTP_DRAFT_VOCAB ids (default 65536: 99 % of generated tokens on
+        // the test prompts) -- the int4 head's 128-row strips make that a prefix of it
+        size_t nv = RV;
+        if (!lm_b4_.empty()) {
+            host::gemv_b4(lm_b4_.data(), dvocab, hid, xn.data(), lg.data());
+            nv = dvocab;
+        } else {
+            host::lmhead_q8_cpu(lm_cpu_.data(), V, hid, xn.data(), lg.data());
+        }
+        const auto top = std::max_element(lg.begin(), lg.begin() + static_cast<long>(nv));
+        d.push_back(static_cast<int>(top - lg.begin()));
+        if (j == 0 && pld.size() >= pld_min && pld[0] == d[0]) { d = pld; ++sp.pld_passes; sp.took_pld = true; break; }
+        if (want_p) {
+            // softmax over the draft vocabulary; terms under e^-20 skipped
+            float z = 0;
+            const float mx = *top;
+            for (size_t i = 0; i < nv; ++i) {
+                const float t = lg[i] - mx;
+                if (t > -20.f) z += std::exp(t);
+            }
+            sp.dp.push_back(1.f / z);
+            pcum *= 1.0 / z;
+        }
+        // OFLM_OPEN_MTP_PCUM: a draft past the first only while the chance that all drafts so far
+        // hold (the product of their probabilities) stays over it -- each costs a verify row and a
+        // draft step (~12 ms) against ~55 ms a token, so ~0.25 breaks even
+        if (pcum_min > 0 && j > 0 && pcum < pcum_min) { d.pop_back(); sp.dp.pop_back(); break; }
+        // OFLM_OPEN_MTP_TAU: stop drafting once a draft's probability falls under tau
+        if (j + 1 < k && tau > 0 && sp.dp.back() < tau) break;
+        if (j + 1 < k) {
+            std::vector<float> nx(hid);
+            mtp_forward(xn.data(), &d.back(), 1, sp.P + j - mtp_.kv0, nx.data());
+            xn = nx;
+        }
+    }
+    omp_set_num_threads(saved_threads);
+    sp.t_draft += ms_since(td);
+    // verify [tok, d1 .. dk] at P .. P + k; row 0's logits out now, the others as they are fed
+    auto tv = std::chrono::steady_clock::now();
+    sp.rows.assign(1, tok);
+    sp.rows.insert(sp.rows.end(), d.begin(), d.end());
+    step_cpu_rows(sp.rows.data(), sp.rows.size(), true);
+    sp.vms = ms_since(tv);
+    sp.t_verify += sp.vms;
+    ++sp.passes;
+    sp.drafted += d.size();
+    std::copy(rows_logits_.begin(), rows_logits_.begin() + static_cast<long>(V), logits_host_.begin());
+    sp.served = 1;
+}
+
+void Core::spec_flush() {
+    if (!spec_.active) return;
+    Spec& sp = spec_;
+    // OFLM_OPEN_SPEC_REPORT=1: the stats of the decode since the last prompt (a server reply), fed
+    // tokens over the time from the first one; generate_mtp prints its own
+    static const bool report = std::getenv("OFLM_OPEN_SPEC_REPORT") != nullptr;
+    if (report && sp.fed > 1) spec_report(sp.fed, ms_since(sp.t0));
+    if (!sp.rows.empty()) spec_settle(sp.served);
     verify_save_ = false;
-    hist_ids_.insert(hist_ids_.end(), out.begin(), out.end() - 1);   // every output but the last was fed
-    if (pld_on) std::fprintf(stderr, "PLD: %zu of %zu passes took a prompt-lookup draft\n", pld_passes, passes);
     // every linear layer's current S back in state_[l] (prefill and the NPU route read it there)
     for (int l = 0; l < nl_ && static_cast<size_t>(l) < s_in_alt_.size(); ++l)
         if (s_in_alt_[l]) {
             const GemmBlockProgram& gb = types_[l]->gemm_block;
-            host::par_copy(state_[l].map<uint8_t*>() + gb.state_s_off, s_alt_[l].data(), s_alt_[l].size() * 4);
+            const std::vector<float>& src = s_in_alt_[l] == 1 ? s_alt_[l] : s_alt2_[l];
+            host::par_copy(state_[l].map<uint8_t*>() + gb.state_s_off, src.data(), src.size() * 4);
             s_in_alt_[l] = 0;
         }
-    const double ms = ms_since(t0);
+    sp.active = false;
+}
+
+void Core::spec_report(size_t tokens, double ms) const {
+    const Spec& sp = spec_;
+    if (!sp.passes) return;
+    static const bool pld_on = [] { const char* e = std::getenv("OFLM_OPEN_PLD"); return !(e && *e == '0'); }();
+    if (pld_on) std::fprintf(stderr, "PLD: %zu of %zu passes took a prompt-lookup draft\n", sp.pld_passes, sp.passes);
     if (head2_on()) {
         const host::HeadTwoStats& h = host::g_head2;
         std::fprintf(stderr, "head2: %zu calls, %zu rows, %.1f groups a call + %.2f extra; checked %zu rows, %zu argmax mismatches, "
@@ -3356,8 +3563,50 @@ std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
     }
     std::fprintf(stderr, "MTP k=%d: %zu tokens in %zu passes (%.2f a pass), drafts accepted %zu / %zu (%.1f %%); %.1f ms/token (%.2f tok/s) | "
                          "a pass: draft %.1f verify %.1f rollback %.1f ms\n",
-                 k, out.size() - 1, passes, (out.size() - 1) / double(passes), accepted, drafted, 100.0 * accepted / std::max<size_t>(1, drafted),
-                 ms / (out.size() - 1), 1000.0 * (out.size() - 1) / ms, t_draft / passes, t_verify / passes, t_roll / passes);
+                 sp.k, tokens, sp.passes, tokens / double(sp.passes), sp.accepted, sp.drafted, 100.0 * sp.accepted / std::max<size_t>(1, sp.drafted),
+                 ms / tokens, 1000.0 * tokens / ms, sp.t_draft / sp.passes, sp.t_verify / sp.passes, sp.t_roll / sp.passes);
+}
+
+// A short prompt on the CPU decode route: chunks of up to 8 rows through step_cpu_rows (the verify
+// pass's path), the logits for the last row only. ~200 ms a chunk against ~130 ms a token one at a
+// time, and against the NPU prompt route's fixed cost (a 256-row block) for a handful of tokens.
+void Core::step_cpu_prompt(const std::vector<int>& ids) {
+    spec_flush();
+    if (ids.empty()) return;
+    if (!cpu_decode_on_) throw std::runtime_error("open_qwen36: step_cpu_prompt without OFLM_OPEN_CPU_DECODE=1");
+    const size_t n = ids.size(), hid = w_->hidden, chunks = (n + 7) / 8;
+    std::vector<float> xs;
+    xs.reserve(n * hid);
+    for (size_t c = 0, i = 0; c < chunks; ++c) {
+        const size_t r = (n - i) / (chunks - c);     // even chunks: no 1-row tail after a full one
+        step_cpu_rows(ids.data() + i, r, c + 1 == chunks);
+        xs.insert(xs.end(), rows_x_.begin(), rows_x_.end());
+        i += r;
+    }
+    hist_ids_.insert(hist_ids_.end(), ids.begin(), ids.end());   // prompt-lookup drafts
+    // MTP's prompt context: these rows (spec_begin reads them before the first draft)
+    mtp_prompt_x_ = std::move(xs);
+    mtp_prompt_ids_ = ids;
+}
+
+std::vector<int> Core::generate_mtp(int tok0, int n, int k) {
+    if (!spec_ok()) throw std::runtime_error("open_qwen36: generate_mtp without OFLM_OPEN_MTP / CPU decode / the CPU head");
+    if (k < 1 || k > 7) throw std::runtime_error("open_qwen36: MTP k must be 1..7");
+    const size_t RV = w_->real_vocab ? w_->real_vocab : w_->vocab;
+    spec_flush();
+    spec_k_ = k;
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<int> out{tok0};
+    spec_step(tok0);
+    while (static_cast<int>(out.size()) < n) {
+        const int b = static_cast<int>(std::max_element(logits_host_.begin(), logits_host_.begin() + static_cast<long>(RV)) - logits_host_.begin());
+        out.push_back(b);
+        if (static_cast<int>(out.size()) < n) spec_step(b);
+    }
+    // the stats before the flush's settle, which adds the last pass's rollback
+    const double ms = ms_since(t0);
+    spec_report(out.size() - 1, ms);
+    spec_flush();
     return out;
 }
 
@@ -3401,8 +3650,34 @@ void Core::cpu_rollback(size_t keep, size_t R) {
         // the conv window back; S recomputed from the pre-pass state (the other buffer) into the current
         std::memcpy(sp, v.conv.data(), v.conv.size());
         float* s_bo = reinterpret_cast<float*>(sp + gb.state_s_off);
-        float* s_cur = s_in_alt_[l] ? s_alt_[l].data() : s_bo;
-        const float* s_pre = s_in_alt_[l] ? s_bo : s_alt_[l].data();
+        float* sbuf[3] = {s_bo, s_alt_[l].empty() ? nullptr : s_alt_[l].data(), s_alt2_[l].empty() ? nullptr : s_alt2_[l].data()};
+        const size_t nchn = gb.qkv_dim, pre_rows = gb.conv_kernel - 1;
+        if (v.fast && keep && v.R == R) {
+            // the window: the last conv_kernel - 1 rows of [window before the pass; the kept rows]
+            uint16_t* cw = reinterpret_cast<uint16_t*>(sp);
+            const uint16_t* old = reinterpret_cast<const uint16_t*>(v.conv.data());
+            for (size_t r = 0; r < pre_rows; ++r) {
+                const long long sr = static_cast<long long>(keep) - static_cast<long long>(pre_rows) + static_cast<long long>(r);
+                if (sr < 0) std::copy(old + (keep + r) * nchn, old + (keep + r + 1) * nchn, cw + r * nchn);
+                else for (size_t j = 0; j < nchn; ++j) cw[r * nchn + j] = f32_to_bf16(v.qkv[static_cast<size_t>(sr) * nchn + j]);
+            }
+            // S: a whole chunk kept is already a buffer (o1, o2); else the chunk's prefix from the
+            // state before it, written to that chunk's own (now unused) output buffer
+            const size_t c = (keep - 1) / 4, m = keep - 4 * c;
+            const int base = c == 0 ? v.pre : v.o1, out = c == 0 ? v.o1 : v.o2;
+            if (m < 4) {
+                host::DeltaGeom g;
+                g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim; g.s_rows = gb.s_rows;
+                const size_t kw = gb.key_heads * gb.head_dim, vw2 = gb.value_heads * gb.head_dim;
+                host::delta_rollback(g, m, sbuf[base], v.k.data() + 4 * c * kw, v.d.data() + 4 * c * vw2,
+                                     v.a.data() + 4 * c * gb.value_heads, sbuf[out]);
+            }
+            s_in_alt_[l] = static_cast<uint8_t>(out);
+            continue;
+        }
+        float* s_cur = sbuf[v.o1];
+        const float* s_pre = sbuf[v.pre];
+        s_in_alt_[l] = static_cast<uint8_t>(v.o1);
         if (!keep) {
             std::memcpy(s_cur, s_pre, s_alt_[l].size() * 4);
             continue;
@@ -4048,6 +4323,7 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
 }
 
 void Core::step_gemm_block(const std::vector<int>& ids, size_t t_real, bool want_logits) {
+    spec_flush();
     apply_thread_budget();
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: step_gemm_block before load_weights");
     const size_t T = ids.size();
@@ -4188,6 +4464,7 @@ void Core::step_block_moe(const std::vector<int>& ids, size_t t_real, bool want_
 // expert), and a token's expert output does not depend on which other tokens share its
 // slot, so the result is bit-for-bit the block-major one.
 void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
+    spec_flush();
     apply_thread_budget();
     hist_ids_.insert(hist_ids_.end(), ids.begin(), ids.end());   // generate_mtp's prompt-lookup drafts
     if (pipe_ok()) {
@@ -6023,6 +6300,7 @@ Snapshot Core::checkpoint() const {
 }
 
 void Core::restore(const Snapshot& s) {
+    spec_flush();
     size_t il = 0, ia = 0;
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];

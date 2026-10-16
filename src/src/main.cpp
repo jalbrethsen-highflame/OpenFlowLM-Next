@@ -533,6 +533,20 @@ int main(int argc, char* argv[]) {
     // XRT backend: preload bundled XRT libraries from the executable directory.
     preload_bundled_libraries();
 #endif
+#if defined(__linux__) && defined(OFLM_USE_OPEN_QWEN36)
+    // OFLM_OPEN_CPU_DECODE=1 (the open engine's CPU decode): one thread per core, spread over both
+    // CPU dies, spinning between a step's short parallel regions but asleep ~0.2 s after the last
+    // (GOMP_SPINCOUNT), so an idle server holds no cores. libgomp reads these only at start: set
+    // them and start again once (OFLM_OPEN_OMP_REEXEC marks the second start).
+    if (const char* cd = std::getenv("OFLM_OPEN_CPU_DECODE"); cd && std::string(cd) == "1" && !std::getenv("OFLM_OPEN_OMP_REEXEC")) {
+        setenv("OFLM_OPEN_OMP_REEXEC", "1", 1);
+        bool changed = false;
+        for (const auto& [k, v] : {std::pair<const char*, const char*>{"OMP_PROC_BIND", "spread"}, {"OMP_PLACES", "cores"},
+                                   {"OMP_WAIT_POLICY", "ACTIVE"}, {"GOMP_SPINCOUNT", "20000000"}})
+            if (!std::getenv(k)) { setenv(k, v, 1); changed = true; }
+        if (changed) execv("/proc/self/exe", argv);   // on failure, carry on unpinned
+    }
+#endif
 
     // `add` owns a richer, repository-oriented option set than the runtime
     // commands. Hand its arguments through unchanged before the common Boost
