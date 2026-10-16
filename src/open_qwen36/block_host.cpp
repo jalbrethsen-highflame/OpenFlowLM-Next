@@ -471,25 +471,53 @@ void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, 
     }
 }
 
-#ifdef DN_PROFILE
-double g_dn_prof[6] = {0, 0, 0, 0, 0, 0};   // setup, phase 1, phase 1b, window, rule (us, summed)
+// deltanet_block's phases (us, summed): setup, phase 1 (conv, silu, q / k norm), phase 1b
+// (alpha / beta), window; read by the prompt pipe's OFLM_OPEN_MID_PROF
+double g_dn_prof[6] = {0, 0, 0, 0, 0, 0};
 #define DN_MARK(i) do { auto _n = std::chrono::steady_clock::now(); g_dn_prof[i] += std::chrono::duration<double, std::micro>(_n - dn_t).count(); dn_t = _n; } while (0)
-#else
-#define DN_MARK(i) do {} while (0)
-#endif
+// alpha / beta for a prompt block: decay = exp(A softplus(xn Wa + dtb)), beta = sigmoid(xn Wb), 16
+// tokens x 16 lanes of accumulators in zmm (FMA) a pass. OFLM_OPEN_AB_AVX2=1: the AVX2 path (mul
+// then add, the earlier rounding).
+__attribute__((target("avx512f"))) void dn_alpha_beta_512(size_t hid, size_t lanes, size_t nv, const float* xn,
+                                                          const float* Wa, const float* Wb, const float* A,
+                                                          const float* dtb, size_t R, float* decay, float* beta) {
+    constexpr size_t TB = 16;
+    const size_t nlc = (lanes + 15) / 16;
+#pragma omp parallel for schedule(dynamic, 1) collapse(2)
+    for (long long tb = 0; tb < static_cast<long long>((R + TB - 1) / TB); ++tb)
+        for (long long lc = 0; lc < static_cast<long long>(nlc); ++lc) {
+            const size_t t0 = static_cast<size_t>(tb) * TB, nt = std::min(TB, R - t0), h0 = static_cast<size_t>(lc) * 16;
+            const __mmask16 m = h0 + 16 <= lanes ? __mmask16(0xFFFF) : __mmask16((1u << (lanes - h0)) - 1);
+            alignas(64) float al[TB][16], be[TB][16];
+            for (int pass = 0; pass < 2; ++pass) {
+                const float* W = pass ? Wb : Wa;
+                __m512 acc[TB];
+                for (size_t u = 0; u < TB; ++u) acc[u] = _mm512_setzero_ps();
+                for (size_t i = 0; i < hid; ++i) {
+                    const __m512 w = _mm512_maskz_loadu_ps(m, W + i * lanes + h0);
+                    for (size_t u = 0; u < TB; ++u)
+                        acc[u] = _mm512_fmadd_ps(_mm512_set1_ps(u < nt ? xn[(t0 + u) * hid + i] : 0.f), w, acc[u]);
+                }
+                for (size_t u = 0; u < TB; ++u) _mm512_store_ps(pass ? be[u] : al[u], acc[u]);
+            }
+            for (size_t u = 0; u < nt; ++u)
+                for (size_t h = h0; h < std::min(h0 + 16, nv); ++h) {
+                    decay[(t0 + u) * nv + h] = std::exp(A[h] * softplus(al[u][h - h0] + dtb[h]));
+                    beta[(t0 + u) * nv + h] = sigmoid(be[u][h - h0]);
+                }
+        }
+}
 void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const float* xn, const float* convw,
                     const float* Wa, const float* Wb, const float* A, const float* dtb, const float* nw,
                     uint16_t* conv_state, float* S, float* og, double* phase_ms) {
     const auto tp0 = std::chrono::steady_clock::now();
     const size_t dim = g.head_dim, key_w = g.key_heads * dim, vw = g.value_heads * dim, nch = 2 * key_w + vw;
-#ifdef DN_PROFILE
     auto dn_t = tp0;
-#endif
     if (g.value_heads % g.key_heads || g.t_real > g.T || g.s_rows < dim || g.lanes < g.value_heads)
         throw std::runtime_error("open_qwen36: deltanet_block: inconsistent geometry");
     const size_t grp = g.value_heads / g.key_heads, R = g.t_real;
     const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(dim));
-    std::fill(og, og + g.T * vw, 0.f);
+    std::fill(og + g.t_real * vw, og + g.T * vw, 0.f);   // the real rows: every head written by phase 2
 
     // ---- phase 1, per token: the conv (state rows carried), q / k normalised, alpha / beta
     // The conv is a fixed taps-wide window over the bf16-rounded rows, not a recurrence, so
@@ -568,6 +596,7 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
     // A decode-sized block (R <= 8, one token block): split over the hidden dim instead, each
     // thread a slice of i for every lane, then the partial sums added -- one thread alone read
     // all of Wa / Wb (2.6 MB at the 27B's width) for 0.5 ms a layer.
+    static const bool dn_ab512 = __builtin_cpu_supports("avx512f") && !std::getenv("OFLM_OPEN_AB_AVX2");
     if (R <= 8 && omp_get_max_threads() > 1) {
         const size_t lanes = g.lanes, hid = g.hid, nv = g.value_heads;
         const int nt = omp_get_max_threads();
@@ -618,6 +647,9 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                 decay[u * nv + h] = std::exp(A[h] * softplus(sa + dtb[h]));
                 beta[u * nv + h] = sigmoid(sb);
             }
+    } else if (dn_ab512) {
+        // 16 tokens x 16 lanes a pass in zmm (FMA): each Wa / Wb row read once for 16 tokens
+        dn_alpha_beta_512(g.hid, g.lanes, g.value_heads, xn, Wa, Wb, A, dtb, R, decay.data(), beta.data());
     } else {
         const size_t lanes = g.lanes, hid = g.hid, nv = g.value_heads;
         constexpr size_t TB = 8;

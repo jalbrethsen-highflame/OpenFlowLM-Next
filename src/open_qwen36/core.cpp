@@ -193,6 +193,15 @@ void fab_pack_v(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t 
     }
 }
 
+// n bf16 -> f32 (exact: the bits shifted up), 16 a step
+__attribute__((target("avx512f"))) void bf16_row_f32(const uint16_t* src, size_t n, float* dst) {
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16)
+        _mm512_storeu_ps(dst + i, _mm512_castsi512_ps(_mm512_slli_epi32(
+                                      _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i))), 16)));
+    for (; i < n; ++i) dst[i] = bf16_to_f32(src[i]);
+}
+
 void dit_decode_q4(const uint8_t* pool, size_t n, size_t k, float* W) {
     const size_t per_band = 2 * k / 256, nch = n * k / (32 * 256);
 #pragma omp parallel for
@@ -4439,6 +4448,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         return found;
     };
     double npu_busy_ms = 0, npu_idle_ms = 0, host_idle_ms = 0, fa_ms = 0;
+    // OFLM_OPEN_MID_PROF: the linear layers' MID in parts (qkv read back, state read back, bf16 ->
+    // f32, state sync, out pack) and deltanet_block's phases
+    static const bool mid_prof_on = std::getenv("OFLM_OPEN_MID_PROF") != nullptr;
+    double mid_prof[5] = {0, 0, 0, 0, 0};
+    for (double& v : host::g_dn_prof) v = 0;
     double hst[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     int n_fa = 0;
 
@@ -4623,15 +4637,19 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 uint8_t* sp = st.map<uint8_t*>();
                 if (lin) {
                     const size_t nch = gb.qkv_dim, vw = gb.vw;
+                    auto tm = std::chrono::steady_clock::now();
+                    mid_prof[0] += ms_since(th);                        // the qkv C read back
                     if (c == 0) read_back(st, lt.state_bytes, 0);
+                    mid_prof[1] += ms_since(tm); tm = std::chrono::steady_clock::now();
                     ya.resize(M * nch);
                     yb.resize(M * vw);
                     og.resize(M * vw);
 #pragma omp parallel for
                     for (long long t = 0; t < static_cast<long long>(t_real); ++t) {
-                        for (size_t i = 0; i < nch; ++i) ya[t * nch + i] = bf16_to_f32(q16[t * nq + i]);
-                        for (size_t i = 0; i < vw; ++i) yb[t * vw + i] = bf16_to_f32(q16[t * nq + nch + i]);
+                        bf16_row_f32(q16 + t * nq, nch, ya.data() + t * nch);
+                        bf16_row_f32(q16 + t * nq + nch, vw, yb.data() + t * vw);
                     }
+                    mid_prof[2] += ms_since(tm); tm = std::chrono::steady_clock::now();
                     host::DeltaGeom g;
                     g.T = M; g.hid = hid;
                     g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
@@ -4644,9 +4662,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                          reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
                     timing_.dn_conv_ms += ph[0];
                     timing_.dn_rule_ms += ph[1];
+                    tm = std::chrono::steady_clock::now();
                     if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
+                    mid_prof[3] += ms_since(tm); tm = std::chrono::steady_clock::now();
                     if (has2(hid, vw)) to_bfp2(og.data(), vw, "pp_m2_" + cs, t_real);
                     else to_bf16(og.data(), M, vw, "pp_m_" + cs);
+                    mid_prof[4] += ms_since(tm);
                 } else {
                     const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
                     const std::string fk = fa_kernel(c);
@@ -4917,6 +4938,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                          "hpack %.0f res %.0f idle %.0f\n",
                  N, C, M, L, timing_.total_ms, npu_busy_ms, n_fa, fa_ms, npu_idle_ms, hst[PRE], hst[MID], timing_.dn_conv_ms,
                  timing_.dn_rule_ms, timing_.attn_ms, hst[GATE], hst[TAIL], hst[HPACK], hst[RES], host_idle_ms);
+    if (mid_prof_on)
+        std::fprintf(stderr, "open_qwen36: linear MID: qkv read %.1f state read %.1f to f32 %.1f | dn setup %.1f conv %.1f "
+                             "alpha/beta %.1f window %.1f rule %.1f | state sync %.1f out pack %.1f ms\n",
+                     mid_prof[0], mid_prof[1], mid_prof[2], host::g_dn_prof[0] / 1e3, host::g_dn_prof[1] / 1e3,
+                     host::g_dn_prof[2] / 1e3, host::g_dn_prof[3] / 1e3, timing_.dn_rule_ms, mid_prof[3], mid_prof[4]);
 }
 
 void Core::moe_token(int l, const float* xm, const float* res, const float* probs, const int32_t* idx, const float* w,
