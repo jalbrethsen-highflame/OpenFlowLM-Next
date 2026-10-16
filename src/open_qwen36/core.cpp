@@ -4539,6 +4539,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     static const bool mid_prof_on = std::getenv("OFLM_OPEN_MID_PROF") != nullptr;
     double mid_prof[5] = {0, 0, 0, 0, 0};
     for (double& v : host::g_dn_prof) v = 0;
+    for (double& v : host::g_dn_p1) v = 0;
     double hst[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     int n_fa = 0;
 
@@ -5033,6 +5034,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                              "alpha/beta %.1f window %.1f rule %.1f | state sync %.1f out pack %.1f ms\n",
                      mid_prof[0], mid_prof[1], mid_prof[2], host::g_dn_prof[0] / 1e3, host::g_dn_prof[1] / 1e3,
                      host::g_dn_prof[2] / 1e3, host::g_dn_prof[3] / 1e3, timing_.dn_rule_ms, mid_prof[3], mid_prof[4]);
+    if (mid_prof_on)
+        std::fprintf(stderr, "open_qwen36: dn phase 1 on thread 0: taps %.1f silu %.1f qk norm %.1f V copy %.1f ms\n",
+                     host::g_dn_p1[0] / 1e3, host::g_dn_p1[1] / 1e3, host::g_dn_p1[2] / 1e3, host::g_dn_p1[3] / 1e3);
 }
 
 void Core::moe_token(int l, const float* xm, const float* res, const float* probs, const int32_t* idx, const float* w,

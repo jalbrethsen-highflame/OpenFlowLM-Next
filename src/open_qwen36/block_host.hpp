@@ -133,7 +133,8 @@ void gemv_b4(const uint8_t* B, size_t npad, size_t K, const float* x, float* y,
 /// (kt0, kt1: only those 64-K tiles of every strip, a partial sum; kt1 = 0 means all)
 /// R rows at once (1..8; an MTP verify pass): x [R, K] row-major, y [R, ldy] (columns 0..npad);
 /// each weight block unpacked once for all rows. The int8 path; the bf16 one loops gemv_b4.
-extern double g_dn_prof[6];   // deltanet_block's phases (us, summed; see block_host.cpp)
+extern double g_dn_prof[6];
+extern double g_dn_p1[4];   // deltanet_block's phases (us, summed; see block_host.cpp)
 void gemv_b4_rows(const uint8_t* B, size_t npad, size_t K, const float* x, size_t R, float* y, size_t ldy,
                   size_t kt0 = 0, size_t kt1 = 0);
 /// The dit FFN's up|gate output to h: every 128 columns of `ug` are [gate 64 | up 64]; h [ff] =

@@ -43,6 +43,7 @@ inline __m256 bf16r8(const float* p) {
 }
 
 // x[d] / sqrt(mean(x^2) + eps) * w[d]
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void rms_vec(const float* x, size_t d, const float* w, double eps, float* out) {
     double ss = 0;
     for (size_t j = 0; j < d; ++j) ss += static_cast<double>(x[j]) * x[j];
@@ -63,6 +64,7 @@ void rope(float* x, size_t half, const double* inv_freq, double pos) {
 
 }  // namespace
 
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void rmsnorm_rows(const float* x, size_t T, size_t d, const float* w, double eps, float* out) {
 #pragma omp parallel for
     for (long long t = 0; t < static_cast<long long>(T); ++t) rms_vec(x + t * d, d, w, eps, out + t * d);
@@ -475,6 +477,7 @@ void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, 
 // deltanet_block's phases (us, summed): setup, phase 1 (conv, silu, q / k norm), phase 1b
 // (alpha / beta), window; read by the prompt pipe's OFLM_OPEN_MID_PROF
 double g_dn_prof[6] = {0, 0, 0, 0, 0, 0};
+double g_dn_p1[4] = {0, 0, 0, 0};   // phase 1 on thread 0 (us): taps, silu, q / k norm, V copy
 #define DN_MARK(i) do { auto _n = std::chrono::steady_clock::now(); g_dn_prof[i] += std::chrono::duration<double, std::micro>(_n - dn_t).count(); dn_t = _n; } while (0)
 // alpha / beta for a prompt block: decay = exp(A softplus(xn Wa + dtb)), beta = sigmoid(xn Wb), 16
 // tokens x 16 lanes of accumulators in zmm (FMA) a pass. OFLM_OPEN_AB_AVX2=1: the AVX2 path (mul
@@ -508,6 +511,8 @@ __attribute__((target("avx512f"))) void dn_alpha_beta_512(size_t hid, size_t lan
                 }
         }
 }
+// cloned like the rule: phase 1's silu and norms are 16-lane vector code (two AVX2 halves without it)
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const float* xn, const float* convw,
                     const float* Wa, const float* Wb, const float* A, const float* dtb, const float* nw,
                     uint16_t* conv_state, float* S, float* og, double* phase_ms) {
@@ -547,6 +552,9 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
 #pragma omp for
         for (long long tt = 0; tt < static_cast<long long>(R); ++tt) {
             const size_t t = static_cast<size_t>(tt);
+            const bool t0p = omp_get_thread_num() == 0;
+            auto p1 = std::chrono::steady_clock::now();
+            auto p1m = [&](int i) { if (t0p) { auto n = std::chrono::steady_clock::now(); g_dn_p1[i] += std::chrono::duration<double, std::micro>(n - p1).count(); p1 = n; } };
             // The taps as `taps` contiguous passes over the channels rather than a strided
             // inner loop of depth `taps` inside the channel loop. Each pass reads one whole
             // row of qkv and one of convw in order, and the "is this row carried state or
@@ -582,11 +590,13 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                     }
                 }
             }
+            p1m(0);
             {   // silu, 16 lanes at a time (nch is a multiple of 16 at every Qwen3.5 width)
                 size_t j = 0;
                 for (; j + 16 <= nch; j += 16) dn_st(c.data() + j, dn_silu(dn_ld(c.data() + j)));
                 for (; j < nch; ++j) c[j] = silu(c[j]);
             }
+            p1m(1);
             for (size_t hh = 0; hh < g.key_heads; ++hh)
                 for (int which = 0; which < 2; ++which) {
                     const float* src = c.data() + which * key_w + hh * dim;
@@ -596,7 +606,9 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                     const float r = static_cast<float>(1.0 / std::sqrt(ss + 1e-6));   // dn_glue's L2 norm
                     for (size_t j = 0; j < dim; ++j) dst[j] = src[j] * r;
                 }
+            p1m(2);
             std::copy(c.begin() + 2 * key_w, c.end(), V.begin() + t * vw);
+            p1m(3);
             (void)al; (void)be;   // alpha / beta: phase 1b below, 8 tokens a pass over Wa / Wb
         }
     }
@@ -1183,6 +1195,7 @@ void attention_full(const AttnGeom& g, const float* Q, const uint16_t* kv, size_
     attention_tiles(g.hd, g.nh, g.kvh, g.t_real, g.pos0, 1.0f, Q, kv, kv_row_elems, og, keys);
 }
 
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
                     const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems, float* Q) {
     const size_t qw = g.nh * g.hd, kvw = g.kvh * g.hd, half = g.rot / 2, R = g.t_real;
@@ -1419,6 +1432,7 @@ struct B4XQ {
 void b4_xq_size(size_t K, B4XQ& q) {
     q.ev.resize(K / 8); q.od.resize(K / 8); q.sx.resize(K / 64); q.cs.resize(K / 64);
 }
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void b4_prep_xq_tiles(const float* x, size_t kt0, size_t kt1, B4XQ& q) {
     for (size_t kt = kt0; kt < kt1; ++kt) {
         float m = 0.f;
@@ -1684,6 +1698,7 @@ void lmhead_groups(const uint8_t* W, size_t K, const uint32_t* ax, const uint64_
 
 namespace {
 struct HeadX { std::vector<uint32_t> ax; std::vector<uint64_t> neg; std::vector<float> sx; };
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void head_prep(const float* x, size_t K, HeadX& h) {
     const size_t KB = K / 32;
     h.ax.resize(KB * 8); h.neg.resize(KB * 8); h.sx.resize(KB);
@@ -1881,6 +1896,7 @@ void lmhead_q8_cpu(const uint8_t* W, size_t N, size_t K, const float* x, float* 
     }
 }
 
+__attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void swiglu_tiles(const float* ug, size_t ff, float* h) {
 #pragma omp parallel for schedule(static)
     for (long long jj = 0; jj < static_cast<long long>(ff / 64); ++jj) {
