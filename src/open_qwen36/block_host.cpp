@@ -15,6 +15,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1392,6 +1393,13 @@ void b4_prep_xq_tiles(const float* x, size_t kt0, size_t kt1, B4XQ& q) {
         }
     }
 }
+// The int4 / q8 weight kernels prefetch every line of the next block themselves (NTA, 8 lines
+// a step): one hint a 4 KB tile left the rest to the hardware prefetcher, which falls behind
+// once there is compute between the loads (8 cores, 1 GB of int4 tiles: 4 rows 11.8 -> 9.1 ms,
+// 6 rows 16.8 -> 10.0).
+inline void pf8(const uint8_t* p) {
+    for (int l = 0; l < 8; ++l) _mm_prefetch(reinterpret_cast<const char*>(p + l * 64), _MM_HINT_NTA);
+}
 __attribute__((target("avx512f,avx512bw,avx512vnni")))
 void b4_strip_vnni(const uint8_t* st, const B4XQ& q, size_t t0, size_t t1, float* acc) {
     const __m512i x88 = _mm512_set1_epi8(static_cast<char>(0x88)), m0f = _mm512_set1_epi8(0x0F), six = _mm512_set1_epi32(6);
@@ -1399,9 +1407,10 @@ void b4_strip_vnni(const uint8_t* st, const B4XQ& q, size_t t0, size_t t1, float
     for (int p = 0; p < 8; ++p) run[p] = _mm512_setzero_ps();
     for (size_t kt = t0; kt < t1; ++kt) {
         const uint8_t* t = st + kt * kB4Tile;
-        _mm_prefetch(reinterpret_cast<const char*>(t + 8 * kB4Tile), _MM_HINT_NTA);
         const __m512 corr = _mm512_set1_ps(static_cast<float>(q.cs[kt])), sx = _mm512_set1_ps(q.sx[kt]);
         for (int p = 0; p < 8; ++p) {
+            pf8(t + kB4Tile + p * 512);
+            if (p == 0) pf8(t + kB4Tile + 4096 - 6 * 64);   // the exponents' 2 lines (and 6 already asked)
             __m512i a = _mm512_setzero_si512();
             for (int kb = 0; kb < 8; ++kb) {
                 const __m512i v = _mm512_xor_si512(_mm512_loadu_si512(t + (p * 8 + kb) * 64), x88);
@@ -1430,8 +1439,9 @@ void b4_strip_vnni_rows(const uint8_t* st, const B4XQ* q, size_t t0, size_t t1, 
     std::memset(run, 0, sizeof run);
     for (size_t kt = t0; kt < t1; ++kt) {
         const uint8_t* t = st + kt * kB4Tile;
-        _mm_prefetch(reinterpret_cast<const char*>(t + 8 * kB4Tile), _MM_HINT_NTA);
         for (int p = 0; p < 8; ++p) {
+            pf8(t + kB4Tile + p * 512);
+            if (p == 0) pf8(t + kB4Tile + 4096 - 6 * 64);
             __m512i a[R];
             for (int r = 0; r < R; ++r) a[r] = _mm512_setzero_si512();
             for (int kb = 0; kb < 8; ++kb) {
@@ -1605,10 +1615,11 @@ void lmhead_groups(const uint8_t* W, size_t K, const uint32_t* ax, const uint64_
     const __m512i zero = _mm512_setzero_si512();
     for (size_t g = g0; g < g1; ++g) {
         const uint8_t* gp = W + g * GS;
-        _mm_prefetch(reinterpret_cast<const char*>(gp + GS), _MM_HINT_NTA);
         __m512 acc = _mm512_setzero_ps();
         for (size_t B = 0; B < KB; ++B) {
             const uint8_t* blk = gp + B * 544;
+            pf8(blk + 4 * 544);                              // 4 blocks (2 KB) ahead, into the next group
+            if (B % 8 == 0) pf8(blk + 4 * 544 + 512);        // 544-byte blocks: 8 lines a block plus 1 a 8
             __m512i a = _mm512_setzero_si512();
             for (int kq = 0; kq < 8; ++kq) {
                 __m512i w = _mm512_loadu_si512(blk + 32 + kq * 64);
@@ -1655,11 +1666,12 @@ void lmhead_groups_rows(const uint8_t* W, size_t K, const HeadX* hx, size_t g0, 
     const __m512i zero = _mm512_setzero_si512();
     for (size_t g = g0; g < g1; ++g) {
         const uint8_t* gp = W + g * GS;
-        _mm_prefetch(reinterpret_cast<const char*>(gp + GS), _MM_HINT_NTA);
         __m512 acc[R];
         for (int r = 0; r < R; ++r) acc[r] = _mm512_setzero_ps();
         for (size_t B = 0; B < KB; ++B) {
             const uint8_t* blk = gp + B * 544;
+            pf8(blk + 4 * 544);
+            if (B % 8 == 0) pf8(blk + 4 * 544 + 512);
             __m512i a[R];
             for (int r = 0; r < R; ++r) a[r] = _mm512_setzero_si512();
             for (int kq = 0; kq < 8; ++kq) {
