@@ -1399,6 +1399,20 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
 
 
 # ---- the step program (what the driver runs per layer type), and the kernel sets that serve it
+def moe_dit(spec: ModelSpec) -> dict | None:
+    """The prompt pipeline's GEMMs for a MoE spec (OPEN_QWEN36_DIT, default on): the Qwen3.5 dense
+    recipe's gemm_dit over this family's block route, its fused FFN at the shared expert's width,
+    the causal dit_fa256b attention only, no CPU decode shares. b4 weights with
+    OPEN_QWEN35_GEMM_B4=1, as for the 27B. The routed experts stay on moe_batch / mbe."""
+    if os.environ.get("OPEN_QWEN36_DIT", "1") == "0" or not spec.num_experts:
+        return None
+    from . import qwen35 as Q35       # qwen35 imports this module: here, not at the top
+    r = gemm_route(spec)
+    if not r:
+        return None
+    return Q35.gemm_dit(spec, route=r, ff=spec.shared_expert_intermediate, decode=False, causal_only=True)
+
+
 def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     L = layout(spec)
     out: dict = {
@@ -1463,6 +1477,9 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         for name, types in r.get("variants", {}).items():
             for lt, gb in types.items():
                 out["layer_types"][lt].setdefault("gemm_block_variants", {})[name] = gb
+    if d := moe_dit(spec):
+        from . import qwen35 as Q35
+        Q35.dit_programs(spec, out, d)
     return out
 
 
@@ -1489,6 +1506,7 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
                 "stripe": C.STRIPE, "up_bytes": C.UP_BYTES, "down_core": C.DOWN_PER_CORE * C.DOWN_BAND,
                 "pool_down": L.POOL_DOWN, "share_up": L.POOL_SHARE_UP, "share_gate": L.POOL_SHARE_GATE,
                 "share_down": L.POOL_SHARE_DOWN},
+        **({"gemm_dit": {k: v for k, v in d.items() if not k.startswith("_")}} if (d := moe_dit(spec)) else {}),
     }
 
 
@@ -1521,6 +1539,9 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     r = gemm_route(spec)
     if r:
         b.update(r["builds"])
+    if d := moe_dit(spec):
+        from . import qwen35 as Q35
+        Q35.dit_builds(spec, b, d)
     return b
 
 

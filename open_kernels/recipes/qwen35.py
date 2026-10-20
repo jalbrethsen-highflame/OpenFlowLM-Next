@@ -336,11 +336,13 @@ DECODE2_FRAC = float(_os.environ.get("OPEN_QWEN35_DECODE2_FRAC", "0.31"))
 DECODE2_MIN_KT = int(_os.environ.get("OPEN_QWEN35_DECODE2_MIN_KT", 16))
 
 
-def gemm_dit(spec: ModelSpec, route: dict | None = None, ff: int | None = None, decode: bool = True) -> dict | None:
+def gemm_dit(spec: ModelSpec, route: dict | None = None, ff: int | None = None, decode: bool = True,
+             causal_only: bool = False) -> dict | None:
     """{m, kernels {NxK: name}, npad {N: Npad}, x {K: global}, y {Npad: global}} for every
     gemm_route shape dit_gemm can take (K % 512, N padded to 1024), or None. `route` and `ff`
     default to this family's (qwen36moe passes its MoE route and the shared expert's width);
-    decode=False leaves out the CPU decode route's NPU shares."""
+    decode=False leaves out the CPU decode route's NPU shares; causal_only=True keeps only the
+    causal dit_fa256b attention streams (cb, cbs) of `fa`."""
     r = (route if route is not None else gemm_route(spec)) if GEMM_DIT else None
     if not r:
         return None
@@ -421,10 +423,12 @@ def gemm_dit(spec: ModelSpec, route: dict | None = None, ff: int | None = None, 
     if GEMM_DIT2 and FA_MAX_LK >= DIT_M and spec.has_full and spec.head_dim == 256:
         fa = {"lk": {str(lk): f"fa256_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)},
               "q_cols": spec.num_heads * spec.head_dim}
-        if FA_NC:
+        if causal_only:
+            del fa["lk"]
+        if FA_NC and not causal_only:
             fa["nc"] = {str(lk): f"fa256nc_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)}
             fa["nc_valid"] = FA_NC_VALID
-        if FA_NCB:
+        if FA_NCB and not causal_only:
             fa["ncb"] = {str(lk): f"fa256b_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)}
             fa["nc_valid"] = FA_NC_VALID
         if FA_CB:

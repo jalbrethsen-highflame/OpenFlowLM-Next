@@ -1082,8 +1082,9 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                 // the FFN up|gate weight ([up ff | gate ff] rows) for the SwiGLU epilogue: every
                 // 128-column tile j is [gate 64j.. | up 64j..]
                 std::vector<int64_t> cm;
-                if (man_.gemm_dit.contains("ffn") && dit_ffn_on() && !lt.gemm_block.ffn_program.empty() &&
-                    lt.gemm_block.ffn_program[0].args[0] == name) {
+                // (a MoE layer's shared expert runs on the same fused FFN: its up|gate too)
+                const auto& fprog = lt.gemm_block.has_dense_ffn() ? lt.gemm_block.ffn_program : lt.gemm_block.shared_program;
+                if (man_.gemm_dit.contains("ffn") && dit_ffn_on() && !fprog.empty() && fprog[0].args[0] == name) {
                     const size_t ff = man_.gemm_dit["ffn"]["ff"].get<size_t>();
                     if (n != 2 * ff || npad != n) throw std::runtime_error("open_qwen36: dit FFN: up|gate is not [2 ff]");
                     cm.resize(npad);
@@ -1134,6 +1135,41 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                         if (b3_err_on())
                             log("b4 err: layer " + std::to_string(l) + " " + name + (b3 ? " b3" : " b4") + ": " +
                                 std::to_string(std::sqrt(er[0] / std::max(er[1], 1e-30))));
+                        // OFLM_OPEN_B4_ROT=<r>[,<r>...] (log only): the b4 error after a block Hadamard of
+                        // size r along K on each row (orthonormal, so the error compares as is)
+                        if (const char* rot = std::getenv("OFLM_OPEN_B4_ROT")) {
+                            std::string rs = rot, msg;
+                            for (size_t a = 0; a < rs.size();) {
+                                size_t b = rs.find(',', a);
+                                if (b == std::string::npos) b = rs.size();
+                                const size_t r = std::stoul(rs.substr(a, b - a));
+                                a = b + 1;
+                                if (!r || (r & (r - 1)) || k % r) continue;
+                                std::vector<float> Wr(Wq);
+#pragma omp parallel for
+                                for (long long row = 0; row < static_cast<long long>(n); ++row)
+                                    for (size_t k0 = 0; k0 < k; k0 += r) {
+                                        float* v = Wr.data() + static_cast<size_t>(row) * k + k0;
+                                        for (size_t h = 1; h < r; h *= 2)
+                                            for (size_t i = 0; i < r; i += 2 * h)
+                                                for (size_t j = i; j < i + h; ++j) {
+                                                    const float x = v[j], y = v[j + h];
+                                                    v[j] = x + y; v[j + h] = x - y;
+                                                }
+                                        const float sc = 1.f / std::sqrt(static_cast<float>(r));
+                                        for (size_t j = 0; j < r; ++j) v[j] *= sc;
+                                    }
+                                std::vector<uint8_t> tmp(npad / 128 * (k / 64) * kB4Tile);
+                                double er2[2] = {0, 0};
+                                dit_encode_b4(Wr.data(), n, k, npad, tmp.data(), cm.empty() ? nullptr : cm.data(), nullptr, er2);
+                                msg += " rot" + std::to_string(r) + " " + std::to_string(std::sqrt(er2[0] / std::max(er2[1], 1e-30)));
+                            }
+                            double er0[2] = {0, 0};
+                            std::vector<uint8_t> tmp(npad / 128 * (k / 64) * kB4Tile);
+                            dit_encode_b4(Wq.data(), n, k, npad, tmp.data(), cm.empty() ? nullptr : cm.data(), nullptr, er0);
+                            log("b4 rot: layer " + std::to_string(l) + " " + name + " [" + std::to_string(n) + "x" + std::to_string(k) +
+                                "] plain " + std::to_string(std::sqrt(er0[0] / std::max(er0[1], 1e-30))) + msg);
+                        }
                     } else {
                         dit_pack_region(host + off0, n, k, npad, w.map<uint8_t*>(), cm.empty() ? nullptr : cm.data(), dit_hs_);
                     }
@@ -4694,11 +4730,15 @@ void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
 // ============================================================================
 bool Core::pipe_ok() const {
     if (!dit_on_ || !pipe_on_ || !man_.gemm_dit.contains("ffn") || !dit_ffn_on() || !gemm_block_t_) return false;
+    const size_t ff = man_.gemm_dit["ffn"].value("ff", size_t{0});
     for (int l = 0; l < nl_; ++l) {
         const GemmBlockProgram& gb = types_[l]->gemm_block;
-        if ((gb.kind != "linear" && gb.kind != "full") || !gb.has_dense_ffn() || gb.program.size() < 2 ||
-            gb.ffn_program.size() < 2)
-            return false;
+        if ((gb.kind != "linear" && gb.kind != "full") || gb.program.size() < 2) return false;
+        // a MoE layer (Qwen3.6-MoE): the shared expert on the fused FFN, the routed experts on
+        // moe_batch's streams (the batched expert kernel, the host router)
+        const bool moe = !gb.has_dense_ffn() && gb.shared_program.size() >= 2 && gb.shared_ff == ff &&
+                         gb.moe_batch.present() && moe_batch_on_ && !hc_.empty() && !hc_[l].router.empty();
+        if (!moe && (!gb.has_dense_ffn() || gb.ffn_program.size() < 2)) return false;
     }
     return true;
 }
@@ -4790,7 +4830,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // designs/dit_fa256: NPU attention for a full layer's chunk when a stream exists for its key
     // length (pos0 + chunk end) and that length is at least OFLM_OPEN_FA_MIN_LK (default 3072:
     // below it the kernel is no faster than the host); OFLM_OPEN_FA=0 keeps every chunk on the host
-    const nlohmann::json& FA = D.contains("fa") ? D["fa"]["lk"] : kEmpty;
+    const nlohmann::json& FA = D.contains("fa") && D["fa"].contains("lk") ? D["fa"]["lk"] : kEmpty;
     static const bool fa_on = [] { const char* e = std::getenv("OFLM_OPEN_FA"); return !(e && *e == '0'); }();
     static const size_t fa_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_MIN_LK"); return e ? std::strtoul(e, nullptr, 10) : 3072ul; }();
     // noncausal (d3): one NPU stream for the whole prompt, keys [0, N) of lk = N rounded up to
@@ -4876,7 +4916,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     };
     auto is_cb = [](const std::string& k) { return k.rfind("fa256bc", 0) == 0; };
     bool any_cb = false;
-    for (size_t c = 0; c < C; ++c) any_cb = any_cb || is_cb(fa_kernel(c));
+    for (size_t c = 0; c < C && fab_nh; ++c) any_cb = any_cb || is_cb(fa_kernel(c));   // (no full layer: none)
     // a causal stream's query offset, patched in right before its dispatch (two chunks of the tiny
     // tier can share one stream), skipped when it already carries that offset
     auto cb_qoff = [&](const std::string& fk, uint32_t qoff) {
@@ -4932,13 +4972,45 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // Each layer's cells walk a list of operations, host (even index) and NPU (odd) alternating.
     enum Op { PRE, QKV, MID, FAT, GATE, OUT, TAIL, UP, HPACK, DOWN, RES };
     std::vector<std::vector<int>> ops(L);
+    auto is_moe = [&](size_t l) { return !types_[l]->gemm_block.has_dense_ffn(); };
     for (size_t l = 0; l < L; ++l) {
         auto& o = ops[l];
         o = {PRE, QKV, MID};
-        if (types_[l]->gemm_block.kind == "full" && (!FA.empty() || noncausal_)) o.insert(o.end(), {FAT, GATE});
+        if (types_[l]->gemm_block.kind == "full" && (!FA.empty() || !FCB.empty() || noncausal_)) o.insert(o.end(), {FAT, GATE});
         o.insert(o.end(), {OUT, TAIL, UP});
-        if (down2 && !ffn_dev) o.insert(o.end(), {HPACK, DOWN});
+        if (down2 && !ffn_dev) {
+            if (is_moe(l)) throw std::runtime_error("open_qwen36: the MoE prompt pipeline runs the shared expert on the device FFN (dit2 pack_h / a_units)");
+            o.insert(o.end(), {HPACK, DOWN});
+        }
         o.push_back(RES);
+    }
+    // MoE layers (Qwen3.6-MoE): a chunk's routed experts run on moe_batch's streams from one of two
+    // buffer sets, because several chunks are in flight. TAIL routes the chunk and gathers its
+    // tokens into a free set (c % 2), UP runs the set's passes after the shared expert, RES scatters
+    // them with the router weights and frees the set. Core::moe_block's law: visits in expert order,
+    // each pass the shortest stream that holds what is left, else the longest.
+    struct MoePass { std::string kernel; size_t n = 0; std::vector<uint32_t> ex; };
+    struct MoeSet {
+        long owner = -1;
+        std::vector<MoePass> passes;
+        std::vector<std::vector<std::vector<std::pair<size_t, float>>>> per_token;   // [pass][token]: (slot * NT + column, weight)
+        std::vector<float> gate;                                                       // the shared expert's gate, per token
+    };
+    MoeSet mset[2];
+    const MoeBatch* mbp = nullptr;
+    for (size_t l = 0; l < L && !mbp; ++l)
+        if (is_moe(l)) mbp = &types_[l]->gemm_block.moe_batch;
+    size_t mb_np = 0;
+    auto mbuf = [&](char what, size_t set, size_t p) { return std::string("pmb_") + what + std::to_string(set) + "_" + std::to_string(p); };
+    if (mbp) {
+        const size_t maxs = mbp->kernels.rbegin()->first, NTm = mbp->nt;
+        mb_np = (w_->moe.experts + (M * w_->moe.topk + NTm - 1) / NTm + maxs - 1) / maxs;   // visits <= E + M topk / NT
+        for (size_t set = 0; set < 2; ++set)
+            for (size_t p = 0; p < mb_np; ++p) {
+                need(mbuf('x', set, p), globals_.at(mbp->args[1]).size());
+                need(mbuf('h', set, p), globals_.at(mbp->args[2]).size());
+                need(mbuf('y', set, p), globals_.at(mbp->args[3]).size());
+            }
     }
     // host rows
     std::vector<float> xres(TOT * hid), res(TOT * hid), xn(TOT * hid);
@@ -4963,6 +5035,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         if (busy[cell(l, c)] || s >= nst(l) || ((s & 1) != 0) != npu) return false;
         if (s == 0) return l == 0 || stage[cell(l - 1, c)] >= nst(l - 1);
         if (ops[l][s] == MID) return c == 0 || stage[cell(l, c - 1)] > s;     // S / the KV rows chain
+        if (ops[l][s] == TAIL && is_moe(l)) {                                  // its expert buffer set free
+            const long o = mset[c % 2].owner;
+            if (o >= 0 && o != static_cast<long>(cell(l, c))) return false;
+        }
         if (noncausal_ && ops[l][s] == FAT)                                     // every chunk's K / V rows first
             for (size_t c2 = 0; c2 < C; ++c2)
                 if (stage[cell(l, c2)] < s) return false;
@@ -5049,10 +5125,24 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                            {"pp_m2_" + cs, gb.program[1].args[0], "pp_y_" + cs});
                     else run(kname(hid, km), {"pp_m_" + cs, gb.program[1].args[0], "pp_y_" + cs});
                 } else if (op == UP && ffn_dev) {
-                    run(D["ffn"]["up2p"].get<std::string>(), {"pp_a2_" + cs, gb.ffn_program[0].args[0], "pp_hu"});
-                    run(D["ffn"]["down2u"].get<std::string>(), {"pp_hu", gb.ffn_program[1].args[0], "pp_y_" + cs});
+                    // a MoE layer: the shared expert here, then the chunk's routed-expert passes
+                    const std::vector<Step>& fp = is_moe(l) ? gb.shared_program : gb.ffn_program;
+                    run(D["ffn"]["up2p"].get<std::string>(), {"pp_a2_" + cs, fp[0].args[0], "pp_hu"});
+                    run(D["ffn"]["down2u"].get<std::string>(), {"pp_hu", fp[1].args[0], "pp_y_" + cs});
+                    if (is_moe(l)) {
+                        const size_t set = c % 2;
+                        auto tm = std::chrono::steady_clock::now();
+                        for (size_t p = 0; p < mset[set].passes.size(); ++p) {
+                            const MoePass& mp = mset[set].passes[p];
+                            Kern& mk = kerns_.at(mp.kernel);
+                            stream_patch::moe2_apply(mk.iw(), mk.moe2, mp.ex.data(), w_->moe);
+                            mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                            run(mp.kernel, {mbp->args[0], mbuf('x', set, p), mbuf('h', set, p), mbuf('y', set, p)});
+                        }
+                        timing_.moe_run_ms += ms_since(tm);
+                    }
                     static const bool ffn_check = [] { const char* e = std::getenv("OFLM_OPEN_FFN_CHECK"); return e && *e == '1'; }();
-                    if (ffn_check && c == 0 && l < 2) {
+                    if (ffn_check && c == 0 && l < 2 && !is_moe(l)) {
                         // debug: the host-repack route on the same input, compared
                         xrt::bo& yb = buffer("pp_y_" + cs, 0);
                         read_back(yb, M * hid * 2, 0);
@@ -5130,7 +5220,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         dit2_pack_a(src, rows, M, w, b.map<uint8_t*>(), dit_hs_, MT);
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * w * 9 / 8, 0);
     };
-    std::vector<float> ya, yb, yc, yd, og, hf;
+    std::vector<float> ya, yb, yc, yd, og, hf, rprobs, rwt;
+    std::vector<int32_t> ridx;
     // OFLM_OPEN_FA_CHECK=1 (debug): every NPU-attention chunk also runs host attention, and GATE
     // prints the NPU output's error against it per (layer, chunk)
     static const bool fa_check = [] { const char* e = std::getenv("OFLM_OPEN_FA_CHECK"); return e && *e == '1'; }();
@@ -5148,6 +5239,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 if (err) std::rethrow_exception(err);
                 if (finished == L * C) break;
                 busy[cell(l, c)] = 1;
+                if (ops[l][stage[cell(l, c)]] == TAIL && is_moe(l)) mset[c % 2].owner = static_cast<long>(cell(l, c));
             }
             const int op = ops[l][stage[cell(l, c)]];
             int advance = 1;
@@ -5426,6 +5518,69 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 }
                 if (up2) to_bfp2(xc, hid, "pp_a2_" + cs, t_real);
                 else to_bf16(xc, M, hid, "pp_a_" + cs);
+                if (is_moe(l)) {
+                    // the router (staged_tail's), the shared expert's gate (ffn_staged's), and the
+                    // chunk's tokens gathered into its set's expert slots (moe_block's)
+                    auto tm = std::chrono::steady_clock::now();
+                    MoeSet& ms = mset[c % 2];
+                    const size_t E = w_->moe.experts, topk = w_->moe.topk, NTm = mbp->nt;
+                    rprobs.resize(M * E); ridx.resize(M * topk); rwt.resize(M * topk);
+                    host::router_block(t_real, hid, E, topk, xc, hc.router.data(), rprobs.data(), ridx.data(), rwt.data());
+                    ms.gate.resize(t_real);
+#pragma omp parallel for
+                    for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
+                        const float* x = xc + static_cast<size_t>(tk) * hid;
+                        double d = 0;
+                        for (size_t i = 0; i < hid; ++i) d += static_cast<double>(bf16_to_f32(f32_to_bf16(x[i]))) * hc.sgw[i];
+                        ms.gate[static_cast<size_t>(tk)] = 1.f / (1.f + std::exp(-static_cast<float>(d)));
+                    }
+                    std::vector<std::vector<std::pair<int, float>>> owed(E);
+                    for (size_t t = 0; t < t_real; ++t)
+                        for (size_t k = 0; k < topk; ++k) {
+                            const int32_t e = ridx[t * topk + k];
+                            if (e < 0 || static_cast<size_t>(e) >= E) throw std::runtime_error("open_qwen36: router produced expert index " + std::to_string(e));
+                            owed[e].push_back({static_cast<int>(t), rwt[t * topk + k]});
+                        }
+                    std::vector<std::pair<uint32_t, size_t>> visits;
+                    for (size_t e = 0; e < E; ++e)
+                        for (size_t off = 0; off < owed[e].size(); off += NTm) visits.push_back({static_cast<uint32_t>(e), off});
+                    ms.passes.clear();
+                    ms.per_token.clear();
+                    for (size_t done = 0; done < visits.size();) {
+                        const size_t left = visits.size() - done;
+                        size_t slots = 0;
+                        const std::string* kn = nullptr;
+                        for (const auto& [sl, k] : mbp->kernels) { slots = sl; kn = &k; if (sl >= left) break; }
+                        const size_t n = std::min(left, slots), p = ms.passes.size();
+                        if (p >= mb_np) throw std::runtime_error("open_qwen36: MoE chunk needs more expert passes than its buffers hold");
+                        MoePass mp;
+                        mp.kernel = *kn; mp.n = n; mp.ex.assign(slots, 0);   // unused slots stream expert 0, ignored
+                        ms.per_token.emplace_back(t_real);
+                        auto& pt = ms.per_token.back();
+                        for (size_t i = 0; i < n; ++i) {
+                            const auto& [e, off] = visits[done + i];
+                            mp.ex[i] = e;
+                            for (size_t j = 0; j < std::min(NTm, owed[e].size() - off); ++j)
+                                pt[owed[e][off + j].first].push_back({i * NTm + j, owed[e][off + j].second});
+                        }
+                        xrt::bo& xb = buffer(mbuf('x', c % 2, p), 0);
+                        uint16_t* xh = xb.map<uint16_t*>();
+#pragma omp parallel for
+                        for (long long i = 0; i < static_cast<long long>(n); ++i) {
+                            const auto& [e, off] = visits[done + static_cast<size_t>(i)];
+                            uint16_t* xs = xh + static_cast<size_t>(i) * hid * NTm;
+                            for (size_t j = 0; j < std::min(NTm, owed[e].size() - off); ++j) {
+                                const float* row = xc + owed[e][off + j].first * hid;
+                                for (size_t kb = 0; kb < hid / 8; ++kb)
+                                    for (size_t kl = 0; kl < 8; ++kl) xs[(kb * NTm + j) * 8 + kl] = f32_to_bf16(row[kb * 8 + kl]);
+                            }
+                        }
+                        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, n * hid * NTm * 2, 0);
+                        ms.passes.push_back(std::move(mp));
+                        done += n;
+                    }
+                    timing_.moe_prep_ms += ms_since(tm);
+                }
             } else if (op == HPACK) {
                 // h = the first 64 of every 128 columns of the up GEMM's C, packed as dit2's A
                 xrt::bo& hb = buffer("pp_h_" + cs, 0);
@@ -5436,6 +5591,46 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 for (long long r = 0; r < static_cast<long long>(M); ++r)
                     for (size_t j = 0; j < ff; ++j) hf[r * ff + j] = bf16_to_f32(h16[r * 2 * ff + (j / 64) * 128 + j % 64]);
                 to_bfp2(hf.data(), ff, "pp_d2_" + cs, M);
+            } else if (is_moe(l)) {   // RES of a MoE layer: the gated shared expert, then the routed experts
+                xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
+                read_back(yb2, t_real * hid * 2, 0);
+                const uint16_t* y16 = yb2.map<const uint16_t*>();
+                MoeSet& ms = mset[c % 2];
+#pragma omp parallel for
+                for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
+                    const size_t o = static_cast<size_t>(tk) * hid;
+                    const float gt = ms.gate[static_cast<size_t>(tk)];
+                    for (size_t i = 0; i < hid; ++i) rs[o + i] += gt * bf16_to_f32(y16[o + i]);
+                }
+                auto tr = std::chrono::steady_clock::now();
+                const size_t NTm = mbp->nt, NG = NTm / 8;
+                for (size_t p = 0; p < ms.passes.size(); ++p) {
+                    xrt::bo& yb = buffer(mbuf('y', c % 2, p), 0);
+                    read_back(yb, ms.passes[p].n * hid * NTm * 4, 0);
+                    const float* yh = yb.map<const float*>();
+                    const auto& pt = ms.per_token[p];
+                    // moe_block's un-interleave of y's C tiles, straight into the token's row
+#pragma omp parallel for
+                    for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
+                        float* o = rs + static_cast<size_t>(tk) * hid;
+                        for (const auto& [col, wt] : pt[static_cast<size_t>(tk)]) {
+                            const size_t tt = col % NTm;
+                            const float* base = yh + (col / NTm) * hid * NTm + (tt / 8) * 64 + (tt % 8) * 8;
+                            for (size_t band = 0; band < hid / 64; ++band)
+                                for (size_t g = 0; g < 4; ++g) {
+                                    const float* even = base + ((band * 4 + g) * 2 * NG) * 64;
+                                    const float* odd = even + NG * 64;
+                                    float* d = o + band * 64 + g * 16;
+                                    for (size_t jj = 0; jj < 8; ++jj) {
+                                        d[2 * jj] += wt * even[jj];
+                                        d[2 * jj + 1] += wt * odd[jj];
+                                    }
+                                }
+                        }
+                    }
+                }
+                std::memcpy(xr, rs, t_real * hid * 4);
+                timing_.moe_read_ms += ms_since(tr);
             } else {   // RES
                 xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
                 read_back(yb2, t_real * hid * 2, 0);
@@ -5447,6 +5642,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             {
                 std::lock_guard<std::mutex> lk(mu);
                 busy[cell(l, c)] = 0;
+                if (op == RES && is_moe(l)) mset[c % 2].owner = -1;
                 stage[cell(l, c)] += advance;
                 if (stage[cell(l, c)] >= nst(l)) ++finished;
             }
@@ -5494,6 +5690,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                          "hpack %.0f res %.0f idle %.0f\n",
                  N, C, M, L, timing_.total_ms, npu_busy_ms, n_fa, fa_ms, npu_idle_ms, hst[PRE], hst[MID], timing_.dn_conv_ms,
                  timing_.dn_rule_ms, timing_.attn_ms, hst[GATE], hst[TAIL], hst[HPACK], hst[RES], host_idle_ms);
+    if (mbp)
+        std::fprintf(stderr, "open_qwen36: pipe MoE: experts on the NPU %.0f ms; host route + gather %.0f, scatter %.0f ms\n",
+                     timing_.moe_run_ms, timing_.moe_prep_ms, timing_.moe_read_ms);
     if (mid_prof_on)
         std::fprintf(stderr, "open_qwen36: linear MID: qkv read %.1f state read %.1f to f32 %.1f | dn setup %.1f conv %.1f "
                              "alpha/beta %.1f window %.1f rule %.1f | state sync %.1f out pack %.1f ms\n",
