@@ -77,6 +77,33 @@ Decode (CPU decode on the q4_1 pools, 16 threads, GPU job running), tok/s:
   rows) did not raise acceptance at 30K and cost 2.8 s.
 - At 30K a step reads ~650 MB of KV (mixer 21 ms of 77): KV in int8 is the next lever there.
 
+Through the oflm app (`oflm bench`, 32 tokens a stage, MTP on, GPU job running), tok/s:
+
+| Context | Prefill (closed / open at start) | Prefill now | Decode (closed / open at start) | Decode now |
+|---|---|---|---|---|
+| 1K | 163 / 142 | 296 | 13.0 / 9.9 | 19.1 |
+| 2K | 195 / 150 | 368 | 11.2 / 9.8 | 18.9 |
+| 4K | 227 / 168 | 466 | 11.2 / 9.0 | 22.7 |
+| 8K | 236 / 152 | 497 | 10.3 / 7.8 | 16.7 |
+| 16K | 262 / 137 | 632 | 9.4 / 5.9 | 15.1 |
+| 32K | 244 / 113 | 648 | 7.8 / 4.2 | 16.1 |
+
+CLI, chat prompts of C++ source + a question, kernels to 130048 keys (k4):
+
+| Prompt | Prefill | TTFT | Decode (MTP k = 2) | Drafts accepted |
+|---|---|---|---|---|
+| 30K | ~700 | ~45 s | 15.6 | 48 % |
+| 64K | 698 | 92 s | 21.8 | 60 % |
+| 120K | 592 | 203 s | 11.9 | 58 % |
+
+At 120K the NPU is busy 97 % of the prompt: experts 121 s, attention 49 s. The int8 KV copy halves
+decode attention at 128K (62 -> 32 ms a step in the bench; kv8, fa19d66).
+
+Next for prefill: an expert core on the int8 x int4 MAC mode (the q4_1 nibbles are already the B tile's
+[k][16 rows] order; (q - 8) centring as gemv_q41) and a token split over a column's 4 rows (weights
+broadcast from the mem tile: 128 tokens a weight stream). The current kernel is bound by DMA and core
+together, so neither alone gains much.
+
 ## Plan (biggest first; re-profile after each)
 
 Prefill:
