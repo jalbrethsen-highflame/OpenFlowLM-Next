@@ -6559,65 +6559,6 @@ float bf16_round(float v) { return bf16_to_f32(f32_to_bf16(v)); }
 struct PromptClock { double tile = 0, gemm = 0, read = 0, conv = 0, attn = 0, norm = 0, ffn = 0, wait = 0; } g_pc;
 }  // namespace
 
-namespace {
-// dit_gemm's B operand from a q4_1 pool region (q4_1_pack.py's chunk order, rs = 2: a 64-row
-// band's 256-wide k-group is two 5120 B chunks of 32 rows): B[k][n] = W[n][k], N padded with
-// zeros to npad, as designs/dit_gemm/pack.py's pack_b lays it out -- per 64 (K) x 128 (N)
-// tile [16 n-blocks][8 k-blocks][8 n][8 k], tiles column-major, each 8 k of one column a
-// bfp16ebs8 block (exponent byte = the largest IEEE exponent, 8 int8 mantissas, rounded to
-// nearest exactly as pack.py's bfp16ebs8_encode).
-void dit_pack_region(const uint8_t* pool, size_t n, size_t k, size_t npad, uint8_t* out) {
-    std::vector<float> W(n * k);
-    const size_t per_band = 2 * k / 256, nch = n * k / (32 * 256);
-#pragma omp parallel for
-    for (long long cc = 0; cc < static_cast<long long>(nch); ++cc) {
-        const size_t c = static_cast<size_t>(cc), band = c / per_band, ci = c % per_band;
-        const size_t r0 = 64 * band + 32 * (ci % 2), c0 = 256 * (ci / 2);
-        const uint8_t* b = pool + c * 5120;
-        const uint16_t* d = reinterpret_cast<const uint16_t*>(b);
-        const uint16_t* m = reinterpret_cast<const uint16_t*>(b + 512);
-        const uint8_t* qb = b + 1024;
-        for (size_t rb = 0; rb < 2; ++rb)
-            for (size_t kk = 0; kk < 256; ++kk)
-                for (size_t r16 = 0; r16 < 16; ++r16) {
-                    const size_t i = (rb * 256 + kk) * 16 + r16, r = rb * 16 + r16;
-                    const uint8_t nib = (i & 1) ? (qb[i >> 1] >> 4) : (qb[i >> 1] & 0xF);
-                    const size_t si = (kk / 32) * 32 + r;
-                    W[(r0 + r) * k + c0 + kk] = static_cast<float>(nib) * bf16_to_f32(d[si]) + bf16_to_f32(m[si]);
-                }
-    }
-    const size_t KT = k / 64, NT = npad / 128;
-#pragma omp parallel for
-    for (long long tt = 0; tt < static_cast<long long>(NT * KT); ++tt) {
-        const size_t nt = static_cast<size_t>(tt) / KT, kt = static_cast<size_t>(tt) % KT;
-        for (size_t nb = 0; nb < 16; ++nb)
-            for (size_t kb = 0; kb < 8; ++kb)
-                for (size_t nin = 0; nin < 8; ++nin) {
-                    const size_t col = nt * 128 + nb * 8 + nin, k0 = kt * 64 + kb * 8;
-                    uint8_t* blk = out + ((((nt * KT + kt) * 16 + nb) * 8 + kb) * 8 + nin) * 9;
-                    uint32_t bits[8];
-                    for (size_t j = 0; j < 8; ++j) {
-                        const float v = col < n ? W[col * k + k0 + j] : 0.f;
-                        std::memcpy(&bits[j], &v, 4);
-                    }
-                    int max_exp = 0;
-                    for (uint32_t bt : bits) max_exp = std::max(max_exp, static_cast<int>((bt >> 23) & 0xFF));
-                    blk[0] = static_cast<uint8_t>(max_exp);
-                    for (size_t j = 0; j < 8; ++j) {
-                        const int e = static_cast<int>((bits[j] >> 23) & 0xFF);
-                        int64_t mant = static_cast<int64_t>(bits[j] & 0x7FFFFF) | (e != 0 ? (int64_t{1} << 23) : 0);
-                        if (bits[j] >> 31) mant = -mant;
-                        const int shift = 17 + std::min(max_exp - e, 31);
-                        // floor((mant + half) / 2^shift): an arithmetic shift is the floor
-                        int64_t q = (mant + (int64_t{1} << (shift - 1))) >> shift;
-                        q = std::clamp<int64_t>(q, -128, 127);
-                        blk[1 + j] = static_cast<uint8_t>(static_cast<int8_t>(q));
-                    }
-                }
-    }
-}
-}  // namespace
-
 void Core::prompt_setup() {
     prompt_gemm_on_ = false;
     ph_.clear();
