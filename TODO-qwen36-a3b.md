@@ -32,6 +32,31 @@ Open engine, 4009-token prompt (CLI `--gemm-block`, 25.9 s = 155 tok/s): experts
 Decode step at 4K, 100 ms: lx0 (DeltaNet mixer) 30 x 1.8 ms, ax0 (attention) 10 x 3.2 ms, lx1 /
 ax1 (experts) 40 x 0.66 ms, lm (q8 head) 14.5 ms.
 
+## Progress (2026-10-20, GPU job running beside it)
+
+Prefill, CLI `--gemm-block`, tok/s:
+
+| Prompt | Baseline | mbe experts (block route) | Prompt pipeline + grouped MoE |
+|---|---|---|---|
+| 4K | 155 | 212 | 413 |
+| 8K | | | 426 |
+| 16K | | | 612 |
+| 32K | 113 (bench) | | 706 |
+
+- mbe (5be6774): eb's core program over moe_batch's taps, bfp16, 32 tokens a visit: experts 11.7 -> 4.6 s at 4K.
+- The prompt pipeline (fa9a4f0): dit2 GEMMs (bfp16: b4 repack of q4_1 loses 12-13 % of each weight and
+  flipped routing, KL 0.18 after 4 layers; a block Hadamard along K only took it to 11-12 %, the weights
+  have few outliers), causal dit_fa256b at 16 / 2 heads (rel 1 % against host attention), a MoE stage:
+  router + gather on the host, shared expert on the device FFN, mbe passes, scatter.
+- Accuracy, 600 tokens, all 40 layers, against the per-token reference: pipeline mean KL 1.0e-2, top-1
+  535/600; the old block route 4.6e-3, 550/600 (bfp16 activations and attention). Not yet checked
+  against the bf16 model.
+- MoE passes over 4096-token chunk groups (c937102): one visit list per group, not per chunk (experts
+  6.8 -> 4.8 s at 4K); register-blocked router (4.6 -> 1.8 ms per 1K tokens, same bits), AVX-512 scatter.
+- Now: the experts are 76 % of NPU time at 32K and bound by both DMA and core (MB_NULL_MM stream alone
+  19.7 ms vs 16.4 full per 256-slot pass; the bfp16 step ~2.5 us a call). Next lever there: a faster
+  expert core (hand-scheduled q4_1 dequant + bfp16 MAC), then fewer weight bytes per token.
+
 ## Plan (biggest first; re-profile after each)
 
 Prefill:
