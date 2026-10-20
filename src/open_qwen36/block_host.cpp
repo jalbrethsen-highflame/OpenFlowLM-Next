@@ -2776,10 +2776,14 @@ const uint8_t* q41_perm() {
     return tab.b;
 }
 
+// MBI: the chunks in mbi's transform (Q41Lay::shift): the nibble bytes XOR 0x88 back to q, d and
+// m + 8 d from int16 at 2^-shift
+template <bool MBI>
 __attribute__((target("avx512f,avx512bw,avx512vnni,avx512vbmi,fma")))
 void q41_group16(const uint8_t* const* chunks, size_t ng, size_t rb, const Q41X* const* x, size_t R, float* const* y,
-                 size_t row0) {
-    const __m512i perm = _mm512_load_si512(q41_perm()), m4 = _mm512_set1_epi8(0x0F);
+                 size_t row0, int shift) {
+    const __m512i perm = _mm512_load_si512(q41_perm()), m4 = _mm512_set1_epi8(0x0F), x88 = _mm512_set1_epi8(static_cast<char>(0x88));
+    const __m512 unscale = _mm512_set1_ps(std::ldexp(1.f, -std::max(shift, 0)));
     __m512 acc[8];
     for (size_t r = 0; r < R; ++r) acc[r] = _mm512_setzero_ps();
     for (size_t g = 0; g < ng; ++g) {
@@ -2791,7 +2795,8 @@ void q41_group16(const uint8_t* const* chunks, size_t ng, size_t rb, const Q41X*
             __m512i ae[8], ao[8];
             for (size_t r = 0; r < R; ++r) ae[r] = ao[r] = _mm512_setzero_si512();
             for (size_t it = 0; it < 4; ++it) {
-                const __m512i v = _mm512_loadu_si512(nib + (kb * 32 + it * 8) * 8);
+                __m512i v = _mm512_loadu_si512(nib + (kb * 32 + it * 8) * 8);
+                if constexpr (MBI) v = _mm512_xor_si512(v, x88);
                 const __m512i pe = _mm512_permutexvar_epi8(perm, _mm512_and_si512(v, m4));
                 const __m512i po = _mm512_permutexvar_epi8(perm, _mm512_and_si512(_mm512_srli_epi16(v, 4), m4));
                 const size_t k0 = g * 256 + kb * 32 + it * 8;
@@ -2803,9 +2808,15 @@ void q41_group16(const uint8_t* const* chunks, size_t ng, size_t rb, const Q41X*
                     ao[r] = _mm512_dpbusd_epi32(ao[r], po, xb);
                 }
             }
-            const __m512 d16 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(dp + kb * 32))), 16));
-            const __m512 m16 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp + kb * 32))), 16));
-            const __m512 mc16 = _mm512_fmadd_ps(d16, _mm512_set1_ps(8.f), m16);   // m + 8 d
+            __m512 d16, mc16;
+            if constexpr (MBI) {
+                d16 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(dp + kb * 32)))), unscale);
+                mc16 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp + kb * 32)))), unscale);
+            } else {
+                d16 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(dp + kb * 32))), 16));
+                const __m512 m16 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp + kb * 32))), 16));
+                mc16 = _mm512_fmadd_ps(d16, _mm512_set1_ps(8.f), m16);   // m + 8 d
+            }
             const size_t blk = g * 8 + kb;
             for (size_t r = 0; r < R; ++r) {
                 const __m512i e2 = _mm512_add_epi32(ae[r], _mm512_shuffle_epi32(ae[r], _MM_PERM_CDAB));
@@ -2830,8 +2841,41 @@ void gemv_q41_bands(const uint8_t* base, const Q41Lay& lay, size_t K, const Q41X
     for (size_t b = b0; b < b1; ++b)
         for (size_t h = 0; h < 2; ++h) {
             for (size_t g = 0; g < ng; ++g) chunks[g] = base + (b / 2) * lay.s2 + (b % 2) * lay.s1 + g * lay.sk + h * 5120;
-            for (size_t rb = 0; rb < 2; ++rb) q41_group16(chunks, ng, rb, x, R, y, b * 64 + h * 32 + rb * 16);
+            for (size_t rb = 0; rb < 2; ++rb)
+                if (lay.shift >= 0) q41_group16<true>(chunks, ng, rb, x, R, y, b * 64 + h * 32 + rb * 16, lay.shift);
+                else q41_group16<false>(chunks, ng, rb, x, R, y, b * 64 + h * 32 + rb * 16, -1);
         }
+}
+
+int mbi_shift(const uint8_t* chunks, size_t nch, size_t stride) {
+    float dmax = 0.f, mcmax = 0.f;
+    for (size_t c = 0; c < nch; ++c) {
+        const uint16_t* d = reinterpret_cast<const uint16_t*>(chunks + c * stride);
+        const uint16_t* m = d + 256;
+        for (size_t i = 0; i < 256; ++i) {
+            const float dv = bf16_to_f32(d[i]), mc = bf16_to_f32(m[i]) + 8.f * dv;
+            dmax = std::max(dmax, std::fabs(dv));
+            mcmax = std::max(mcmax, std::fabs(mc));
+        }
+    }
+    const double lim = std::min(dmax > 0.f ? 8000.0 / dmax : 1e30, mcmax > 0.f ? 32000.0 / mcmax : 1e30);
+    return std::max(0, std::min(24, static_cast<int>(std::floor(std::log2(lim)))));
+}
+
+void mbi_transform(uint8_t* chunks, size_t nch, size_t stride, int shift) {
+    for (size_t c = 0; c < nch; ++c) {
+        uint8_t* ch = chunks + c * stride;
+        uint16_t* d = reinterpret_cast<uint16_t*>(ch);
+        uint16_t* m = d + 256;
+        for (size_t i = 0; i < 256; ++i) {
+            const double dv = bf16_to_f32(d[i]), mc = bf16_to_f32(m[i]) + 8.0 * dv;
+            const int16_t di = static_cast<int16_t>(std::lrint(std::ldexp(dv, shift)));
+            const int16_t mi = static_cast<int16_t>(std::lrint(std::ldexp(mc, shift)));
+            std::memcpy(d + i, &di, 2);
+            std::memcpy(m + i, &mi, 2);
+        }
+        for (size_t i = 1024; i < 5120; ++i) ch[i] ^= 0x88;
+    }
 }
 
 void q41_pack_std(const float* W, size_t n, size_t K, uint8_t* out) {

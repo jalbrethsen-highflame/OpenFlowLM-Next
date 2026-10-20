@@ -192,7 +192,9 @@ void par_copy(void* dst, const void* src, size_t bytes);
 /// h) at base + (b / 2) s2 + (b % 2) s1 + g sk + h 5120. q41_std: the std_perm band order (bands
 /// whole, groups inside); q41_stripe: Qwen3.6-MoE's experts, 128-row stripes of two bands
 /// interleaved by k-group, stripes `stride` apart.
-struct Q41Lay { size_t s2 = 0, s1 = 0, sk = 0; };
+/// shift >= 0: the chunks are mbi's transform of q4_1 (Core, moe_batch.kind "mbi"): every nibble
+/// byte XOR 0x88, d and m replaced by int16 d 2^shift and (m + 8 d) 2^shift.
+struct Q41Lay { size_t s2 = 0, s1 = 0, sk = 0; int shift = -1; };
 Q41Lay q41_std(size_t K);
 Q41Lay q41_stripe(size_t stride);
 /// x [K] as int8 per 32 (xq), each block's scale (sx) and its float sum (xs) -- gemv_q41_rows' input
@@ -209,6 +211,11 @@ void gemv_q41_bands(const uint8_t* base, const Q41Lay& lay, size_t K, const Q41X
 /// (row, 32-K block) m = min, d = (max - min) / 15, q = round((w - m) / d), d and m in bf16 and q
 /// against the rounded ones. out: n K 5 / 8 bytes.
 void q41_pack_std(const float* W, size_t n, size_t K, uint8_t* out);
+/// mbi's transform of nch q4_1 chunks in place, all at one shift; mbi_shift: that shift for the
+/// chunks' largest |d| and |m + 8 d| (d 2^S <= 8000, (m + 8 d) 2^S <= 32000: mbi_core.h's int32
+/// sums stay in range).
+int mbi_shift(const uint8_t* chunks, size_t nch, size_t stride);
+void mbi_transform(uint8_t* chunks, size_t nch, size_t stride, int shift);
 /// The same over all n rows, OpenMP over 32-row halves: x [R, K] row-major, y [R, ldy].
 void gemv_q41_rows(const uint8_t* base, const Q41Lay& lay, size_t n, size_t K, const float* x, size_t R, float* y,
                    size_t ldy);

@@ -423,8 +423,12 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                         MoeBatch& b = g.moe_batch;
                         b.nt = get<uint64_t>(bj, "nt", bw);
                         b.args = get<std::vector<std::string>>(bj, "args", bw);
-                        if (b.nt == 0 || b.args.size() != 4 || b.args[0] != "pool")
-                            fail(bw, "wants nt > 0 and four args (pool, x, h, y)");
+                        if (bj.contains("kind")) b.kind = bj["kind"].get<std::string>();
+                        if (!b.kind.empty() && b.kind != "mbi") fail(bw, "unknown kind " + b.kind);
+                        const size_t nargs = b.kind == "mbi" ? 3 : 4;
+                        if (b.nt == 0 || b.args.size() != nargs || b.args[0] != "pool")
+                            fail(bw, b.kind == "mbi" ? "mbi wants nt > 0 and three args (pool, x, y)"
+                                                     : "wants nt > 0 and four args (pool, x, h, y)");
                         for (const auto& [slots_s, kname] : need(bj, "kernels", bw).items()) {
                             const size_t slots = static_cast<size_t>(std::stoull(slots_s));
                             if (slots == 0 || slots % 8) fail(bw, "slot count " + slots_s + " is not a positive multiple of 8");

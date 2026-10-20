@@ -849,6 +849,8 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
                        : " (no gemm_block program in this kernel set, or its layer types disagree)"));
     // the token-batched expert kernel: every stream's slot count must be what the manifest says
     if (const char* env = std::getenv("OFLM_OPEN_MOE_BATCH")) moe_batch_on_ = std::string(env) != "0";
+    for (int l = 0; l < nl_; ++l)
+        mbi_on_ = mbi_on_ || (moe_batch_on_ && types_[l]->gemm_block.moe_batch.kind == "mbi");
     if (const char* env = std::getenv("OFLM_OPEN_ATTN_BLOCK")) attn_block_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_LAYER_MAJOR")) layer_major_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_STAGE_MAJOR")) stage_major_on_ = std::string(env) != "0";
@@ -1200,6 +1202,10 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     // its decode reads ~2.2 GB a token and is bandwidth-bound: 16 threads, not the 27B's 8, by
     // default (GPU busy: 68 against 81 ms a token); OFLM_OPEN_DECODE_THREADS still decides
     if (q41_cpu_ && !std::getenv("OFLM_OPEN_DECODE_THREADS")) setenv("OFLM_OPEN_DECODE_THREADS", "16", 0);
+    if (mbi_on_ && (skip_pools || drop_pools_ || !q41_cpu_))
+        throw std::runtime_error("open_qwen36: the mbi expert kernels transform the pools' routed experts, so decode "
+                                 "must read them on the CPU (OFLM_OPEN_CPU_DECODE=1, the pools kept)");
+    if (mbi_on_) mbi_s_.assign(static_cast<size_t>(nl_), {});
     std::vector<uint8_t> pool_tmp;
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];
@@ -1216,6 +1222,23 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
             uint8_t* pool_host = pool.map<uint8_t*>();
             pools::pack_pool(*w_, lt, *file_, l, pool_host);
             build_weights(lt, l, "pool", pool_host);
+            if (mbi_on_ && lt.gemm_block.moe_batch.kind == "mbi") {
+                // the routed experts in mbi's transform: one shift for an expert's up + gate, one for
+                // its down (the kernels and the CPU decode read the transform from here on)
+                const auto& g = w_->moe;
+                const size_t E = g.experts, nug = g.expert_stripes() / 5120, ndn = g.up_bytes / 5120;
+                std::vector<int8_t>& S = mbi_s_[static_cast<size_t>(l)];
+                S.assign(2 * E, 0);
+#pragma omp parallel for schedule(dynamic, 4)
+                for (long long e = 0; e < static_cast<long long>(E); ++e) {
+                    uint8_t* ug = pool_host + g.base + static_cast<size_t>(e) * g.expert_stripes();
+                    uint8_t* dn = pool_host + g.pool_down + static_cast<size_t>(e) * g.up_bytes;
+                    S[2 * e] = static_cast<int8_t>(host::mbi_shift(ug, nug, 5120));
+                    S[2 * e + 1] = static_cast<int8_t>(host::mbi_shift(dn, ndn, 5120));
+                    host::mbi_transform(ug, nug, 5120, S[2 * e]);
+                    host::mbi_transform(dn, ndn, 5120, S[2 * e + 1]);
+                }
+            }
             pool.sync(XCL_BO_SYNC_BO_TO_DEVICE);
             pools_.push_back(std::move(pool));
         }
@@ -1674,6 +1697,7 @@ double gbps(double mb, double ms) { return ms > 0 ? mb / 1024.0 / (ms / 1000.0) 
 }  // namespace
 
 void Core::bench_dispatch(int layer, int reps) {
+    if (mbi_on_) throw std::runtime_error("open_qwen36: bench_dispatch: the pools' routed experts are in mbi's transform; only the prompt pipeline and the CPU decode read them");
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: bench_dispatch before load_weights");
     if (layer < 0 || layer >= nl_) throw std::runtime_error("open_qwen36: bench_dispatch: no such layer");
     const GemmBlockProgram& gb = types_[layer]->gemm_block;
@@ -2391,6 +2415,7 @@ void Core::dump_step_trace(const char* what) {
 }
 
 void Core::route(Kern& k, int layer, uint64_t act_off) {
+    if (mbi_on_) throw std::runtime_error("open_qwen36: route: the pools' routed experts are in mbi's transform; only the prompt pipeline and the CPU decode read them");
     auto t0 = std::chrono::steady_clock::now();
     if (k.moe2.empty()) throw std::runtime_error("open_qwen36: moeroute2 on " + k.name + ", which has no routed-expert table");
     xrt::bo& act = act_[layer];
@@ -2507,6 +2532,7 @@ void Core::route_math(int layer, const float* xm, uint32_t idx[8], float wt[8]) 
 }
 
 void Core::host_route(Kern& k, int layer, uint64_t act_off) {
+    if (mbi_on_) throw std::runtime_error("open_qwen36: host_route: the pools' routed experts are in mbi's transform; only the prompt pipeline and the CPU decode read them");
     auto t0 = std::chrono::steady_clock::now();
     const auto& R = w_->router;
     if (!R.present) throw std::runtime_error("open_qwen36: hostroute without layout.router in the manifest");
@@ -3129,6 +3155,7 @@ void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
     // the pool's experts: [up | gate] 128-row stripes interleaved, then the downs (stripes of K = ff)
     W.up0 = pool + w_->moe.base; W.up_stride = 2 * (ff / 128) * stripe; W.gate_off = stripe; W.up_lay = host::q41_stripe(2 * stripe);
     W.dn0 = pool + w_->moe.pool_down; W.dn_stride = w_->moe.up_bytes; W.dn_lay = host::q41_stripe(128 * ff * 5 / 8);
+    if (mbi_on_) W.mbi_s = mbi_s_.at(static_cast<size_t>(l)).data();
     moe_cpu(W, xn, R, x);
 }
 
@@ -3181,6 +3208,7 @@ void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
         for (size_t proj = 0; proj < 2; ++proj)
             for (size_t b = 0; b < ff / 64; ++b) {
                 Item it{W.up0 + ex[i].first * W.up_stride + proj * W.gate_off, W.up_lay, hid, b, {}, {}, rows.size()};
+                if (W.mbi_s) it.lay.shift = W.mbi_s[2 * ex[i].first];
                 for (size_t j = 0; j < rows.size(); ++j) {
                     it.x[j] = &xq[rows[j].first];
                     it.y[j] = hu.data() + (i * R + j) * 2 * ff + proj * ff;
@@ -3220,6 +3248,7 @@ void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
         for (size_t i = 0; i < NE; ++i) {
             const auto& rows = ex[i].second;
             Item ie{W.dn0 + ex[i].first * W.dn_stride, W.dn_lay, ff, b, {}, {}, rows.size()};
+            if (W.mbi_s) ie.lay.shift = W.mbi_s[2 * ex[i].first + 1];
             for (size_t j = 0; j < rows.size(); ++j) { ie.x[j] = &hq[i * R + j]; ie.y[j] = ye.data() + (i * R + j) * hid; }
             items.push_back(ie);
         }
@@ -5035,6 +5064,78 @@ void moe_scatter_avx512(float* o, const float* base, size_t hid, size_t NG, floa
             _mm512_storeu_ps(d, _mm512_fmadd_ps(w, _mm512_permutexvar_ps(lv, eo), _mm512_loadu_ps(d)));
         }
 }
+// mbi (designs/moe_batch/mbi.py) at hidden 2048: a slot is 64 tokens, row r of it tokens 16 r ..
+// 16 r + 15, and its x is [row 4][k-group 8][element]; an element is [header 64 B: S_ug, S_dn, the
+// row's real tokens | xa int8 [16 k-tiles][4 token groups][4][16] | qs int16 [8 blocks][4 tg][64]
+// (lane 16 t + n: token t's block sum) | sx bf16 [4 tg][64]]. y bf16 [ob 32][row 4][rg 4][tg 4][t 4][16].
+constexpr size_t kMbiXel = 64 + 16 * 4 * 64 + 8 * 4 * 128 + 4 * 128, kMbiXslot = 4 * 8 * kMbiXel;
+constexpr size_t kMbiYslot = 32 * 4 * 2048;   // bytes
+// per row of x [T, 2048]: int8 per (row, 256-K group) at a bf16 scale (|q| <= 127 with amax / 126),
+// the scales [T, 8] and the block sums [T, 64]
+void mbi_quant_rows(const float* x, size_t T, int8_t* q, uint16_t* sx, int16_t* qs) {
+#pragma omp parallel for schedule(static)
+    for (long long tt = 0; tt < static_cast<long long>(T); ++tt) {
+        const size_t t = static_cast<size_t>(tt);
+        for (size_t kg = 0; kg < 8; ++kg) {
+            const float* v = x + t * 2048 + kg * 256;
+            float amax = 0.f;
+            for (size_t i = 0; i < 256; ++i) amax = std::max(amax, std::fabs(v[i]));
+            const uint16_t sb = f32_to_bf16(amax / 126.f);
+            const float s = bf16_to_f32(sb), inv = s > 0.f ? 1.f / s : 0.f;
+            sx[t * 8 + kg] = sb;
+            int8_t* o = q + t * 2048 + kg * 256;
+            for (size_t i = 0; i < 256; ++i)
+                o[i] = static_cast<int8_t>(std::max(-127.f, std::min(127.f, std::nearbyint(v[i] * inv))));
+            for (size_t b = 0; b < 8; ++b) {
+                int sum = 0;
+                for (size_t i = 0; i < 32; ++i) sum += o[b * 32 + i];
+                qs[t * 64 + kg * 8 + b] = static_cast<int16_t>(sum);
+            }
+        }
+    }
+}
+// a slot's 32 element headers (every slot of the stream, used or not: 0 real tokens skips a row)
+void mbi_headers(uint8_t* xs, int s_ug, int s_dn, size_t ntok) {
+    for (size_t r = 0; r < 4; ++r)
+        for (size_t kg = 0; kg < 8; ++kg) {
+            int32_t h[3] = {s_ug, s_dn, static_cast<int32_t>(std::min<size_t>(16, ntok > 16 * r ? ntok - 16 * r : 0))};
+            std::memcpy(xs + (r * 8 + kg) * kMbiXel, h, sizeof h);
+        }
+}
+// token j of a slot from its quantized row
+void mbi_pack_token(uint8_t* xs, size_t j, const int8_t* q, const uint16_t* sx, const int16_t* qs) {
+    const size_t r = j / 16, tg = (j % 16) / 4, t = j % 4;
+    for (size_t kg = 0; kg < 8; ++kg) {
+        uint8_t* el = xs + (r * 8 + kg) * kMbiXel;
+        for (size_t kt = 0; kt < 16; ++kt) std::memcpy(el + 64 + ((kt * 4 + tg) * 4 + t) * 16, q + kg * 256 + kt * 16, 16);
+        int16_t* qd = reinterpret_cast<int16_t*>(el + 64 + 4096);
+        for (size_t b = 0; b < 8; ++b)
+            for (size_t n = 0; n < 16; ++n) qd[(b * 4 + tg) * 64 + t * 16 + n] = qs[kg * 8 + b];
+        uint16_t* sd = reinterpret_cast<uint16_t*>(el + 64 + 8192);
+        for (size_t n = 0; n < 16; ++n) sd[tg * 64 + t * 16 + n] = sx[kg];
+    }
+}
+// o[2048] += w y for token j of a slot's bf16 y
+__attribute__((target("avx512f,avx512vl,avx512bw,fma")))
+void mbi_scatter_avx512(float* o, const uint16_t* ys, size_t j, float wt) {
+    const size_t r = j / 16, tg = (j % 16) / 4, t = j % 4;
+    const uint16_t* b = ys + r * 1024 + tg * 64 + t * 16;
+    const __m512 w = _mm512_set1_ps(wt);
+    for (size_t ob = 0; ob < 32; ++ob)
+        for (size_t rg = 0; rg < 4; ++rg) {
+            const __m512 v = _mm512_castsi512_ps(_mm512_slli_epi32(
+                _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + ob * 4096 + rg * 256))), 16));
+            float* d = o + ob * 64 + rg * 16;
+            _mm512_storeu_ps(d, _mm512_fmadd_ps(w, v, _mm512_loadu_ps(d)));
+        }
+}
+void mbi_scatter_scalar(float* o, const uint16_t* ys, size_t j, float wt) {
+    const size_t r = j / 16, tg = (j % 16) / 4, t = j % 4;
+    const uint16_t* b = ys + r * 1024 + tg * 64 + t * 16;
+    for (size_t ob = 0; ob < 32; ++ob)
+        for (size_t rg = 0; rg < 4; ++rg)
+            for (size_t n = 0; n < 16; ++n) o[ob * 64 + rg * 16 + n] += wt * bf16_to_f32(b[ob * 4096 + rg * 256 + n]);
+}
 void moe_scatter_scalar(float* o, const float* base, size_t hid, size_t NG, float wt) {
     for (size_t band = 0; band < hid / 64; ++band)
         for (size_t g = 0; g < 4; ++g) {
@@ -5322,6 +5423,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     std::vector<std::vector<int32_t>> ridx_c(C);
     std::vector<std::vector<float>> rwt_c(C), gate_c(C);
     std::vector<std::vector<uint16_t>> xb16_c(C);
+    // mbi: each chunk's rows quantized once (int8 per 256-K group, bf16 scales, block sums)
+    const bool mbi = mbi_on_;
+    std::vector<std::vector<int8_t>> xq_c(mbi ? C : 0);
+    std::vector<std::vector<uint16_t>> xsx_c(mbi ? C : 0);
+    std::vector<std::vector<int16_t>> xqs_c(mbi ? C : 0);
+    if (mbi && hid != 2048) throw std::runtime_error("open_qwen36: the mbi expert kernels are built for hidden 2048");
     size_t mb_np = 0;
     auto mbuf = [&](char what, size_t set, size_t p) { return std::string("pmb_") + what + std::to_string(set) + "_" + std::to_string(p); };
     if (mbp) {
@@ -5330,8 +5437,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         for (size_t set = 0; set < 2; ++set)
             for (size_t p = 0; p < mb_np; ++p) {
                 need(mbuf('x', set, p), globals_.at(mbp->args[1]).size());
-                need(mbuf('h', set, p), globals_.at(mbp->args[2]).size());
-                need(mbuf('y', set, p), globals_.at(mbp->args[3]).size());
+                if (mbi) {
+                    need(mbuf('y', set, p), globals_.at(mbp->args[2]).size());
+                } else {
+                    need(mbuf('h', set, p), globals_.at(mbp->args[2]).size());
+                    need(mbuf('y', set, p), globals_.at(mbp->args[3]).size());
+                }
             }
     }
     // host rows
@@ -5462,7 +5573,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             Kern& mk = kerns_.at(mp.kernel);
                             stream_patch::moe2_apply(mk.iw(), mk.moe2, mp.ex.data(), w_->moe);
                             mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                            run(mp.kernel, {mbp->args[0], mbuf('x', set, p), mbuf('h', set, p), mbuf('y', set, p)});
+                            if (mbi) run(mp.kernel, {mbp->args[0], mbuf('x', set, p), mbuf('y', set, p)});
+                            else run(mp.kernel, {mbp->args[0], mbuf('x', set, p), mbuf('h', set, p), mbuf('y', set, p)});
                         }
                         timing_.moe_run_ms += ms_since(tm);
                     }
@@ -5859,10 +5971,16 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     moe_ms[0] += ms_since(tm);
                     auto tg = std::chrono::steady_clock::now();
                     gate_c[c].resize(t_real);
-                    // the chunk's rows as bf16 once, for the group's gather (copies of 8 at a time)
-                    xb16_c[c].resize(M * hid);
+                    if (mbi) {
+                        // the chunk's rows as mbi's int8 k-group parts, once, for the group's gather
+                        xq_c[c].resize(M * hid); xsx_c[c].resize(M * 8); xqs_c[c].resize(M * 64);
+                        mbi_quant_rows(xc, t_real, xq_c[c].data(), xsx_c[c].data(), xqs_c[c].data());
+                    } else {
+                        // the chunk's rows as bf16 once, for the group's gather (copies of 8 at a time)
+                        xb16_c[c].resize(M * hid);
 #pragma omp parallel for
-                    for (long long i = 0; i < static_cast<long long>(t_real * hid); ++i) xb16_c[c][static_cast<size_t>(i)] = f32_to_bf16(xc[i]);
+                        for (long long i = 0; i < static_cast<long long>(t_real * hid); ++i) xb16_c[c][static_cast<size_t>(i)] = f32_to_bf16(xc[i]);
+                    }
 #pragma omp parallel for
                     for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
                         const float* x = xc + static_cast<size_t>(tk) * hid;
@@ -5910,6 +6028,28 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                     pt[owed[e][off + j].first].push_back({i * NTm + j, owed[e][off + j].second});
                             }
                             xrt::bo& xb = buffer(mbuf('x', set, p), 0);
+                            if (mbi) {
+                                uint8_t* xm = xb.map<uint8_t*>();
+                                const int8_t* S = mbi_s_.at(l).data();
+#pragma omp parallel for
+                                for (long long i = 0; i < static_cast<long long>(slots); ++i) {
+                                    uint8_t* xs = xm + static_cast<size_t>(i) * kMbiXslot;
+                                    if (static_cast<size_t>(i) >= n) { mbi_headers(xs, 0, 0, 0); continue; }
+                                    const auto& [e, off] = visits[done + static_cast<size_t>(i)];
+                                    const size_t nt = std::min(NTm, owed[e].size() - off);
+                                    mbi_headers(xs, S[2 * e], S[2 * e + 1], nt);
+                                    for (size_t j = 0; j < nt; ++j) {
+                                        const size_t gr = static_cast<size_t>(owed[e][off + j].first), cc = c0 + gr / M, rr = gr % M;
+                                        mbi_pack_token(xs, j, xq_c[cc].data() + rr * hid, xsx_c[cc].data() + rr * 8, xqs_c[cc].data() + rr * 64);
+                                    }
+                                }
+                                auto ts = std::chrono::steady_clock::now();
+                                xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, slots * kMbiXslot, 0);
+                                moe_ms[3] += ms_since(ts);
+                                ms.passes.push_back(std::move(mp));
+                                done += n;
+                                continue;
+                            }
                             uint16_t* xh = xb.map<uint16_t*>();
 #pragma omp parallel for
                             for (long long i = 0; i < static_cast<long long>(n); ++i) {
@@ -5957,7 +6097,24 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 auto tr = std::chrono::steady_clock::now();
                 const size_t NTm = mbp->nt, NG = NTm / 8;
                 static const bool avx512 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq");
-                for (size_t p = 0; p < ms.passes.size(); ++p) {
+                for (size_t p = 0; mbi && p < ms.passes.size(); ++p) {
+                    xrt::bo& yb = buffer(mbuf('y', set, p), 0);
+                    auto ty = std::chrono::steady_clock::now();
+                    if (!ms.ysynced) read_back(yb, ms.passes[p].n * kMbiYslot, 0);
+                    moe_ms[4] += ms_since(ty);
+                    const uint16_t* yh = yb.map<const uint16_t*>();
+                    const auto& pt = ms.per_token[p];
+#pragma omp parallel for
+                    for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
+                        float* o = rs + static_cast<size_t>(tk) * hid;
+                        for (const auto& [col, wt] : pt[grow0 + static_cast<size_t>(tk)]) {
+                            const uint16_t* ys = yh + (col / NTm) * (kMbiYslot / 2);
+                            if (avx512) mbi_scatter_avx512(o, ys, col % NTm, wt);
+                            else mbi_scatter_scalar(o, ys, col % NTm, wt);
+                        }
+                    }
+                }
+                for (size_t p = 0; !mbi && p < ms.passes.size(); ++p) {
                     xrt::bo& yb = buffer(mbuf('y', set, p), 0);
                     auto ty = std::chrono::steady_clock::now();
                     if (!ms.ysynced) read_back(yb, ms.passes[p].n * hid * NTm * 4, 0);
@@ -6054,6 +6211,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
 
 void Core::moe_token(int l, const float* xm, const float* res, const float* probs, const int32_t* idx, const float* w,
                      float* out) {
+    if (mbi_on_) throw std::runtime_error("open_qwen36: moe_token: the pools' routed experts are in mbi's transform; only the prompt pipeline and the CPU decode read them");
     const LayerType& lt = *types_[l];
     const GemmBlockProgram& gb = lt.gemm_block;
     const size_t hid = w_->hidden, E = w_->moe.experts, topk = w_->moe.topk;
@@ -6867,6 +7025,7 @@ void Core::layer_full_staged(int l, float* xres, size_t B, size_t T, size_t N, s
 // of the 128-stream, then a handful (Poisson(8) tokens per expert).
 void Core::moe_block(int l, const float* xm, const float* res, const int32_t* idx, const float* w, size_t T, size_t t_real,
                      float* out) {
+    if (mbi_on_) throw std::runtime_error("open_qwen36: moe_block: the pools' routed experts are in mbi's transform; only the prompt pipeline and the CPU decode read them");
     const MoeBatch& mb = types_[l]->gemm_block.moe_batch;
     const size_t hid = w_->hidden, E = w_->moe.experts, topk = w_->moe.topk, NT = mb.nt;
     auto tp = std::chrono::steady_clock::now();
@@ -6992,6 +7151,7 @@ bool Core::prompt_route_ok() const {
 // expert, runs, and scatters y[slot] back with the router weights. Core::moe_block's law.
 void Core::experts_batch(int l, const float* xm, const float* res, const int32_t* idx, const float* w, size_t n,
                          float* out) {
+    if (mbi_on_) throw std::runtime_error("open_qwen36: experts_batch: the pools' routed experts are in mbi's transform; only the prompt pipeline and the CPU decode read them");
     const MoeBatch& mb = w_->expert_batch;
     const size_t hid = w_->hidden, E = w_->moe.experts, topk = w_->moe.topk, NT = mb.nt;
     std::memcpy(out, res, n * hid * 4);

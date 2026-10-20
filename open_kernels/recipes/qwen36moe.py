@@ -1089,6 +1089,16 @@ MBE = os.environ.get("OPEN_QWEN36_MBE", "1") != "0"
 MBE_NT = 32
 if MBE:
     MB_NT = MBE_NT
+# OPEN_QWEN36_MBI (default off): designs/moe_batch/mbi.py -- the int8 x int4 MAC mode, a column's
+# four rows splitting a visit's MBI_NT = 64 tokens, the weights broadcast to them. The driver
+# transforms the routed experts of the pool at load (signed nibbles, int16 d / mc; Core,
+# moe_batch.kind "mbi"), and the host packs x as int8 k-group elements; no h buffer.
+MBI = os.environ.get("OPEN_QWEN36_MBI", "0") != "0"
+MBI_NT = 64
+MBI_XSLOT = 4 * 8 * (64 + 16 * 4 * 64 + 8 * 4 * 128 + 4 * 128)     # mbi.py's XSLOT at HID 2048
+MBI_YSLOT = 32 * 4 * 2048                                         # mbi.py's YSLOT at HID 2048
+if MBI:
+    MB_NT = MBI_NT
 ATTN_LMAX = 4096      # the widest attention GEMM stream (rows of window); a longer window is chunked on the host
 # The q4_1 GEMM reads the band law; an all-q8 MoE route runs every GEMM on bf16 instead (bf16_route), and
 # a q8 projection elsewhere runs as its exact q4_1 split (gemm_weight): every q8 code is 16 hi + lo, so two q4_1 halves sum
@@ -1227,10 +1237,11 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
     # left, so the rungs decide the padding: a 256-token block leaves ~306 visits a layer,
     # which without a 64 rounds up to 256 + 128 and streams 78 experts nobody asked for.
     mb_slots = [s for s in (E >> i for i in range(30)) if s >= 8 and s % 8 == 0]
-    mb_args = ["pool", "mb_x", "mb_h", "mb_y"]
+    mb_args = ["pool", "mb_x", "mb_y"] if MBI else ["pool", "mb_x", "mb_h", "mb_y"]
     if not dense:
         check_buffer_args("moe_batch", mb_args)
-    moe_batch = {"kernels": {str(s): f"mb_s{s}" for s in mb_slots}, "args": mb_args, "nt": MB_NT}
+    moe_batch = {"kernels": {str(s): f"mb_s{s}" for s in mb_slots}, "args": mb_args, "nt": MB_NT,
+                 **({"kind": "mbi"} if MBI else {})}
 
     # Block attention as two bf16 GEMMs per kv head (OPEN-PREFILL-ATTN, designs/attn_block): the
     # group's 8 query heads x T tokens against the window, scores then values, the row softmax on
@@ -1350,12 +1361,22 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
         out["contexts"].setdefault("mb", f"mb_s{mb_slots[0]}/final.xclbin")
         name = f"mb_s{s}"
         out["kernels"][name] = {"context": "mb", "insts": f"{name}/insts.bin", "patch": "moebatch", "build": name}
+        if MBI:
+            if hid != 2048 or ff != 512:
+                raise OpRangeError(f"mbi: built for hidden 2048 / expert ff 512, not {hid} / {ff}")
+            out["builds"][name] = {"design": "moe_batch/mbi.py", "build_dir": f"moe_batch/build_mbi_s{s}{sfx}",
+                                   "env": {"MBI_SLOTS": str(s), "MBI_EXPERTS": str(E), "MBI_POOL_DOWN": str(L.POOL_DOWN),
+                                           "MBI_POOL_BYTES": str(L.POOL_BYTES)}}
+            continue
         out["builds"][name] = {"design": "moe_batch/mbe.py" if MBE else "moe_batch/moe_batch.py",
                                "build_dir": f"moe_batch/build_{'mbe_' if MBE else ''}s{s}{sfx}",
                                "env": {"MB_SLOTS": str(s), "MB_NT": str(MB_NT), "MB_HID": str(hid), "MB_FF": str(ff),
                                        "MB_EXPERTS": str(E), "MB_POOL_DOWN": str(L.POOL_DOWN),
                                        "MB_POOL_BYTES": str(L.POOL_BYTES), **({"MB_BFP": "1"} if MBE else {})}}
-    if not dense:
+    if not dense and MBI:
+        out["globals"]["mb_x"] = mb_slots[0] * MBI_XSLOT
+        out["globals"]["mb_y"] = mb_slots[0] * MBI_YSLOT
+    elif not dense:
         out["globals"]["mb_x"] = mb_slots[0] * hid * MB_NT * 2
         out["globals"]["mb_h"] = mb_slots[0] * ff * MB_NT * 2
         out["globals"]["mb_y"] = mb_slots[0] * hid * MB_NT * 4
@@ -1556,7 +1577,7 @@ KERNEL_SOURCES = [
     "designs/ln/ln.h", "designs/ln/*.cc", "designs/ln/ln.py", "designs/lin_layer/ln_nr.cc",
     "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.cc", "designs/lm_head_q8/*.h",
     "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc", "designs/gemm_q4_prefill/*.h",
-    "designs/moe_batch/moe_batch.py", "designs/moe_batch/mbe.py", "designs/moe_batch/*.cc", "designs/moe_batch/*.h",
+    "designs/moe_batch/moe_batch.py", "designs/moe_batch/mbe.py", "designs/moe_batch/mbi.py", "designs/moe_batch/*.cc", "designs/moe_batch/*.h",
     "designs/lfm2moe/eb_*.cc",
     "designs/attn_block/attn_gemm.py", "../npu_offload/gemm_rtp/gemm_pretiled.py", "../npu_offload/gemm_rtp/npue.py",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",

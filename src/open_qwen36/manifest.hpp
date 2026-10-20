@@ -96,8 +96,11 @@ struct GemmWeight {
 /// patches the slots' expert offsets (moebatch) and runs it against pool, x, h, y.
 struct MoeBatch {
     std::map<size_t, std::string> kernels;   ///< slots -> kernel name
-    std::vector<std::string> args;           ///< pool, then the x / h / y globals
+    std::vector<std::string> args;           ///< pool, then the x / h / y globals (mbi: x / y)
     size_t nt = 0;                           ///< token slots per expert visit
+    /// "" (moe_batch.py / mbe.py: bf16 x, h through DDR) or "mbi" (designs/moe_batch/mbi.py: int8
+    /// k-group x elements, bf16 y, and the pool's routed experts transformed at load)
+    std::string kind;
     bool present() const { return !kernels.empty(); }
 };
 

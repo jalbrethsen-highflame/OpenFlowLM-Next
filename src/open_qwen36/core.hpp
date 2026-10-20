@@ -755,6 +755,10 @@ private:
     bool cpu_decode_on_ = false;
     bool drop_pools_ = false;   ///< the q4 pools freed after building the int4 weights (CPU decode)
     bool q41_cpu_ = false;      ///< CPU decode on the q4_1 pools in place (a MoE family: host::gemv_q41_rows)
+    /// moe_batch.kind "mbi" (designs/moe_batch/mbi.py): the pools' routed experts in mbi's transform
+    /// (host::mbi_transform at load), mbi_s_[l] their shifts [expert][S_ug, S_dn]
+    bool mbi_on_ = false;
+    std::vector<std::vector<int8_t>> mbi_s_;
     /// OFLM_OPEN_KV8 (default on with q41_cpu_): the CPU decode's attention reads an int8 copy of
     /// each full layer's cache (host::kv8_quant_rows); kv8_valid_[l] rows of it match the bf16 cache
     std::vector<std::vector<uint8_t>> kv8_;
@@ -772,6 +776,7 @@ private:
         const uint8_t* sh_ug = nullptr; const uint8_t* sh_dn = nullptr;
         const uint8_t* up0 = nullptr; size_t up_stride = 0, gate_off = 0; host::Q41Lay up_lay;
         const uint8_t* dn0 = nullptr; size_t dn_stride = 0; host::Q41Lay dn_lay;
+        const int8_t* mbi_s = nullptr;   ///< the experts in mbi's transform: [expert][S_ug, S_dn]
     };
     /// x += the MoE block of xn for R rows on the CPU (the shared expert gated, then the routed
     /// experts ascending; each expert's weights read once for the rows that chose it)
