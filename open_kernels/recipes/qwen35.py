@@ -336,10 +336,12 @@ DECODE2_FRAC = float(_os.environ.get("OPEN_QWEN35_DECODE2_FRAC", "0.31"))
 DECODE2_MIN_KT = int(_os.environ.get("OPEN_QWEN35_DECODE2_MIN_KT", 16))
 
 
-def gemm_dit(spec: ModelSpec) -> dict | None:
+def gemm_dit(spec: ModelSpec, route: dict | None = None, ff: int | None = None, decode: bool = True) -> dict | None:
     """{m, kernels {NxK: name}, npad {N: Npad}, x {K: global}, y {Npad: global}} for every
-    gemm_route shape dit_gemm can take (K % 512, N padded to 1024), or None."""
-    r = gemm_route(spec) if GEMM_DIT else None
+    gemm_route shape dit_gemm can take (K % 512, N padded to 1024), or None. `route` and `ff`
+    default to this family's (qwen36moe passes its MoE route and the shared expert's width);
+    decode=False leaves out the CPU decode route's NPU shares."""
+    r = (route if route is not None else gemm_route(spec)) if GEMM_DIT else None
     if not r:
         return None
     shapes = []
@@ -351,7 +353,7 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             return None
         shapes.append((n, k))
     npad = {n: -(-n // 1024) * 1024 for n, _ in shapes}
-    ff, hid = spec.intermediate, spec.hidden
+    ff, hid = (spec.intermediate if ff is None else ff), spec.hidden
     # the FFN fused on the device: up|gate with the SwiGLU epilogue (h in the first 64 of every
     # 128 columns of its C), then down reading that C gathered -- no host pass in between
     ffn = None
@@ -380,10 +382,10 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
         sm = f"_m{GEMM_TINY_M}"
         tiny = {"m": GEMM_TINY_M, "mt": _TINY_MT, "kernels2": {key: name + sm for key, name in k2.items()},
                 "ffn": {"up2p": ffn["up2p"] + sm, "down2u": ffn["down2u"] + sm}}
-    decode = None
-    if tiny and DECODE_NPU_FRAC > 0:
+    decode_on, decode = decode, None
+    if decode_on and tiny and DECODE_NPU_FRAC > 0:
         split = {}
-        for key in list(k2) + ([f"{2 * ff_}x{spec.hidden}", f"{spec.hidden}x{ff_}"] if (ff_ := spec.intermediate) and ffn else []):
+        for key in list(k2) + ([f"{2 * ff_}x{spec.hidden}", f"{spec.hidden}x{ff_}"] if (ff_ := ff) and ffn else []):
             n, k = (int(x) for x in key.split("x"))
             nn = max(1024, int(round(n * DECODE_NPU_FRAC / 1024)) * 1024)
             if nn < n:
@@ -395,10 +397,10 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
         if split:
             decode = {"m": GEMM_TINY_M, "mt": _TINY_MT, "split": split}
     decode2 = None
-    if DECODE2 and tiny and GEMM_B4 and ffn:
+    if decode_on and DECODE2 and tiny and GEMM_B4 and ffn:
         hid = spec.hidden
         split = {}
-        for key in sorted(set(k2) | {f"{2 * spec.intermediate}x{hid}", f"{hid}x{spec.intermediate}"}):
+        for key in sorted(set(k2) | {f"{2 * ff}x{hid}", f"{hid}x{ff}"}):
             n, k = (int(x) for x in key.split("x"))
             if n < 4096 or k % 64:
                 continue
@@ -448,6 +450,48 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             "_shapes": [(npad[n], k) for n, k in shapes]}
 
 
+def dit_programs(spec: ModelSpec, out: dict, d: dict | None) -> None:
+    """The gemm_dit layout's contexts, kernels and globals into a programs() result."""
+    if not d:
+        return
+    for npad, k in sorted(set(d["_shapes"])):
+        name = f"dit_n{npad}_k{k}"
+        out["contexts"].setdefault("dit", f"{name}/final.xclbin")
+        out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
+        out["globals"][f"dit_x_k{k}"] = DIT_M * k * 2
+        out["globals"][f"dit_y_n{npad}"] = DIT_M * npad * 2
+    if "ffn" in d:
+        for name in (d["ffn"]["up"], d["ffn"]["down"]):
+            out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
+    names2 = list(d.get("kernels2", {}).values()) + [d["ffn"][x] for x in ("up2", "down2", "up2p", "down2u")
+                                                     if x in d.get("ffn", {})]
+    names2 += list(d.get("small", {}).get("kernels2", {}).values()) + list(d.get("small", {}).get("ffn", {}).values())
+    for name in names2:
+        out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
+        out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
+    for name in (list(d.get("tiny", {}).get("kernels2", {}).values()) + list(d.get("tiny", {}).get("ffn", {}).values())
+                 + [k for v in d.get("decode", {}).get("split", {}).values() for k in v["kernels"].values()]):
+        out["contexts"].setdefault("dit2t", f"{name}/final.xclbin")     # 64-row tiles: its own image
+        out["kernels"][name] = {"context": "dit2t", "insts": f"{name}/insts.bin", "build": name}
+    for name in sorted({c[2] for v in d.get("decode2", {}).get("split", {}).values() for c in v["chunks"]}):
+        out["contexts"].setdefault("dec", f"{name}/final.xclbin")         # dit2/dec.py: its own image
+        out["kernels"][name] = {"context": "dec", "insts": f"{name}/insts.bin", "build": name}
+    for key in ("lk", "nc"):      # the noncausal streams share the causal ones' image
+        for lk, name in d.get("fa", {}).get(key, {}).items():
+            out["contexts"].setdefault("fa", f"{name}/final.xclbin")
+            out["kernels"][name] = {"context": "fa", "insts": f"{name}/insts.bin", "build": name}
+    for lk, name in [*d.get("fa", {}).get("ncb", {}).items(), *d.get("fa", {}).get("cb", {}).items(),
+                     *d.get("fa", {}).get("cbs", {}).items()]:   # dit_fa256b: its own image
+        out["contexts"].setdefault("fab", f"{name}/final.xclbin")
+        out["kernels"][name] = {"context": "fab", "insts": f"{name}/insts.bin", "build": name}
+    if "fa" in d:
+        out["globals"]["fa_q"] = DIT_M * d["fa"]["q_cols"] * 2
+        out["globals"]["fa_o"] = DIT_M * d["fa"]["q_cols"] * 2
+    for k in sorted({int(x.split("x")[1]) for x in d.get("kernels2", {})} | ({spec.hidden} if names2 else set())
+                    | ({d["ffn"]["ff"]} if "down2" in d.get("ffn", {}) else set())):
+        out["globals"][f"dit2_x_k{k}"] = DIT_M * k * 9 // 8
+
+
 # ---- the step program: ONE run per layer type (nothing is routed, so no part split)
 def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     L = layout(spec)
@@ -489,44 +533,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             out[k].update(r[k])
         for lt, gb in r["layer_types"].items():
             out["layer_types"][lt]["gemm_block"] = gb
-    d = gemm_dit(spec)
-    if d:
-        for npad, k in sorted(set(d["_shapes"])):
-            name = f"dit_n{npad}_k{k}"
-            out["contexts"].setdefault("dit", f"{name}/final.xclbin")
-            out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
-            out["globals"][f"dit_x_k{k}"] = DIT_M * k * 2
-            out["globals"][f"dit_y_n{npad}"] = DIT_M * npad * 2
-        if "ffn" in d:
-            for name in (d["ffn"]["up"], d["ffn"]["down"]):
-                out["kernels"][name] = {"context": "dit", "insts": f"{name}/insts.bin", "build": name}
-        names2 = list(d.get("kernels2", {}).values()) + [d["ffn"][x] for x in ("up2", "down2", "up2p", "down2u")
-                                                         if x in d.get("ffn", {})]
-        names2 += list(d.get("small", {}).get("kernels2", {}).values()) + list(d.get("small", {}).get("ffn", {}).values())
-        for name in names2:
-            out["contexts"].setdefault("dit2", f"{name}/final.xclbin")
-            out["kernels"][name] = {"context": "dit2", "insts": f"{name}/insts.bin", "build": name}
-        for name in (list(d.get("tiny", {}).get("kernels2", {}).values()) + list(d.get("tiny", {}).get("ffn", {}).values())
-                     + [k for v in d.get("decode", {}).get("split", {}).values() for k in v["kernels"].values()]):
-            out["contexts"].setdefault("dit2t", f"{name}/final.xclbin")     # 64-row tiles: its own image
-            out["kernels"][name] = {"context": "dit2t", "insts": f"{name}/insts.bin", "build": name}
-        for name in sorted({c[2] for v in d.get("decode2", {}).get("split", {}).values() for c in v["chunks"]}):
-            out["contexts"].setdefault("dec", f"{name}/final.xclbin")         # dit2/dec.py: its own image
-            out["kernels"][name] = {"context": "dec", "insts": f"{name}/insts.bin", "build": name}
-        for key in ("lk", "nc"):      # the noncausal streams share the causal ones' image
-            for lk, name in d.get("fa", {}).get(key, {}).items():
-                out["contexts"].setdefault("fa", f"{name}/final.xclbin")
-                out["kernels"][name] = {"context": "fa", "insts": f"{name}/insts.bin", "build": name}
-        for lk, name in [*d.get("fa", {}).get("ncb", {}).items(), *d.get("fa", {}).get("cb", {}).items(),
-                         *d.get("fa", {}).get("cbs", {}).items()]:   # dit_fa256b: its own image
-            out["contexts"].setdefault("fab", f"{name}/final.xclbin")
-            out["kernels"][name] = {"context": "fab", "insts": f"{name}/insts.bin", "build": name}
-        if "fa" in d:
-            out["globals"]["fa_q"] = DIT_M * d["fa"]["q_cols"] * 2
-            out["globals"]["fa_o"] = DIT_M * d["fa"]["q_cols"] * 2
-        for k in sorted({int(x.split("x")[1]) for x in d.get("kernels2", {})} | ({spec.hidden} if names2 else set())
-                        | ({d["ffn"]["ff"]} if "down2" in d.get("ffn", {}) else set())):
-            out["globals"][f"dit2_x_k{k}"] = DIT_M * k * 9 // 8
+    dit_programs(spec, out, gemm_dit(spec))
     return out
 
 
@@ -575,112 +582,117 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     r = gemm_route(spec)
     if r:
         b.update(r["builds"])
-    d = gemm_dit(spec)
-    if d:
-        for npad, k in sorted(set(d["_shapes"])):
-            b[f"dit_n{npad}_k{k}"] = {"design": "dit_gemm/dit_gemm.py",
-                                      "build_dir": f"dit_gemm/build_m{DIT_M}_k{k}_n{npad}",
-                                      "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(npad)}}
-        for key, name in d.get("kernels2", {}).items():
-            n, k = (int(x) for x in key.split("x"))
-            b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{k}_n{d['npad'][str(n)]}{_HS_SFX}",
-                       "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), "DG_LAYOUT": _lay(), **_HS_ENV}}
-        for lk, name in d.get("fa", {}).get("lk", {}).items():
-            # DF_EXP_FIX: the corrected exp2 (+9 % kernel time); against host attention on 4K tokens
-            # of docs prose the whole fast path is within noise (NLL -0.0002 +- 0.0016)
-            b[name] = {"design": "dit_fa256/dit_fa256.py", "build_dir": f"dit_fa256/build_l{DIT_M}_lk{lk}_fix",
-                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": str(int(lk) - DIT_M), "DF_EXP_FIX": "1",
-                               "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
-        for lk, name in d.get("fa", {}).get("nc", {}).items():
-            b[name] = {"design": "dit_fa256/dit_fa256.py", "build_dir": f"dit_fa256/build_l{DIT_M}_lk{lk}_fix_nc",
-                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": "0", "DF_EXP_FIX": "1",
-                               "DF_CAUSAL": "0", "DF_VALID": str(FA_NC_VALID),
-                               "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
-        for lk, name in d.get("fa", {}).get("cb", {}).items():
-            b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{DIT_M}_lk{lk}_causal_kvi_qs",
-                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_CAUSAL": "1", "DF_QOFF": str(FA_CB_QOFF), "DF_KV_INTER": "1",
-                               "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
-        for lk, name in d.get("fa", {}).get("cbs", {}).items():
-            sm = d["fa"]["cbs_m"]
-            b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{sm}_lk{lk}_causal_kvi_qs",
-                       "env": {"DF_L": str(sm), "DF_LK": lk, "DF_CAUSAL": "1", "DF_QOFF": str(FA_CB_QOFF), "DF_KV_INTER": "1",
-                               "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
-        for lk, name in d.get("fa", {}).get("ncb", {}).items():
-            b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{DIT_M}_lk{lk}",
-                       "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_VALID": str(FA_NC_VALID),
-                               "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
-        if "down2" in d.get("ffn", {}):
-            b[d["ffn"]["down2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{d['ffn']['ff']}_n{spec.hidden}{_HS_SFX}",
-                                    "env": {"DG_M": str(DIT_M), "DG_K": str(d["ffn"]["ff"]), "DG_N": str(spec.hidden), "DG_LAYOUT": _lay(), **_HS_ENV}}
-        if "up2" in d.get("ffn", {}):
-            ff2 = d["ffn"]["ff"]
-            b[d["ffn"]["up2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi{_HS_SFX}",
-                                  "env": {"DG_M": str(DIT_M), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
-                                          "DG_LAYOUT": _lay(epi={"first_cb": 0}), **_HS_ENV}}
-        if "up2p" in d.get("ffn", {}):
-            ff2 = d["ffn"]["ff"]
-            b[d["ffn"]["up2p"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi_ph{_HS_SFX}",
-                                   "env": {"DG_M": str(DIT_M), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
-                                           "DG_LAYOUT": _lay(epi={"first_cb": 0}, pack_h=True), **_HS_ENV}}
-            b[d["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{ff2}_n{spec.hidden}_au{_HS_SFX}",
-                                     "env": {"DG_M": str(DIT_M), "DG_K": str(ff2), "DG_N": str(spec.hidden),
-                                             "DG_LAYOUT": _lay(a_units=True), **_HS_ENV}}
-        if "small" in d:
-            sm, S = d["small"]["m"], d["small"]
-            for key, name in S["kernels2"].items():
-                n, k = (int(x) for x in key.split("x"))
-                b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{sm}_k{k}_n{d['npad'][str(n)]}{_HS_SFX}",
-                           "env": {"DG_M": str(sm), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), "DG_LAYOUT": _lay(), **_HS_ENV}}
-            ff2 = d["ffn"]["ff"]
-            b[S["ffn"]["up2p"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{sm}_k{spec.hidden}_n{2 * ff2}_epi_ph{_HS_SFX}",
-                                   "env": {"DG_M": str(sm), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
-                                           "DG_LAYOUT": _lay(epi={"first_cb": 0}, pack_h=True), **_HS_ENV}}
-            b[S["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{sm}_k{ff2}_n{spec.hidden}_au{_HS_SFX}",
-                                     "env": {"DG_M": str(sm), "DG_K": str(ff2), "DG_N": str(spec.hidden),
-                                             "DG_LAYOUT": _lay(a_units=True), **_HS_ENV}}
-        if "tiny" in d:
-            tm, T = d["tiny"]["m"], d["tiny"]
-            tenv = {**_HS_ENV, "DG_MT": str(T["mt"]), **({"DG_STACK": "0x3000"} if GEMM_B4 else {})}
-            tsfx = f"_mt{T['mt']}{_HS_SFX}"
-            for key, name in T["kernels2"].items():
-                n, k = (int(x) for x in key.split("x"))
-                b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{tm}_k{k}_n{d['npad'][str(n)]}{tsfx}",
-                           "env": {"DG_M": str(tm), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), "DG_LAYOUT": _lay(), **tenv}}
-            ff2 = d["ffn"]["ff"]
-            b[T["ffn"]["up2p"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{tm}_k{spec.hidden}_n{2 * ff2}_epi_ph{tsfx}",
-                                   "env": {"DG_M": str(tm), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
-                                           "DG_LAYOUT": _lay(epi={"first_cb": 0}, pack_h=True), **tenv}}
-            b[T["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{tm}_k{ff2}_n{spec.hidden}_au{tsfx}",
-                                     "env": {"DG_M": str(tm), "DG_K": str(ff2), "DG_N": str(spec.hidden),
-                                             "DG_LAYOUT": _lay(a_units=True), **tenv}}
-        if "decode" in d:
-            T = d["decode"]
-            tenv = {**_HS_ENV, "DG_MT": str(T["mt"]), **({"DG_STACK": "0x3000"} if GEMM_B4 else {})}
-            for key, v in T["split"].items():
-                k = int(key.split("x")[1])
-                for c, name in v["kernels"].items():
-                    b[name] = {"design": "dit2/dit2.py",
-                               "build_dir": f"dit2/build_m{T['m']}_k{k}_n{c}_mt{T['mt']}{_HS_SFX}_dec",
-                               "env": {"DG_M": str(T["m"]), "DG_K": str(k), "DG_N": c, "DG_LAYOUT": _lay(), **tenv}}
-        if "decode2" in d:
-            T = d["decode2"]
-            for key, v in T["split"].items():
-                kr = int(key.split("x")[1])
-                for c in v["chunks"]:
-                    name, off = c[2], c[0]
-                    env = {"DD_K": str(c[3] * 64), "DD_N": "4096", "DD_OFF": str(off), "DD_KROW": str(kr)}
-                    b[name] = {"design": "dit2/dec.py", "build_dir": f"dit2/build_{name}", "env": env}
-        if "ffn" in d:
-            ff, hid = d["ffn"]["ff"], spec.hidden
-            b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",
-                                 "build_dir": f"dit_gemm/build_m{DIT_M}_k{hid}_n{2 * ff}_epi",
-                                 "env": {"DG_M": str(DIT_M), "DG_K": str(hid), "DG_N": str(2 * ff),
-                                         "DG_LAYOUT": '{"epi": {"first_cb": 0}}'}}
-            b[d["ffn"]["down"]] = {"design": "dit_gemm/dit_gemm.py",
-                                   "build_dir": f"dit_gemm/build_m{DIT_M}_k{ff}_n{hid}_gat",
-                                   "env": {"DG_M": str(DIT_M), "DG_K": str(ff), "DG_N": str(hid),
-                                           "DG_LAYOUT": '{"a_gather": true}'}}
+    dit_builds(spec, b, gemm_dit(spec))
     return b
+
+
+def dit_builds(spec: ModelSpec, b: dict, d: dict | None) -> None:
+    """The gemm_dit layout's kernel builds into a builds() result."""
+    if not d:
+        return
+    for npad, k in sorted(set(d["_shapes"])):
+        b[f"dit_n{npad}_k{k}"] = {"design": "dit_gemm/dit_gemm.py",
+                                  "build_dir": f"dit_gemm/build_m{DIT_M}_k{k}_n{npad}",
+                                  "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(npad)}}
+    for key, name in d.get("kernels2", {}).items():
+        n, k = (int(x) for x in key.split("x"))
+        b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{k}_n{d['npad'][str(n)]}{_HS_SFX}",
+                   "env": {"DG_M": str(DIT_M), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), "DG_LAYOUT": _lay(), **_HS_ENV}}
+    for lk, name in d.get("fa", {}).get("lk", {}).items():
+        # DF_EXP_FIX: the corrected exp2 (+9 % kernel time); against host attention on 4K tokens
+        # of docs prose the whole fast path is within noise (NLL -0.0002 +- 0.0016)
+        b[name] = {"design": "dit_fa256/dit_fa256.py", "build_dir": f"dit_fa256/build_l{DIT_M}_lk{lk}_fix",
+                   "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": str(int(lk) - DIT_M), "DF_EXP_FIX": "1",
+                           "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
+    for lk, name in d.get("fa", {}).get("nc", {}).items():
+        b[name] = {"design": "dit_fa256/dit_fa256.py", "build_dir": f"dit_fa256/build_l{DIT_M}_lk{lk}_fix_nc",
+                   "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_QOFF": "0", "DF_EXP_FIX": "1",
+                           "DF_CAUSAL": "0", "DF_VALID": str(FA_NC_VALID),
+                           "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
+    for lk, name in d.get("fa", {}).get("cb", {}).items():
+        b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{DIT_M}_lk{lk}_causal_kvi_qs",
+                   "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_CAUSAL": "1", "DF_QOFF": str(FA_CB_QOFF), "DF_KV_INTER": "1",
+                           "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
+    for lk, name in d.get("fa", {}).get("cbs", {}).items():
+        sm = d["fa"]["cbs_m"]
+        b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{sm}_lk{lk}_causal_kvi_qs",
+                   "env": {"DF_L": str(sm), "DF_LK": lk, "DF_CAUSAL": "1", "DF_QOFF": str(FA_CB_QOFF), "DF_KV_INTER": "1",
+                           "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
+    for lk, name in d.get("fa", {}).get("ncb", {}).items():
+        b[name] = {"design": "dit_fa256b/dit_fa256b.py", "build_dir": f"dit_fa256b/build_l{DIT_M}_lk{lk}",
+                   "env": {"DF_L": str(DIT_M), "DF_LK": lk, "DF_VALID": str(FA_NC_VALID),
+                           "DF_HEADS": str(spec.num_heads), "DF_KV_HEADS": str(spec.num_kv_heads)}}
+    if "down2" in d.get("ffn", {}):
+        b[d["ffn"]["down2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{d['ffn']['ff']}_n{spec.hidden}{_HS_SFX}",
+                                "env": {"DG_M": str(DIT_M), "DG_K": str(d["ffn"]["ff"]), "DG_N": str(spec.hidden), "DG_LAYOUT": _lay(), **_HS_ENV}}
+    if "up2" in d.get("ffn", {}):
+        ff2 = d["ffn"]["ff"]
+        b[d["ffn"]["up2"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi{_HS_SFX}",
+                              "env": {"DG_M": str(DIT_M), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
+                                      "DG_LAYOUT": _lay(epi={"first_cb": 0}), **_HS_ENV}}
+    if "up2p" in d.get("ffn", {}):
+        ff2 = d["ffn"]["ff"]
+        b[d["ffn"]["up2p"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{spec.hidden}_n{2 * ff2}_epi_ph{_HS_SFX}",
+                               "env": {"DG_M": str(DIT_M), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
+                                       "DG_LAYOUT": _lay(epi={"first_cb": 0}, pack_h=True), **_HS_ENV}}
+        b[d["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{DIT_M}_k{ff2}_n{spec.hidden}_au{_HS_SFX}",
+                                 "env": {"DG_M": str(DIT_M), "DG_K": str(ff2), "DG_N": str(spec.hidden),
+                                         "DG_LAYOUT": _lay(a_units=True), **_HS_ENV}}
+    if "small" in d:
+        sm, S = d["small"]["m"], d["small"]
+        for key, name in S["kernels2"].items():
+            n, k = (int(x) for x in key.split("x"))
+            b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{sm}_k{k}_n{d['npad'][str(n)]}{_HS_SFX}",
+                       "env": {"DG_M": str(sm), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), "DG_LAYOUT": _lay(), **_HS_ENV}}
+        ff2 = d["ffn"]["ff"]
+        b[S["ffn"]["up2p"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{sm}_k{spec.hidden}_n{2 * ff2}_epi_ph{_HS_SFX}",
+                               "env": {"DG_M": str(sm), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
+                                       "DG_LAYOUT": _lay(epi={"first_cb": 0}, pack_h=True), **_HS_ENV}}
+        b[S["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{sm}_k{ff2}_n{spec.hidden}_au{_HS_SFX}",
+                                 "env": {"DG_M": str(sm), "DG_K": str(ff2), "DG_N": str(spec.hidden),
+                                         "DG_LAYOUT": _lay(a_units=True), **_HS_ENV}}
+    if "tiny" in d:
+        tm, T = d["tiny"]["m"], d["tiny"]
+        tenv = {**_HS_ENV, "DG_MT": str(T["mt"]), **({"DG_STACK": "0x3000"} if GEMM_B4 else {})}
+        tsfx = f"_mt{T['mt']}{_HS_SFX}"
+        for key, name in T["kernels2"].items():
+            n, k = (int(x) for x in key.split("x"))
+            b[name] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{tm}_k{k}_n{d['npad'][str(n)]}{tsfx}",
+                       "env": {"DG_M": str(tm), "DG_K": str(k), "DG_N": str(d["npad"][str(n)]), "DG_LAYOUT": _lay(), **tenv}}
+        ff2 = d["ffn"]["ff"]
+        b[T["ffn"]["up2p"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{tm}_k{spec.hidden}_n{2 * ff2}_epi_ph{tsfx}",
+                               "env": {"DG_M": str(tm), "DG_K": str(spec.hidden), "DG_N": str(2 * ff2),
+                                       "DG_LAYOUT": _lay(epi={"first_cb": 0}, pack_h=True), **tenv}}
+        b[T["ffn"]["down2u"]] = {"design": "dit2/dit2.py", "build_dir": f"dit2/build_m{tm}_k{ff2}_n{spec.hidden}_au{tsfx}",
+                                 "env": {"DG_M": str(tm), "DG_K": str(ff2), "DG_N": str(spec.hidden),
+                                         "DG_LAYOUT": _lay(a_units=True), **tenv}}
+    if "decode" in d:
+        T = d["decode"]
+        tenv = {**_HS_ENV, "DG_MT": str(T["mt"]), **({"DG_STACK": "0x3000"} if GEMM_B4 else {})}
+        for key, v in T["split"].items():
+            k = int(key.split("x")[1])
+            for c, name in v["kernels"].items():
+                b[name] = {"design": "dit2/dit2.py",
+                           "build_dir": f"dit2/build_m{T['m']}_k{k}_n{c}_mt{T['mt']}{_HS_SFX}_dec",
+                           "env": {"DG_M": str(T["m"]), "DG_K": str(k), "DG_N": c, "DG_LAYOUT": _lay(), **tenv}}
+    if "decode2" in d:
+        T = d["decode2"]
+        for key, v in T["split"].items():
+            kr = int(key.split("x")[1])
+            for c in v["chunks"]:
+                name, off = c[2], c[0]
+                env = {"DD_K": str(c[3] * 64), "DD_N": "4096", "DD_OFF": str(off), "DD_KROW": str(kr)}
+                b[name] = {"design": "dit2/dec.py", "build_dir": f"dit2/build_{name}", "env": env}
+    if "ffn" in d:
+        ff, hid = d["ffn"]["ff"], spec.hidden
+        b[d["ffn"]["up"]] = {"design": "dit_gemm/dit_gemm.py",
+                             "build_dir": f"dit_gemm/build_m{DIT_M}_k{hid}_n{2 * ff}_epi",
+                             "env": {"DG_M": str(DIT_M), "DG_K": str(hid), "DG_N": str(2 * ff),
+                                     "DG_LAYOUT": '{"epi": {"first_cb": 0}}'}}
+        b[d["ffn"]["down"]] = {"design": "dit_gemm/dit_gemm.py",
+                               "build_dir": f"dit_gemm/build_m{DIT_M}_k{ff}_n{hid}_gat",
+                               "env": {"DG_M": str(DIT_M), "DG_K": str(ff), "DG_N": str(hid),
+                                       "DG_LAYOUT": '{"a_gather": true}'}}
 
 
 GEN_KERNELS = "designs/layer_x/gen_kernels.py"
