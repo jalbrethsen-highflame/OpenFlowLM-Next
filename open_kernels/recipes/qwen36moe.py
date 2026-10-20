@@ -1081,6 +1081,14 @@ GEMM_T = 256          # gemm_q4_prefill.py's GQP_T: a multiple of tile_n * 8 col
 # mb_x / mb_h / mb_y and spending the core's last 4 KB of L1. Raise it once the core rate is
 # up (the plan's B(3)); the design and the driver are ready for it.
 MB_NT = 8
+# OPEN_QWEN36_MBE (default on; 0 the moe_batch kernel above): designs/moe_batch/mbe.py -- eb's
+# core program (LFM2-MoE: up / gate band by band, h streamed again for the down) over
+# moe_batch's weight taps, on the bfp16 MAC array, so a visit serves MBE_NT = 32 tokens. At 8
+# the stream of an expert's 1.97 MB per 8 tokens capped the experts at ~660 tok/s.
+MBE = os.environ.get("OPEN_QWEN36_MBE", "1") != "0"
+MBE_NT = 32
+if MBE:
+    MB_NT = MBE_NT
 ATTN_LMAX = 4096      # the widest attention GEMM stream (rows of window); a longer window is chunked on the host
 # The q4_1 GEMM reads the band law; an all-q8 MoE route runs every GEMM on bf16 instead (bf16_route), and
 # a q8 projection elsewhere runs as its exact q4_1 split (gemm_weight): every q8 code is 16 hi + lo, so two q4_1 halves sum
@@ -1342,10 +1350,11 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
         out["contexts"].setdefault("mb", f"mb_s{mb_slots[0]}/final.xclbin")
         name = f"mb_s{s}"
         out["kernels"][name] = {"context": "mb", "insts": f"{name}/insts.bin", "patch": "moebatch", "build": name}
-        out["builds"][name] = {"design": "moe_batch/moe_batch.py", "build_dir": f"moe_batch/build_s{s}{sfx}",
+        out["builds"][name] = {"design": "moe_batch/mbe.py" if MBE else "moe_batch/moe_batch.py",
+                               "build_dir": f"moe_batch/build_{'mbe_' if MBE else ''}s{s}{sfx}",
                                "env": {"MB_SLOTS": str(s), "MB_NT": str(MB_NT), "MB_HID": str(hid), "MB_FF": str(ff),
                                        "MB_EXPERTS": str(E), "MB_POOL_DOWN": str(L.POOL_DOWN),
-                                       "MB_POOL_BYTES": str(L.POOL_BYTES)}}
+                                       "MB_POOL_BYTES": str(L.POOL_BYTES), **({"MB_BFP": "1"} if MBE else {})}}
     if not dense:
         out["globals"]["mb_x"] = mb_slots[0] * hid * MB_NT * 2
         out["globals"]["mb_h"] = mb_slots[0] * ff * MB_NT * 2
@@ -1526,7 +1535,8 @@ KERNEL_SOURCES = [
     "designs/ln/ln.h", "designs/ln/*.cc", "designs/ln/ln.py", "designs/lin_layer/ln_nr.cc",
     "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.cc", "designs/lm_head_q8/*.h",
     "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc", "designs/gemm_q4_prefill/*.h",
-    "designs/moe_batch/moe_batch.py", "designs/moe_batch/*.cc", "designs/moe_batch/*.h",
+    "designs/moe_batch/moe_batch.py", "designs/moe_batch/mbe.py", "designs/moe_batch/*.cc", "designs/moe_batch/*.h",
+    "designs/lfm2moe/eb_*.cc",
     "designs/attn_block/attn_gemm.py", "../npu_offload/gemm_rtp/gemm_pretiled.py", "../npu_offload/gemm_rtp/npue.py",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",
 ]
