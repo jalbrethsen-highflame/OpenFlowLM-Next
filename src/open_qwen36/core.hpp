@@ -691,6 +691,13 @@ private:
         bool on = false;
         std::vector<float> n_emb, n_hid, n_in, n_post, n_out, qn, kn;   ///< (1 + w)
         std::vector<uint8_t> fc, qkvg, o, ug, down;                      ///< dit2 int4 blocks
+        // a MoE model's MTP layer (Qwen3.6-35B-A3B): every product q4_1 in the std band order
+        // (gemv_q41), the FFN a MoE block: the router [hid][E] f32, the shared expert [up | gate] and
+        // down, each routed expert [up | gate] (2 ff rows) and down
+        bool moe = false;
+        size_t nh = 24, kvh = 4, hd = 256, rot = 64, ff = 17408;
+        std::vector<uint8_t> fc41, qkvg41, o41, sh_ug41, sh_dn41, ex_ug41, ex_dn41;
+        std::vector<float> router, sgw;
         std::vector<uint16_t> kv;                                        ///< [max_ctx][2 kvw] bf16
         size_t kv0 = 0;                                                  ///< the position of slot 0
     } mtp_;
@@ -713,7 +720,7 @@ private:
         double t_draft = 0, t_verify = 0, t_roll = 0;
         std::chrono::steady_clock::time_point t0;
     } spec_;
-    int spec_k_ = 3;
+    int spec_k_ = 3;            ///< drafts a pass: OFLM_OPEN_MTP_K, else 3 (a MoE model: 2, set by load_mtp)
     void spec_begin();
     void spec_settle(size_t keep);
     void spec_norm(const float* x, float* out);
@@ -724,6 +731,7 @@ private:
     void mtp_forward(const float* hn, const int* toks, size_t R, size_t pos0, float* xn);
 public:
     bool mtp_on() const { return mtp_.on; }
+    int mtp_k() const { return spec_k_; }
     /// greedy decode with MTP drafts from the prompt's end: tok0 (the prompt's next token) first,
     /// n tokens in all; stats to stderr
     std::vector<int> generate_mtp(int tok0, int n, int k);
@@ -749,7 +757,20 @@ private:
     bool q41_cpu_ = false;      ///< CPU decode on the q4_1 pools in place (a MoE family: host::gemv_q41_rows)
     /// a GEMM step's weight as q4_1 bytes on the host: its pool or consts region (layer l)
     const uint8_t* q41_weight(int l, const std::string& name) const;
-    /// one MoE layer's FFN for R rows on the CPU from the q4_1 pool (step_cpu_rows' MoE tail)
+    /// A MoE block's q4_1 weights for moe_cpu: the router [hid][E] f32, the shared expert's gate
+    /// weight, its [up | gate] and down (std order), and each routed expert's up / gate / down at
+    /// base + e stride (+ gate_off for the gate), in the layouts given
+    struct MoeCpuW {
+        const float* Wr = nullptr; const float* sgw = nullptr;
+        size_t E = 0, topk = 0, ff = 0;
+        const uint8_t* sh_ug = nullptr; const uint8_t* sh_dn = nullptr;
+        const uint8_t* up0 = nullptr; size_t up_stride = 0, gate_off = 0; host::Q41Lay up_lay;
+        const uint8_t* dn0 = nullptr; size_t dn_stride = 0; host::Q41Lay dn_lay;
+    };
+    /// x += the MoE block of xn for R rows on the CPU (the shared expert gated, then the routed
+    /// experts ascending; each expert's weights read once for the rows that chose it)
+    void moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x);
+    /// one MoE layer's FFN for R rows from the q4_1 pool (step_cpu_rows' MoE tail)
     void moe_cpu_rows(int l, const float* xn, size_t R, float* x);
     /// the final norm and q8 lm_head on the CPU (CPU decode; OFLM_OPEN_CPU_HEAD=0 keeps the NPU's):
     /// the head repacked from the pool order (host::lmhead_q8_repack), the norm weight as f32

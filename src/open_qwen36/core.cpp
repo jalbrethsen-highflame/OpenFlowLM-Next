@@ -3114,14 +3114,26 @@ void Core::step_cpu_decode(int token, bool want_logits) { step_cpu_rows(&token, 
 void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
     const GemmBlockProgram& gb = types_[l]->gemm_block;
     const HostConsts& hc = hc_[l];
-    const size_t hid = w_->hidden, E = w_->moe.experts, topk = w_->moe.topk, ff = gb.shared_ff;
-    const size_t stripe = w_->moe.stripe, exp_ug = 2 * (ff / 128) * stripe, down_band = 128 * ff * 5 / 8;
+    const size_t ff = gb.shared_ff, stripe = w_->moe.stripe;
     const uint8_t* pool = pools_[l].map<const uint8_t*>();
+    MoeCpuW W;
+    W.Wr = hc.router.data(); W.sgw = hc.sgw.data();
+    W.E = w_->moe.experts; W.topk = w_->moe.topk; W.ff = ff;
+    W.sh_ug = q41_weight(l, gb.shared_program[0].args[0]);
+    W.sh_dn = q41_weight(l, gb.shared_program[1].args[0]);
+    // the pool's experts: [up | gate] 128-row stripes interleaved, then the downs (stripes of K = ff)
+    W.up0 = pool + w_->moe.base; W.up_stride = 2 * (ff / 128) * stripe; W.gate_off = stripe; W.up_lay = host::q41_stripe(2 * stripe);
+    W.dn0 = pool + w_->moe.pool_down; W.dn_stride = w_->moe.up_bytes; W.dn_lay = host::q41_stripe(128 * ff * 5 / 8);
+    moe_cpu(W, xn, R, x);
+}
+
+void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
+    const size_t hid = w_->hidden, E = W.E, topk = W.topk, ff = W.ff;
     auto tr = std::chrono::steady_clock::now();
     static thread_local std::vector<float> probs, wt, hsh, ysh, hu, hd, ye;
     static thread_local std::vector<int32_t> idx;
     probs.resize(R * E); idx.resize(R * topk); wt.resize(R * topk);
-    host::router_block(R, hid, E, topk, xn, hc.router.data(), probs.data(), idx.data(), wt.data());
+    host::router_block(R, hid, E, topk, xn, W.Wr, probs.data(), idx.data(), wt.data());
     // the experts to run, ascending, each with the rows that chose it
     std::vector<std::pair<uint32_t, std::vector<std::pair<size_t, float>>>> ex;   // (expert, [(row, weight)])
     {
@@ -3147,8 +3159,8 @@ void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
     for (size_t r = 0; r < R; ++r) host::q41_prep_x(xn + r * hid, hid, xq[r]);
     // phase 1, one parallel loop: the shared up|gate (std, 1024 rows) and each expert's up and gate
     // (stripes) -- work items of one 64-row band
-    const uint8_t* sh_up = q41_weight(l, gb.shared_program[0].args[0]);
-    const uint8_t* sh_dn = q41_weight(l, gb.shared_program[1].args[0]);
+    const uint8_t* sh_up = W.sh_ug;
+    const uint8_t* sh_dn = W.sh_dn;
     hsh.resize(R * 2 * ff);
     hu.resize(NE * R * 2 * ff);
     struct Item { const uint8_t* base; host::Q41Lay lay; size_t K, b; const host::Q41X* x[8]; float* y[8]; size_t R; };
@@ -3163,7 +3175,7 @@ void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
         const auto& rows = ex[i].second;
         for (size_t proj = 0; proj < 2; ++proj)
             for (size_t b = 0; b < ff / 64; ++b) {
-                Item it{pool + w_->moe.base + ex[i].first * exp_ug + proj * stripe, host::q41_stripe(2 * stripe), hid, b, {}, {}, rows.size()};
+                Item it{W.up0 + ex[i].first * W.up_stride + proj * W.gate_off, W.up_lay, hid, b, {}, {}, rows.size()};
                 for (size_t j = 0; j < rows.size(); ++j) {
                     it.x[j] = &xq[rows[j].first];
                     it.y[j] = hu.data() + (i * R + j) * 2 * ff + proj * ff;
@@ -3202,7 +3214,7 @@ void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
         items.push_back(it);
         for (size_t i = 0; i < NE; ++i) {
             const auto& rows = ex[i].second;
-            Item ie{pool + w_->moe.pool_down + ex[i].first * w_->moe.up_bytes, host::q41_stripe(down_band), ff, b, {}, {}, rows.size()};
+            Item ie{W.dn0 + ex[i].first * W.dn_stride, W.dn_lay, ff, b, {}, {}, rows.size()};
             for (size_t j = 0; j < rows.size(); ++j) { ie.x[j] = &hq[i * R + j]; ie.y[j] = ye.data() + (i * R + j) * hid; }
             items.push_back(ie);
         }
@@ -3211,7 +3223,7 @@ void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
     // x += gate * shared, then the experts ascending
     for (size_t r = 0; r < R; ++r) {
         double d = 0;
-        for (size_t i = 0; i < hid; ++i) d += static_cast<double>(bf16_to_f32(f32_to_bf16(xn[r * hid + i]))) * hc.sgw[i];
+        for (size_t i = 0; i < hid; ++i) d += static_cast<double>(bf16_to_f32(f32_to_bf16(xn[r * hid + i]))) * W.sgw[i];
         const float gate = 1.f / (1.f + std::exp(-static_cast<float>(d)));
         for (size_t i = 0; i < hid; ++i) x[r * hid + i] += gate * ysh[r * hid + i];
     }
@@ -3587,10 +3599,19 @@ void Core::load_mtp(const std::string& shard) {
         for (float& x : w) x += 1.f;                 // Qwen3.5's zero-centred RMSNorm weight
         return w;
     };
-    const size_t hid = w_->hidden, nh = 24, kvh = 4, hd = 256, qw = nh * hd, kvw = kvh * hd, ff = 17408;
-    if (hid != 5120) throw std::runtime_error("open_qwen36: MTP: built for the 27B's geometry");
-    const std::string p = "mtp.", L = "mtp.layers.0.";
     Mtp& m = mtp_;
+    // the full-attention geometry from the model's own full layers (the 27B: 24 / 4 heads; the
+    // 35B-A3B: 16 / 2), the FFN a MoE block when the model has one
+    for (int l = 0; l < nl_; ++l)
+        if (types_[l]->gemm_block.kind == "full") {
+            const GemmBlockProgram& g = types_[l]->gemm_block;
+            m.nh = g.nh; m.kvh = g.kvh; m.hd = g.hd; m.rot = g.rot;
+            break;
+        }
+    m.moe = w_->has_moe;
+    const size_t hid = w_->hidden, nh = m.nh, kvh = m.kvh, hd = m.hd, qw = nh * hd, kvw = kvh * hd, ff = m.ff;
+    if (!m.moe && hid != 5120) throw std::runtime_error("open_qwen36: MTP: a dense MTP layer is built for the 27B's geometry");
+    const std::string p = "mtp.", L = "mtp.layers.0.";
     m.n_emb = norm(p + "pre_fc_norm_embedding.weight", hid);
     m.n_hid = norm(p + "pre_fc_norm_hidden.weight", hid);
     m.n_out = norm(p + "norm.weight", hid);
@@ -3602,6 +3623,66 @@ void Core::load_mtp(const std::string& shard) {
         out.assign(rows / 128 * (k / 64) * kB4Tile, 0);
         dit_encode_b4(W.data(), rows, k, rows, out.data(), cm);
     };
+    auto enc41 = [&](const std::vector<float>& W, size_t rows, size_t k, std::vector<uint8_t>& out) {
+        out.assign(rows * k * 5 / 8, 0);
+        host::q41_pack_std(W.data(), rows, k, out.data());
+    };
+    if (m.moe) {
+        const size_t E = w_->moe.experts, eff = types_[0]->gemm_block.shared_ff;
+        m.ff = eff;
+        enc41(get(p + "fc.weight", hid, 2 * hid), hid, 2 * hid, m.fc41);
+        {
+            const std::vector<float> q = get(L + "self_attn.q_proj.weight", 2 * qw, hid);
+            const std::vector<float> k = get(L + "self_attn.k_proj.weight", kvw, hid), v = get(L + "self_attn.v_proj.weight", kvw, hid);
+            std::vector<float> W((2 * qw + 2 * kvw) * hid);
+            for (size_t hh = 0; hh < nh; ++hh) {
+                std::memcpy(W.data() + hh * hd * hid, q.data() + hh * 2 * hd * hid, hd * hid * 4);
+                std::memcpy(W.data() + (qw + 2 * kvw + hh * hd) * hid, q.data() + (hh * 2 * hd + hd) * hid, hd * hid * 4);
+            }
+            std::memcpy(W.data() + qw * hid, k.data(), kvw * hid * 4);
+            std::memcpy(W.data() + (qw + kvw) * hid, v.data(), kvw * hid * 4);
+            enc41(W, 2 * qw + 2 * kvw, hid, m.qkvg41);
+        }
+        enc41(get(L + "self_attn.o_proj.weight", hid, qw), hid, qw, m.o41);
+        {
+            std::vector<float> W = get(L + "mlp.shared_expert.up_proj.weight", eff, hid);
+            const std::vector<float> g = get(L + "mlp.shared_expert.gate_proj.weight", eff, hid);
+            W.insert(W.end(), g.begin(), g.end());
+            enc41(W, 2 * eff, hid, m.sh_ug41);
+        }
+        enc41(get(L + "mlp.shared_expert.down_proj.weight", hid, eff), hid, eff, m.sh_dn41);
+        {
+            const std::vector<float> rw = get(L + "mlp.gate.weight", E, hid);       // [E, hid] -> [hid][E]
+            m.router.resize(hid * E);
+            for (size_t e = 0; e < E; ++e)
+                for (size_t i = 0; i < hid; ++i) m.router[i * E + e] = rw[e * hid + i];
+            m.sgw = get(L + "mlp.shared_expert_gate.weight", 1, hid);
+        }
+        {
+            // HF's gate_up_proj [E][gate ff | up ff][hid] -> per expert [up | gate] (the pool's order)
+            const std::vector<float> gu = get(L + "mlp.experts.gate_up_proj", E * 2 * eff, hid);
+            const std::vector<float> dn = get(L + "mlp.experts.down_proj", E * hid, eff);
+            const size_t ub = 2 * eff * hid * 5 / 8, db = hid * eff * 5 / 8;
+            m.ex_ug41.assign(E * ub, 0);
+            m.ex_dn41.assign(E * db, 0);
+            std::vector<float> W(2 * eff * hid);
+            for (size_t e = 0; e < E; ++e) {
+                const float* src = gu.data() + e * 2 * eff * hid;
+                std::memcpy(W.data(), src + eff * hid, eff * hid * 4);              // up
+                std::memcpy(W.data() + eff * hid, src, eff * hid * 4);              // gate
+                host::q41_pack_std(W.data(), 2 * eff, hid, m.ex_ug41.data() + e * ub);
+                host::q41_pack_std(dn.data() + e * hid * eff, hid, eff, m.ex_dn41.data() + e * db);
+            }
+        }
+        m.kv.assign(cfg_.max_ctx * 2 * kvw, 0);
+        m.on = true;
+        // 2 drafts a pass by default: a verify row past them adds more distinct experts than its
+        // token is worth (two chat prompts, GPU busy: k = 1 / 2 / 3 at 19.2-19.7 / 20.8-22.0 / 18.7-22.0 tok/s)
+        spec_k_ = std::getenv("OFLM_OPEN_MTP_K") ? std::atoi(std::getenv("OFLM_OPEN_MTP_K")) : 2;
+        log("MTP: a MoE layer, " + std::to_string((m.fc41.size() + m.qkvg41.size() + m.o41.size() + m.sh_ug41.size() + m.sh_dn41.size() +
+                                                    m.ex_ug41.size() + m.ex_dn41.size()) >> 20) + " MB q4_1 from " + shard);
+        return;
+    }
     enc(get(p + "fc.weight", hid, 2 * hid), hid, 2 * hid, m.fc);
     {
         // [q heads | k | v | gate heads], the main full layers' qkvg order; HF's q_proj interleaves
@@ -3638,8 +3719,8 @@ void Core::load_mtp(const std::string& shard) {
 }
 
 void Core::mtp_forward(const float* hn, const int* toks, size_t R, size_t pos0, float* xn) {
-    const size_t hid = w_->hidden, nh = 24, kvh = 4, hd = 256, qw = nh * hd, kvw = kvh * hd, ff = 17408;
     const Mtp& m = mtp_;
+    const size_t hid = w_->hidden, nh = m.nh, kvh = m.kvh, hd = m.hd, qw = nh * hd, kvw = kvh * hd, ff = m.ff;
     std::vector<float> xin(R * 2 * hid), e(hid), x(R * hid), res(R * hid), y, og(R * qw), q(R * qw), k(R * kvw), v(R * kvw),
         g(R * qw), h(R * 2 * ff), hh(R * ff);
     for (size_t r = 0; r < R; ++r) {
@@ -3647,10 +3728,12 @@ void Core::mtp_forward(const float* hn, const int* toks, size_t R, size_t pos0, 
         host::rmsnorm_rows(e.data(), 1, hid, m.n_emb.data(), 1e-6, xin.data() + r * 2 * hid);
         host::rmsnorm_rows(hn + r * hid, 1, hid, m.n_hid.data(), 1e-6, xin.data() + r * 2 * hid + hid);
     }
-    host::gemv_b4_rows(m.fc.data(), hid, 2 * hid, xin.data(), R, res.data(), hid);
+    if (m.moe) host::gemv_q41_rows(m.fc41.data(), host::q41_std(2 * hid), hid, 2 * hid, xin.data(), R, res.data(), hid);
+    else host::gemv_b4_rows(m.fc.data(), hid, 2 * hid, xin.data(), R, res.data(), hid);
     host::rmsnorm_rows(res.data(), R, hid, m.n_in.data(), 1e-6, x.data());
     y.resize(R * (2 * qw + 2 * kvw));
-    host::gemv_b4_rows(m.qkvg.data(), 2 * qw + 2 * kvw, hid, x.data(), R, y.data(), 2 * qw + 2 * kvw);
+    if (m.moe) host::gemv_q41_rows(m.qkvg41.data(), host::q41_std(hid), 2 * qw + 2 * kvw, hid, x.data(), R, y.data(), 2 * qw + 2 * kvw);
+    else host::gemv_b4_rows(m.qkvg.data(), 2 * qw + 2 * kvw, hid, x.data(), R, y.data(), 2 * qw + 2 * kvw);
     for (size_t r = 0; r < R; ++r) {
         const float* yr = y.data() + r * (2 * qw + 2 * kvw);
         std::copy(yr, yr + qw, q.begin() + r * qw);
@@ -3659,13 +3742,25 @@ void Core::mtp_forward(const float* hn, const int* toks, size_t R, size_t pos0, 
         std::copy(yr + qw + 2 * kvw, yr + 2 * qw + 2 * kvw, g.begin() + r * qw);
     }
     host::AttnGeom ag;
-    ag.T = R; ag.t_real = R; ag.nh = nh; ag.kvh = kvh; ag.hd = hd; ag.rot = 64; ag.pos0 = pos0; ag.eps = 1e-6;
+    ag.T = R; ag.t_real = R; ag.nh = nh; ag.kvh = kvh; ag.hd = hd; ag.rot = m.rot; ag.pos0 = pos0; ag.eps = 1e-6;
     host::attention_block(ag, q.data(), k.data(), v.data(), g.data(), m.qn.data(), m.kn.data(), man_.rope_inv_freq.data(),
                           mtp_.kv.data(), 2 * kvw, og.data());
     y.resize(R * hid);
-    host::gemv_b4_rows(m.o.data(), hid, qw, og.data(), R, y.data(), hid);
+    if (m.moe) host::gemv_q41_rows(m.o41.data(), host::q41_std(qw), hid, qw, og.data(), R, y.data(), hid);
+    else host::gemv_b4_rows(m.o.data(), hid, qw, og.data(), R, y.data(), hid);
     for (size_t i = 0; i < R * hid; ++i) res[i] += y[i];
     host::rmsnorm_rows(res.data(), R, hid, m.n_post.data(), 1e-6, x.data());
+    if (m.moe) {
+        MoeCpuW W;
+        W.Wr = m.router.data(); W.sgw = m.sgw.data();
+        W.E = w_->moe.experts; W.topk = w_->moe.topk; W.ff = ff;
+        W.sh_ug = m.sh_ug41.data(); W.sh_dn = m.sh_dn41.data();
+        W.up0 = m.ex_ug41.data(); W.up_stride = 2 * ff * hid * 5 / 8; W.gate_off = ff * hid * 5 / 8; W.up_lay = host::q41_std(hid);
+        W.dn0 = m.ex_dn41.data(); W.dn_stride = hid * ff * 5 / 8; W.dn_lay = host::q41_std(ff);
+        moe_cpu(W, x.data(), R, res.data());
+        host::rmsnorm_rows(res.data(), R, hid, m.n_out.data(), 1e-6, xn);
+        return;
+    }
     host::gemv_b4_rows(m.ug.data(), 2 * ff, hid, x.data(), R, h.data(), 2 * ff);
     for (size_t r = 0; r < R; ++r) host::swiglu_tiles(h.data() + r * 2 * ff, ff, hh.data() + r * ff);
     host::gemv_b4_rows(m.down.data(), hid, ff, hh.data(), R, y.data(), hid);

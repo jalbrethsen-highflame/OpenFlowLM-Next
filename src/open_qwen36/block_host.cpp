@@ -2598,6 +2598,35 @@ void gemv_q41_bands(const uint8_t* base, const Q41Lay& lay, size_t K, const Q41X
         }
 }
 
+void q41_pack_std(const float* W, size_t n, size_t K, uint8_t* out) {
+    if (n % 64 || K % 256) throw std::runtime_error("open_qwen36: q41_pack_std: n % 64 and K % 256");
+    const Q41Lay lay = q41_std(K);
+    const long long nchunks = static_cast<long long>(n / 32 * (K / 256));
+#pragma omp parallel for
+    for (long long cc = 0; cc < nchunks; ++cc) {
+        const size_t r32 = static_cast<size_t>(cc) / (K / 256), g = static_cast<size_t>(cc) % (K / 256);
+        const size_t b = r32 / 2, h = r32 % 2;
+        uint8_t* c = out + (b / 2) * lay.s2 + (b % 2) * lay.s1 + g * lay.sk + h * 5120;
+        std::memset(c + 1024, 0, 4096);
+        for (size_t r = 0; r < 32; ++r) {
+            const float* w = W + (b * 64 + h * 32 + r) * K + g * 256;
+            for (size_t kb = 0; kb < 8; ++kb) {
+                float lo = w[kb * 32], hi = lo;
+                for (size_t i = 0; i < 32; ++i) { lo = std::min(lo, w[kb * 32 + i]); hi = std::max(hi, w[kb * 32 + i]); }
+                const uint16_t mb = f32_to_bf16(lo), db = f32_to_bf16((hi - lo) / 15.f);
+                const float m = bf16_to_f32(mb), d = bf16_to_f32(db), inv = d > 0.f ? 1.f / d : 0.f;
+                std::memcpy(c + 2 * (kb * 32 + r), &db, 2);
+                std::memcpy(c + 512 + 2 * (kb * 32 + r), &mb, 2);
+                for (size_t i = 0; i < 32; ++i) {
+                    const int q = std::min(15, std::max(0, static_cast<int>(std::lrint((w[kb * 32 + i] - m) * inv))));
+                    const size_t kk = kb * 32 + i, rb = r / 16, r16 = r % 16, idx = (rb * 256 + kk) * 16 + r16;
+                    c[1024 + idx / 2] |= static_cast<uint8_t>(q << ((idx & 1) * 4));
+                }
+            }
+        }
+    }
+}
+
 void gemv_q41_rows(const uint8_t* base, const Q41Lay& lay, size_t n, size_t K, const float* x, size_t R, float* y,
                    size_t ldy) {
     std::vector<Q41X> xq(R);

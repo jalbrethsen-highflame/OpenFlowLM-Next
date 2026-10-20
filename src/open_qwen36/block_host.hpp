@@ -197,6 +197,10 @@ void q41_prep_x(const float* x, size_t K, Q41X& out);
 /// 0.5 %). No threading inside: callers split the bands.
 void gemv_q41_bands(const uint8_t* base, const Q41Lay& lay, size_t K, const Q41X* const* x, size_t R, float* const* y,
                     size_t b0, size_t b1);
+/// W [n, K] f32 (n % 64, K % 256) as q4_1 chunks in the std_perm band order (q41_std(K)): per
+/// (row, 32-K block) m = min, d = (max - min) / 15, q = round((w - m) / d), d and m in bf16 and q
+/// against the rounded ones. out: n K 5 / 8 bytes.
+void q41_pack_std(const float* W, size_t n, size_t K, uint8_t* out);
 /// The same over all n rows, OpenMP over 32-row halves: x [R, K] row-major, y [R, ldy].
 void gemv_q41_rows(const uint8_t* base, const Q41Lay& lay, size_t n, size_t K, const float* x, size_t R, float* y,
                    size_t ldy);
