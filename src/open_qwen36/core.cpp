@@ -1466,6 +1466,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
 }
 
 void Core::reset() {
+    kv8_valid_.assign(kv8_valid_.size(), 0);
     spec_flush();
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: reset before load_weights");
     hist_ids_.clear();
@@ -2617,6 +2618,7 @@ void Core::write_record(size_t row, const double pos[3]) {
 
 void Core::step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
                      const float* deepstack, int n_deepstack) {
+    kv8_clamp();   // the bf16 cache rows from pos_ on get rewritten: the int8 copy past them is stale
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: step before load_weights");
     if (static_cast<size_t>(pos_) >= cfg_.max_ctx)
         throw std::runtime_error("open_qwen36: position " + std::to_string(pos_) + " reached the context capacity " +
@@ -3513,6 +3515,18 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             host::AttnGeom g;
             g.T = R; g.t_real = R; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
             g.pos0 = pos; g.eps = gb.eps;
+            static const bool kv8_on = [] { const char* e = std::getenv("OFLM_OPEN_KV8"); return !(e && *e == '0'); }();
+            if (q41_cpu_ && kv8_on && __builtin_cpu_supports("avx512bf16")) {
+                // the int8 copy: rows the bf16 cache got from elsewhere (a prompt, an NPU step) first
+                if (kv8_.size() != static_cast<size_t>(nl_)) { kv8_.assign(nl_, {}); kv8_valid_.assign(nl_, 0); }
+                kv8_row_ = 2 * gb.kvh * gb.hd + 8 * gb.kvh;
+                if (kv8_[l].size() < (cfg_.max_ctx + 16) * kv8_row_) kv8_[l].resize((cfg_.max_ctx + 16) * kv8_row_);
+                if (kv8_valid_[l] < pos)
+                    host::kv8_quant_rows(state_[l].map<const uint16_t*>(), row / 2, gb.kvh, gb.hd, kv8_valid_[l], pos, kv8_[l].data(), kv8_row_);
+                g.kv8 = kv8_[l].data();
+                g.kv8_row = kv8_row_;
+                kv8_valid_[l] = pos + R;
+            }
             host::attention_block(g, ya.data(), yb.data(), yc.data(), yd.data(), hc.qn.data(), hc.kn.data(),
                                   man_.rope_inv_freq.data(), state_[l].map<uint16_t*>(), row / 2, og.data());
         }
@@ -4774,6 +4788,7 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
 }
 
 void Core::step_gemm_block(const std::vector<int>& ids, size_t t_real, bool want_logits) {
+    kv8_clamp();   // the bf16 cache rows from pos_ on get rewritten: the int8 copy past them is stale
     spec_flush();
     apply_thread_budget();
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: step_gemm_block before load_weights");
@@ -4873,6 +4888,7 @@ void Core::block_layer_moe(int l, size_t rows, size_t t_real, float* xres) {
 }
 
 void Core::step_block_moe(const std::vector<int>& ids, size_t t_real, bool want_logits) {
+    kv8_clamp();   // the bf16 cache rows from pos_ on get rewritten: the int8 copy past them is stale
     auto t0 = std::chrono::steady_clock::now();
     timing_ = StepTiming{};
     const size_t T = ids.size(), hid = w_->hidden;
@@ -4915,6 +4931,7 @@ void Core::step_block_moe(const std::vector<int>& ids, size_t t_real, bool want_
 // expert), and a token's expert output does not depend on which other tokens share its
 // slot, so the result is bit-for-bit the block-major one.
 void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
+    kv8_clamp();   // the bf16 cache rows from pos_ on get rewritten: the int8 copy past them is stale
     spec_flush();
     apply_thread_budget();
     hist_ids_.insert(hist_ids_.end(), ids.begin(), ids.end());   // generate_mtp's prompt-lookup drafts

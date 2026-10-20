@@ -91,7 +91,15 @@ struct AttnGeom {
     /// packed prompts (attention_prep): row t's rope position, its KV row staying pos0 + t.
     /// nullptr: position pos0 + t.
     const size_t* rpos = nullptr;
+    /// an int8 copy of the cache (kv8_quant_rows' rows of kv8_row bytes) for decode-sized blocks:
+    /// attention_block quantizes the block's rows into it and reads it instead of kv. nullptr: none.
+    uint8_t* kv8 = nullptr;
+    size_t kv8_row = 0;
 };
+/// kv rows [r0, r1) (bf16 [K | V], kvh x hd each) as int8 rows of row8 bytes: K int8 [kvh hd], V int8
+/// [kvh hd], then the K scales and the V scales (f32 [kvh] each): one symmetric scale per position
+/// and kv head. row8 >= 2 kvh hd + 8 kvh.
+void kv8_quant_rows(const uint16_t* kv, size_t kv_row_elems, size_t kvh, size_t hd, size_t r0, size_t r1, uint8_t* kv8, size_t row8);
 
 /// The full-attention layer's middle over a block. q / gate [T, nh*hd], k / v [T, kvh*hd]
 /// are the fused projection's outputs; qn / kn [hd]; inv_freq [rot/2]. kv is the layer's

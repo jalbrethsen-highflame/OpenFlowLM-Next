@@ -755,6 +755,12 @@ private:
     bool cpu_decode_on_ = false;
     bool drop_pools_ = false;   ///< the q4 pools freed after building the int4 weights (CPU decode)
     bool q41_cpu_ = false;      ///< CPU decode on the q4_1 pools in place (a MoE family: host::gemv_q41_rows)
+    /// OFLM_OPEN_KV8 (default on with q41_cpu_): the CPU decode's attention reads an int8 copy of
+    /// each full layer's cache (host::kv8_quant_rows); kv8_valid_[l] rows of it match the bf16 cache
+    std::vector<std::vector<uint8_t>> kv8_;
+    std::vector<size_t> kv8_valid_;
+    size_t kv8_row_ = 0;
+    void kv8_clamp() { for (size_t& v : kv8_valid_) v = std::min(v, static_cast<size_t>(pos_ < 0 ? 0 : pos_)); }
     /// a GEMM step's weight as q4_1 bytes on the host: its pool or consts region (layer l)
     const uint8_t* q41_weight(int l, const std::string& name) const;
     /// A MoE block's q4_1 weights for moe_cpu: the router [hid][E] f32, the shared expert's gate
