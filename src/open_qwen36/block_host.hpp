@@ -135,6 +135,9 @@ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, con
 /// idx [T, topk], renormalised into w [T, topk].
 void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, const float* Wr, float* probs,
                   int32_t* idx, float* w);
+/// One token's softmax over its E logits `lg` (overwritten with the probabilities, copied to probs),
+/// the top-k (idx) and their weights normalised to sum 1 (w); taken: E bytes of scratch.
+void router_select(size_t E, size_t topk, float* lg, char* taken, float* probs, int32_t* idx, float* w);
 
 /// y [npad] = x [K] times a dit2 int4-mantissa weight (designs/dit_gemm/pack.py pack_b4: per
 /// [128-column tile][64-K tile] 4096 bytes of nibbles in blocks [pair 8][k-block 8][2] of 8 columns
