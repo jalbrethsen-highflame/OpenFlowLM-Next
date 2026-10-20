@@ -292,10 +292,15 @@ def dit_fa256b(
                     if "nokv" in _EXPT:
                         pass
                     else:
-                      a_prods[g].fill(k, offset=kvbase, sizes=[n_chunks, CHUNK // W, W],
-                                    strides=[kv_step, W, 1], group=tg)
-                      b_prods[g].fill(v, offset=kvbase, sizes=[n_chunks, CHUNK // W, W],
-                                    strides=[kv_step, W, 1], group=tg)
+                      # the shim wraps a dimension at 1023 and limits a repeat's stride to 4 MB: past
+                      # 1023 chunks (~64K keys) K and V go as several fills of up to 1023 chunks each
+                      # (2 passes in flight x (1 Q + 3) fills + 2 drains fit a shim tile's 16 BDs)
+                      for c0 in range(0, n_chunks, 1023):
+                          nc = min(1023, n_chunks - c0)
+                          a_prods[g].fill(k, offset=kvbase + c0 * kv_step, sizes=[nc, CHUNK // W, W],
+                                          strides=[kv_step, W, 1], group=tg)
+                          b_prods[g].fill(v, offset=kvbase + c0 * kv_step, sizes=[nc, CHUNK // W, W],
+                                          strides=[kv_step, W, 1], group=tg)
                     for cc in range(GROUP_COLS):
                         col = g * GROUP_COLS + cc
                         row0 = p * QROWS_PASS + cc * N_ROWS * TQ

@@ -303,6 +303,11 @@ FA_CB = _os.environ.get("OPEN_QWEN35_FA_CB", "1") != "0"
 # Its query offset as a sentinel word the engine patches per chunk (a prompt after earlier turns
 # starts anywhere): fa.cb_qoff.
 FA_CB_QOFF = 0x0C0FF5E7
+# The causal streams' longest key count. Past 1023 key chunks the K / V fills split in two (the
+# shim's 1023 wrap); three fills time out (state 8), so 2 x 1023 chunks = 130944 keys is the
+# ceiling: 130048 (127 x 1024). 32K -> 130048: 25.7 -> 97 ms a call, rel err on random data
+# 3.5e-2 -> 5.7e-2 (min row cos 0.997).
+FA_CB_MAX_LK = int(_os.environ.get("OPEN_QWEN35_FA_CB_MAX_LK", 130048))
 # The causal kernel at GEMM_SMALL_M query rows (one 512-row pass) for the small tier's chunks, key
 # lengths up to FA_CBS_MAX (the engine's OFLM_OPEN_SMALL_MAX); same image.
 FA_CBS_MAX = int(_os.environ.get("OPEN_QWEN35_FA_CBS_MAX", 2048))
@@ -421,7 +426,7 @@ def gemm_dit(spec: ModelSpec) -> dict | None:
             fa["ncb"] = {str(lk): f"fa256b_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)}
             fa["nc_valid"] = FA_NC_VALID
         if FA_CB:
-            fa["cb"] = {str(lk): f"fa256bc_lk{lk}" for lk in range(DIT_M, FA_MAX_LK + 1, DIT_M)}
+            fa["cb"] = {str(lk): f"fa256bc_lk{lk}" for lk in range(DIT_M, FA_CB_MAX_LK + 1, DIT_M)}
             fa["cb_qoff"] = FA_CB_QOFF
             if 0 < GEMM_SMALL_M < DIT_M and GEMM_SMALL_M % 512 == 0:
                 fa["cbs"] = {str(lk): f"fa256bcs_lk{lk}" for lk in range(GEMM_SMALL_M, FA_CBS_MAX + 1, GEMM_SMALL_M)}
