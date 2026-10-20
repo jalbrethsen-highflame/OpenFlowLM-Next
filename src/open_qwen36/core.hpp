@@ -746,6 +746,11 @@ private:
     bool cpu_decode_ok() const;
     bool cpu_decode_on_ = false;
     bool drop_pools_ = false;   ///< the q4 pools freed after building the int4 weights (CPU decode)
+    bool q41_cpu_ = false;      ///< CPU decode on the q4_1 pools in place (a MoE family: host::gemv_q41_rows)
+    /// a GEMM step's weight as q4_1 bytes on the host: its pool or consts region (layer l)
+    const uint8_t* q41_weight(int l, const std::string& name) const;
+    /// one MoE layer's FFN for R rows on the CPU from the q4_1 pool (step_cpu_rows' MoE tail)
+    void moe_cpu_rows(int l, const float* xn, size_t R, float* x);
     /// the final norm and q8 lm_head on the CPU (CPU decode; OFLM_OPEN_CPU_HEAD=0 keeps the NPU's):
     /// the head repacked from the pool order (host::lmhead_q8_repack), the norm weight as f32
     bool cpu_head_ = false, cpu_head_check_ = false, head_b4_main_ = false;

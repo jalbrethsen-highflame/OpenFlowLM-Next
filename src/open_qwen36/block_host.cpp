@@ -1805,6 +1805,26 @@ namespace {
 // 8 tokens x 64 experts, one fused multiply-add per (token, expert) and hid step in the same order
 // as the per-token loop's (the same bits: that loop's `lg[e] += xi * wr[e]` contracts to an FMA)
 __attribute__((target("avx512f,fma")))
+void router_cols8(size_t nt, size_t hid, size_t E, size_t e0, const float* x, const float* Wr, float* lg) {
+    __m512 acc[8][4];
+    for (size_t u = 0; u < 8; ++u)
+        for (int v = 0; v < 4; ++v) acc[u][v] = _mm512_setzero_ps();
+    for (size_t i = 0; i < hid; ++i) {
+        const float* wr = Wr + i * E + e0;
+        const __m512 w0 = _mm512_loadu_ps(wr), w1 = _mm512_loadu_ps(wr + 16), w2 = _mm512_loadu_ps(wr + 32), w3 = _mm512_loadu_ps(wr + 48);
+        for (size_t u = 0; u < nt; ++u) {
+            const __m512 xi = _mm512_set1_ps(x[u * hid + i]);
+            acc[u][0] = _mm512_fmadd_ps(xi, w0, acc[u][0]);
+            acc[u][1] = _mm512_fmadd_ps(xi, w1, acc[u][1]);
+            acc[u][2] = _mm512_fmadd_ps(xi, w2, acc[u][2]);
+            acc[u][3] = _mm512_fmadd_ps(xi, w3, acc[u][3]);
+        }
+    }
+    for (size_t u = 0; u < nt; ++u)
+        for (int v = 0; v < 4; ++v) _mm512_storeu_ps(lg + u * E + e0 + 16 * v, acc[u][v]);
+}
+
+__attribute__((target("avx512f,fma")))
 void router_logits8(size_t nt, size_t hid, size_t E, const float* x, const float* Wr, float* lg) {
     for (size_t e0 = 0; e0 < E; e0 += 64) {
         __m512 acc[8][4];
@@ -1832,6 +1852,17 @@ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, 
     if (topk > E) throw std::runtime_error("open_qwen36: router_block: topk past the expert count");
     static const bool fast = __builtin_cpu_supports("avx512f") && !(std::getenv("OFLM_OPEN_ROUTER_FAST") &&
                                                                      *std::getenv("OFLM_OPEN_ROUTER_FAST") == '0');
+    if (fast && E % 64 == 0 && T < 8 && omp_get_max_threads() > 1) {
+        // a decode step's few rows: the experts split over the threads (64 a work item), each
+        // reading its columns of Wr once for all rows -- one thread reading all 2 MB was 0.25 ms a layer
+        std::vector<float> lgb(8 * E);
+        const long long ne = static_cast<long long>(E / 64);
+#pragma omp parallel for schedule(static)
+        for (long long ec = 0; ec < ne; ++ec) router_cols8(T, hid, E, static_cast<size_t>(ec) * 64, xm, Wr, lgb.data());
+        std::vector<char> taken(E);
+        for (size_t u = 0; u < T; ++u) router_select(E, topk, lgb.data() + u * E, taken.data(), probs + u * E, idx + u * topk, w + u * topk);
+        return;
+    }
     if (fast && E % 64 == 0) {
         // 8 tokens a pass over Wr (2 MB for the 35B; one pass per token was most of a prompt layer's routing)
         const long long nb = static_cast<long long>((T + 7) / 8);

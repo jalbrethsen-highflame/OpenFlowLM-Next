@@ -1193,6 +1193,10 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     drop_pools_ = !skip_pools && cpu_decode_on_ && dit_on_ && dit_b4_ && gemm_block_t_ &&
                   !(std::getenv("OFLM_OPEN_KEEP_POOLS") && *std::getenv("OFLM_OPEN_KEEP_POOLS") == '1');
     if (drop_pools_) log("CPU decode: the q4 pools only feed the int4 GEMM weights, then go");
+    // OFLM_OPEN_CPU_DECODE=1 on a MoE family: decode reads the q4_1 pools in place on the CPU (the
+    // int4 repack loses 12-13 % of each weight there and flips routing)
+    q41_cpu_ = !skip_pools && cpu_decode_on_ && w_->has_moe && !drop_pools_;
+    if (q41_cpu_) log("CPU decode: the products on the q4_1 pools in place (gemv_q41)");
     std::vector<uint8_t> pool_tmp;
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];
@@ -1352,7 +1356,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     for (const auto& [name, bytes] : w_->globals) {
         if (name == "lmpool" && skip_pools) {
             continue;
-        } else if (name == "lmpool" && drop_pools_ && !(std::getenv("OFLM_OPEN_CPU_HEAD") && *std::getenv("OFLM_OPEN_CPU_HEAD") == '0')) {
+        } else if (name == "lmpool" && (drop_pools_ || q41_cpu_) && !(std::getenv("OFLM_OPEN_CPU_HEAD") && *std::getenv("OFLM_OPEN_CPU_HEAD") == '0')) {
             // CPU decode: the head on the CPU, repacked once; the NPU copy only to check it
             cpu_head_check_ = std::getenv("OFLM_OPEN_CPU_HEAD_CHECK") && *std::getenv("OFLM_OPEN_CPU_HEAD_CHECK") == '1';
             const bool int4_main = std::getenv("OFLM_OPEN_CPU_HEAD") && std::string(std::getenv("OFLM_OPEN_CPU_HEAD")) == "int4";
@@ -3063,7 +3067,32 @@ void Core::states_to_host() {
     state_owner_ = 0;
 }
 
+const uint8_t* Core::q41_weight(int l, const std::string& name) const {
+    const LayerType& lt = *types_[l];
+    const GemmBlockProgram& gb = lt.gemm_block;
+    const GemmWeight* gw = nullptr;
+    for (const auto* ws : {&gb.weights, &gb.shared_weights, &gb.ffn_weights})
+        if (auto it = ws->find(name); it != ws->end()) gw = &it->second;
+    if (!gw || gw->ops.empty() || (gw->from != "pool" && gw->from != "consts"))
+        throw std::runtime_error("open_qwen36: q4_1 CPU decode: layer " + std::to_string(l) + " has no pool / consts weight " + name);
+    const size_t off = op_region(lt, gw->from, gw->ops[0]).first;
+    const xrt::bo& b = gw->from == "pool" ? pools_[l] : consts_[l];
+    return const_cast<xrt::bo&>(b).map<const uint8_t*>() + off;
+}
+
 bool Core::cpu_decode_ok() const {
+    if (q41_cpu_) {
+        // the MoE family on the q4_1 pools: every layer a linear / full mixer with its two products,
+        // the router and the shared expert's program
+        if (!cpu_head_ || static_cast<int>(hc_.size()) != nl_) return false;
+        for (int l = 0; l < nl_; ++l) {
+            const GemmBlockProgram& gb = types_[l]->gemm_block;
+            if ((gb.kind != "linear" && gb.kind != "full") || gb.program.size() < 2 || gb.has_dense_ffn() ||
+                gb.shared_program.size() < 2 || hc_[l].router.empty() || hc_[l].sgw.empty())
+                return false;
+        }
+        return true;
+    }
     if (!dit_on_ || !dit_b4_ || !gemm_block_t_ || static_cast<int>(hc_.size()) != nl_) return false;
     for (int l = 0; l < nl_; ++l) {
         const GemmBlockProgram& gb = types_[l]->gemm_block;
@@ -3077,6 +3106,123 @@ bool Core::cpu_decode_ok() const {
 }
 
 void Core::step_cpu_decode(int token, bool want_logits) { step_cpu_rows(&token, 1, want_logits); }
+
+// One MoE layer's FFN for R rows on the CPU, from the q4_1 pool in place: the router (host), the
+// shared expert (gated) and each row's top-k routed experts, every expert's up / gate stripes read
+// once for all rows that chose it; x += shared + sum of w_e expert_e. The staged route's order: the
+// shared expert first, then the experts ascending.
+void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
+    const GemmBlockProgram& gb = types_[l]->gemm_block;
+    const HostConsts& hc = hc_[l];
+    const size_t hid = w_->hidden, E = w_->moe.experts, topk = w_->moe.topk, ff = gb.shared_ff;
+    const size_t stripe = w_->moe.stripe, exp_ug = 2 * (ff / 128) * stripe, down_band = 128 * ff * 5 / 8;
+    const uint8_t* pool = pools_[l].map<const uint8_t*>();
+    auto tr = std::chrono::steady_clock::now();
+    static thread_local std::vector<float> probs, wt, hsh, ysh, hu, hd, ye;
+    static thread_local std::vector<int32_t> idx;
+    probs.resize(R * E); idx.resize(R * topk); wt.resize(R * topk);
+    host::router_block(R, hid, E, topk, xn, hc.router.data(), probs.data(), idx.data(), wt.data());
+    // the experts to run, ascending, each with the rows that chose it
+    std::vector<std::pair<uint32_t, std::vector<std::pair<size_t, float>>>> ex;   // (expert, [(row, weight)])
+    {
+        std::vector<int> slot(E, -1);
+        std::vector<uint32_t> order;
+        for (size_t r = 0; r < R; ++r)
+            for (size_t k = 0; k < topk; ++k) {
+                const uint32_t e = static_cast<uint32_t>(idx[r * topk + k]);
+                if (slot[e] < 0) { slot[e] = 0; order.push_back(e); }
+            }
+        std::sort(order.begin(), order.end());
+        for (size_t i = 0; i < order.size(); ++i) slot[order[i]] = static_cast<int>(i);
+        ex.resize(order.size());
+        for (size_t i = 0; i < order.size(); ++i) ex[i].first = order[i];
+        for (size_t r = 0; r < R; ++r)
+            for (size_t k = 0; k < topk; ++k) ex[slot[idx[r * topk + k]]].second.push_back({r, wt[r * topk + k]});
+    }
+    timing_.route_ms += ms_since(tr);
+    auto tg = std::chrono::steady_clock::now();
+    const size_t NE = ex.size();
+    // the inputs: every row once (the shared expert and the experts' up / gate read the same xn)
+    std::vector<host::Q41X> xq(R);
+    for (size_t r = 0; r < R; ++r) host::q41_prep_x(xn + r * hid, hid, xq[r]);
+    // phase 1, one parallel loop: the shared up|gate (std, 1024 rows) and each expert's up and gate
+    // (stripes) -- work items of one 64-row band
+    const uint8_t* sh_up = q41_weight(l, gb.shared_program[0].args[0]);
+    const uint8_t* sh_dn = q41_weight(l, gb.shared_program[1].args[0]);
+    hsh.resize(R * 2 * ff);
+    hu.resize(NE * R * 2 * ff);
+    struct Item { const uint8_t* base; host::Q41Lay lay; size_t K, b; const host::Q41X* x[8]; float* y[8]; size_t R; };
+    std::vector<Item> items;
+    items.reserve((NE * 2 + 2) * (2 * ff / 64) + 64);
+    for (size_t b = 0; b < 2 * ff / 64; ++b) {
+        Item it{sh_up, host::q41_std(hid), hid, b, {}, {}, R};
+        for (size_t r = 0; r < R; ++r) { it.x[r] = &xq[r]; it.y[r] = hsh.data() + r * 2 * ff; }
+        items.push_back(it);
+    }
+    for (size_t i = 0; i < NE; ++i) {
+        const auto& rows = ex[i].second;
+        for (size_t proj = 0; proj < 2; ++proj)
+            for (size_t b = 0; b < ff / 64; ++b) {
+                Item it{pool + w_->moe.base + ex[i].first * exp_ug + proj * stripe, host::q41_stripe(2 * stripe), hid, b, {}, {}, rows.size()};
+                for (size_t j = 0; j < rows.size(); ++j) {
+                    it.x[j] = &xq[rows[j].first];
+                    it.y[j] = hu.data() + (i * R + j) * 2 * ff + proj * ff;
+                }
+                items.push_back(it);
+            }
+    }
+    auto run_items = [&] {
+#pragma omp parallel for schedule(dynamic, 1)
+        for (long long q = 0; q < static_cast<long long>(items.size()); ++q) {
+            const Item& it = items[static_cast<size_t>(q)];
+            host::gemv_q41_bands(it.base, it.lay, it.K, it.x, it.R, it.y, it.b, it.b + 1);
+        }
+    };
+    run_items();
+    // h = silu(gate) * up for the shared expert and each (expert, row)
+    hd.resize((NE * R + R) * ff);
+    auto silu_mul = [&](const float* u, const float* g, float* o) {
+        for (size_t j = 0; j < ff; ++j) o[j] = g[j] / (1.f + std::exp(-g[j])) * u[j];
+    };
+    for (size_t r = 0; r < R; ++r) silu_mul(hsh.data() + r * 2 * ff, hsh.data() + r * 2 * ff + ff, hd.data() + (NE * R + r) * ff);
+    for (size_t i = 0; i < NE; ++i)
+        for (size_t j = 0; j < ex[i].second.size(); ++j)
+            silu_mul(hu.data() + (i * R + j) * 2 * ff, hu.data() + (i * R + j) * 2 * ff + ff, hd.data() + (i * R + j) * ff);
+    // phase 2: the downs, each (expert, row) its own input
+    std::vector<host::Q41X> hq((NE + 1) * R);
+    for (size_t i = 0; i < NE; ++i)
+        for (size_t j = 0; j < ex[i].second.size(); ++j) host::q41_prep_x(hd.data() + (i * R + j) * ff, ff, hq[i * R + j]);
+    for (size_t r = 0; r < R; ++r) host::q41_prep_x(hd.data() + (NE * R + r) * ff, ff, hq[NE * R + r]);
+    ysh.resize(R * hid);
+    ye.resize(NE * R * hid);
+    items.clear();
+    for (size_t b = 0; b < hid / 64; ++b) {
+        Item it{sh_dn, host::q41_std(ff), ff, b, {}, {}, R};
+        for (size_t r = 0; r < R; ++r) { it.x[r] = &hq[NE * R + r]; it.y[r] = ysh.data() + r * hid; }
+        items.push_back(it);
+        for (size_t i = 0; i < NE; ++i) {
+            const auto& rows = ex[i].second;
+            Item ie{pool + w_->moe.pool_down + ex[i].first * w_->moe.up_bytes, host::q41_stripe(down_band), ff, b, {}, {}, rows.size()};
+            for (size_t j = 0; j < rows.size(); ++j) { ie.x[j] = &hq[i * R + j]; ie.y[j] = ye.data() + (i * R + j) * hid; }
+            items.push_back(ie);
+        }
+    }
+    run_items();
+    // x += gate * shared, then the experts ascending
+    for (size_t r = 0; r < R; ++r) {
+        double d = 0;
+        for (size_t i = 0; i < hid; ++i) d += static_cast<double>(bf16_to_f32(f32_to_bf16(xn[r * hid + i]))) * hc.sgw[i];
+        const float gate = 1.f / (1.f + std::exp(-static_cast<float>(d)));
+        for (size_t i = 0; i < hid; ++i) x[r * hid + i] += gate * ysh[r * hid + i];
+    }
+    for (size_t i = 0; i < NE; ++i)
+        for (size_t j = 0; j < ex[i].second.size(); ++j) {
+            const auto [r, w] = ex[i].second[j];
+            const float* y = ye.data() + (i * R + j) * hid;
+            for (size_t c = 0; c < hid; ++c) x[r * hid + c] += w * y[c];
+        }
+    timing_.moe_run_ms += ms_since(tg);
+}
 
 void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
     apply_thread_budget();
@@ -3118,6 +3264,16 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
     // in: R rows of k, out: R rows of npad (row stride npad)
     auto gemv = [&](const Step& st, int l, const float* in, std::vector<float>& out) {
         size_t n, k, npad;
+        if (q41_cpu_) {   // the q4_1 pool bytes in place: out rows of n
+            const std::string& kn = st.kernel;
+            n = std::stoul(kn.substr(6, kn.find("_k") - 6));
+            k = std::stoul(kn.substr(kn.find("_k") + 2));
+            out.resize(R * n);
+            auto tg = std::chrono::steady_clock::now();
+            host::gemv_q41_rows(q41_weight(l, st.args[0]), host::q41_std(k), n, k, in, R, out.data(), n);
+            timing_.part0_ms += ms_since(tg);
+            return;
+        }
         shape(st, n, k, npad);
         out.resize(R * npad);
         auto tg = std::chrono::steady_clock::now();
@@ -3355,6 +3511,10 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
         for (size_t r = 0; r < R; ++r)
             for (size_t i = 0; i < hid; ++i) x[r * hid + i] += y[r * no + i];
         host::rmsnorm_rows(x.data(), R, hid, hc.postln.data(), gb.eps, xn.data());
+        if (!gb.has_dense_ffn()) {
+            moe_cpu_rows(l, xn.data(), R, x.data());
+            continue;
+        }
         gemv(gb.ffn_program[0], l, xn.data(), h);
         // up|gate C: every 128-column tile is [gate 64 | up 64]; h = silu(gate) * up
         const size_t ug = h.size() / R, ff = ug / 2;
@@ -3393,9 +3553,10 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
     timing_.total_ms = ms_since(t0);
     static const bool trace = std::getenv("OFLM_OPEN_CPU_DECODE_TRACE") != nullptr;
     if (trace)
-        std::fprintf(stderr, "cpu decode pos %zu rows %zu: %.1f ms | gemv %.1f (npu wait %.1f) mixer %.1f lm %.1f | split pre %.1f post %.1f\n",
+        std::fprintf(stderr, "cpu decode pos %zu rows %zu: %.1f ms | gemv %.1f (npu wait %.1f) mixer %.1f lm %.1f | split pre %.1f post %.1f"
+                             " | moe route %.1f experts %.1f\n",
                      pos, R, timing_.total_ms, timing_.part0_ms, timing_.attn_ms, timing_.part1_ms, timing_.lmhead_ms,
-                     timing_.moe_prep_ms, timing_.moe_read_ms);
+                     timing_.moe_prep_ms, timing_.moe_read_ms, timing_.route_ms, timing_.moe_run_ms);
 }
 
 void Core::load_mtp(const std::string& shard) {
