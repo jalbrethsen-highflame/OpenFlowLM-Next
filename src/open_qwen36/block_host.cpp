@@ -1070,6 +1070,19 @@ void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, fl
 }  // namespace
 
 namespace {
+// The flash kernels' team from 2048 keys (OFLM_OPEN_ATTN_THREADS, default the OMP places: the
+// physical cores with OMP_PLACES=cores): decode passes run 8 threads, which suits the memory-bound
+// weight products, but attention over a long cache is compute-bound (32K keys, 4 rows: 95 -> 50
+// ms a pass with 16)
+int flash_threads(size_t keys) {
+    static const int n = [] {
+        if (const char* e = std::getenv("OFLM_OPEN_ATTN_THREADS")) return std::max(1, std::atoi(e));
+        return std::max(0, omp_get_num_places());
+    }();
+    const int cur = omp_get_max_threads();
+    return keys >= 2048 && n > cur ? n : cur;
+}
+
 // exp for x <= 0 (softmax terms): 2^(x log2 e) as 2^f (degree-7 polynomial, f in [0, 1), relative
 // error < 1e-6) scaled by 2^floor; lanes under -87 give 0
 __attribute__((target("avx512f,avx512dq,fma")))
@@ -1138,7 +1151,7 @@ void attention_decode_flash(size_t hd, size_t nh, size_t kvh, size_t R, size_t p
     std::vector<float>& part = part_tl;
     part.resize(R * nh * NC * PS);
     float* pp = part.data();
-#pragma omp parallel
+#pragma omp parallel num_threads(flash_threads(Kmax))
     {
         // per thread: the scaled queries, their accumulators, K transposed and V as floats
         std::vector<float, std::allocator<float>> buf(MAXQ * hd * 2 + hd * KB + KB * hd + MAXQ * KB + 64);
@@ -1320,7 +1333,7 @@ void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, siz
     std::vector<float>& part = part_tl;
     part.resize(R * nh * NC * PS);
     float* pp = part.data();
-#pragma omp parallel
+#pragma omp parallel num_threads(flash_threads(Kmax))
     {
         std::vector<uint32_t> buf(MAXQ * HP + HP * KB + (KB / 2) * hd + MAXQ * hd + 64);
         uint32_t* base = reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(buf.data()) + 63) & ~uintptr_t(63));
@@ -1379,23 +1392,26 @@ void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, siz
                         _mm512_store_si512(VI + jp * hd + d, _mm512_or_si512(lo, _mm512_slli_epi32(hi, 16)));
                     }
                 }
-                // scores, 4 queries at a time
-                for (size_t q0 = 0; q0 < NQ; q0 += 4) {
-                    const size_t nq4 = std::min<size_t>(4, NQ - q0);
-                    __m512 s4[4][2];
-                    for (int u = 0; u < 4; ++u) s4[u][0] = s4[u][1] = _mm512_setzero_ps();
+                // scores, 6 queries at a time (12 sums in flight: 8 left the dot products' latency
+                // exposed)
+                for (size_t q0 = 0; q0 < NQ; q0 += 6) {
+                    const size_t nq6 = std::min<size_t>(6, NQ - q0);
+                    const uint32_t* qr[6];
+                    for (size_t u = 0; u < 6; ++u) qr[u] = qb + (q0 + (u < nq6 ? u : 0)) * HP;
+                    __m512 s6[6][2];
+                    for (int u = 0; u < 6; ++u) s6[u][0] = s6[u][1] = _mm512_setzero_ps();
                     for (size_t p = 0; p < HP; ++p) {
                         const __m512bh ka = reinterpret_cast<__m512bh>(_mm512_load_si512(KT + p * KB));
                         const __m512bh kb2 = reinterpret_cast<__m512bh>(_mm512_load_si512(KT + p * KB + 16));
-                        for (int u = 0; u < 4; ++u) {
-                            const __m512bh qv = reinterpret_cast<__m512bh>(_mm512_set1_epi32(static_cast<int>(qb[(q0 + (u < static_cast<int>(nq4) ? u : 0)) * HP + p])));
-                            s4[u][0] = _mm512_dpbf16_ps(s4[u][0], qv, ka);
-                            s4[u][1] = _mm512_dpbf16_ps(s4[u][1], qv, kb2);
+                        for (int u = 0; u < 6; ++u) {
+                            const __m512bh qv = reinterpret_cast<__m512bh>(_mm512_set1_epi32(static_cast<int>(qr[u][p])));
+                            s6[u][0] = _mm512_dpbf16_ps(s6[u][0], qv, ka);
+                            s6[u][1] = _mm512_dpbf16_ps(s6[u][1], qv, kb2);
                         }
                     }
-                    for (size_t u = 0; u < nq4; ++u) {
-                        _mm512_store_ps(sc[q0 + u], s4[u][0]);
-                        _mm512_store_ps(sc[q0 + u] + 16, s4[u][1]);
+                    for (size_t u = 0; u < nq6; ++u) {
+                        _mm512_store_ps(sc[q0 + u], s6[u][0]);
+                        _mm512_store_ps(sc[q0 + u] + 16, s6[u][1]);
                     }
                 }
                 // the online softmax; p rounded to bf16 (the sums use the rounded values too)
@@ -1419,40 +1435,43 @@ void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, siz
                     l[qi] = l[qi] * corr[qi] + (_mm512_reduce_add_ps(r0) + _mm512_reduce_add_ps(r1));
                     m[qi] = mn;
                 }
-                // sum p v, 2 queries x 64 dims a pass, 2 keys an instruction
-                for (size_t q0 = 0; q0 < NQ; q0 += 2) {
-                    const size_t q1 = std::min(q0 + 1, NQ - 1), nv = std::max(nvq[q0], nvq[q1]);
-                    const bool two = q1 != q0;
+                // sum p v, 3 queries x 64 dims a pass (12 sums in flight), 2 keys an instruction
+                for (size_t q0 = 0; q0 < NQ; q0 += 3) {
+                    const size_t q1 = std::min(q0 + 1, NQ - 1), q2 = std::min(q0 + 2, NQ - 1);
+                    const size_t nv = std::max({nvq[q0], nvq[q1], nvq[q2]});
                     if (!nv) continue;
                     const size_t npair = (nv + 1) / 2;
                     float* a0p = acc + q0 * hd;
                     float* a1p = acc + q1 * hd;
+                    float* a2p = acc + q2 * hd;
                     const uint32_t* p0w = reinterpret_cast<const uint32_t*>(pb[q0]);
                     const uint32_t* p1w = reinterpret_cast<const uint32_t*>(pb[q1]);
-                    const __m512 c0 = _mm512_set1_ps(corr[q0]), c1 = _mm512_set1_ps(corr[q1]);
+                    const uint32_t* p2w = reinterpret_cast<const uint32_t*>(pb[q2]);
+                    const __m512 c0 = _mm512_set1_ps(corr[q0]), c1 = _mm512_set1_ps(corr[q1]), c2 = _mm512_set1_ps(corr[q2]);
                     for (size_t d = 0; d < hd; d += 64) {
-                        __m512 x0 = _mm512_mul_ps(_mm512_load_ps(a0p + d), c0), x1 = _mm512_mul_ps(_mm512_load_ps(a0p + d + 16), c0);
-                        __m512 x2 = _mm512_mul_ps(_mm512_load_ps(a0p + d + 32), c0), x3 = _mm512_mul_ps(_mm512_load_ps(a0p + d + 48), c0);
-                        __m512 y0 = _mm512_mul_ps(_mm512_load_ps(a1p + d), c1), y1 = _mm512_mul_ps(_mm512_load_ps(a1p + d + 16), c1);
-                        __m512 y2 = _mm512_mul_ps(_mm512_load_ps(a1p + d + 32), c1), y3 = _mm512_mul_ps(_mm512_load_ps(a1p + d + 48), c1);
+                        __m512 x[3][4];
+                        for (int i = 0; i < 4; ++i) {
+                            x[0][i] = _mm512_mul_ps(_mm512_load_ps(a0p + d + 16 * i), c0);
+                            x[1][i] = _mm512_mul_ps(_mm512_load_ps(a1p + d + 16 * i), c1);
+                            x[2][i] = _mm512_mul_ps(_mm512_load_ps(a2p + d + 16 * i), c2);
+                        }
                         for (size_t jp = 0; jp < npair; ++jp) {
                             const uint32_t* vr = VI + jp * hd + d;
-                            const __m512bh v0 = reinterpret_cast<__m512bh>(_mm512_load_si512(vr));
-                            const __m512bh v1 = reinterpret_cast<__m512bh>(_mm512_load_si512(vr + 16));
-                            const __m512bh v2 = reinterpret_cast<__m512bh>(_mm512_load_si512(vr + 32));
-                            const __m512bh v3 = reinterpret_cast<__m512bh>(_mm512_load_si512(vr + 48));
                             const __m512bh pa = reinterpret_cast<__m512bh>(_mm512_set1_epi32(static_cast<int>(p0w[jp])));
                             const __m512bh pbv = reinterpret_cast<__m512bh>(_mm512_set1_epi32(static_cast<int>(p1w[jp])));
-                            x0 = _mm512_dpbf16_ps(x0, pa, v0); x1 = _mm512_dpbf16_ps(x1, pa, v1);
-                            x2 = _mm512_dpbf16_ps(x2, pa, v2); x3 = _mm512_dpbf16_ps(x3, pa, v3);
-                            y0 = _mm512_dpbf16_ps(y0, pbv, v0); y1 = _mm512_dpbf16_ps(y1, pbv, v1);
-                            y2 = _mm512_dpbf16_ps(y2, pbv, v2); y3 = _mm512_dpbf16_ps(y3, pbv, v3);
+                            const __m512bh pc = reinterpret_cast<__m512bh>(_mm512_set1_epi32(static_cast<int>(p2w[jp])));
+                            for (int i = 0; i < 4; ++i) {
+                                const __m512bh v = reinterpret_cast<__m512bh>(_mm512_load_si512(vr + 16 * i));
+                                x[0][i] = _mm512_dpbf16_ps(x[0][i], pa, v);
+                                x[1][i] = _mm512_dpbf16_ps(x[1][i], pbv, v);
+                                x[2][i] = _mm512_dpbf16_ps(x[2][i], pc, v);
+                            }
                         }
-                        _mm512_store_ps(a0p + d, x0); _mm512_store_ps(a0p + d + 16, x1);
-                        _mm512_store_ps(a0p + d + 32, x2); _mm512_store_ps(a0p + d + 48, x3);
-                        if (two) {
-                            _mm512_store_ps(a1p + d, y0); _mm512_store_ps(a1p + d + 16, y1);
-                            _mm512_store_ps(a1p + d + 32, y2); _mm512_store_ps(a1p + d + 48, y3);
+                        // (a clamped duplicate in the last group holds the same sums as its query)
+                        for (int i = 0; i < 4; ++i) {
+                            _mm512_store_ps(a2p + d + 16 * i, x[2][i]);
+                            _mm512_store_ps(a1p + d + 16 * i, x[1][i]);
+                            _mm512_store_ps(a0p + d + 16 * i, x[0][i]);
                         }
                     }
                 }

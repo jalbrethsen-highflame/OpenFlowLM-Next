@@ -13,6 +13,27 @@ with d3.
 - 512-row and 256-row GEMM tiers for short prompts, host stages on real rows only.
 - The tiled host attention, one host thread per physical core.
 
+## Status (2026-10-20): long context
+
+Causal attention on the NPU to 130048 keys (dit_fa256b fills K / V in pieces of <= 1023 chunks:
+two fills work, three time out). Server, greedy, C++ source prompts, **a GPU training job running
+beside it** (CPU boost off: tuned `powersave`, cores at ~1.6 GHz under the 85 W limit):
+
+| Prompt tokens | Prefill | First token | Decode (before -> after the 16-thread attention) |
+|---|---|---|---|
+| 1.7K | 352 tok/s | 6.2 s | 6.8 |
+| 17.8K | 401 | 46 s | 6.0 |
+| 34.1K | 394 -> 403 | 89 s | 5.8 -> 7.3 |
+| 66.1K | 348 -> 345 | 195 s | 4.1 -> 5.0 |
+| 121K | 276 | 445 s | 3.6 |
+
+Decode attention runs on all physical cores from 2048 keys (OFLM_OPEN_ATTN_THREADS; the weight
+products keep 8 threads), 12 dot-product sums in flight in the bf16 kernel (same bits). One
+layer's call, 4 rows, bench (npu-scratch/longctx/bench3), a pass = 16 layers: 32K 85 -> ~45 ms,
+64K 170 -> ~85 ms. At 16 threads the kernel change is within the noise.
+
+- [ ] The same table on a quiet machine (no GPU job, boost on).
+
 ## Status (2026-10-16, afternoon)
 
 **Decode, 8 cores, greedy (CLI):** as below plus the fast rollback: 4 short prompts **17.5 tok/s**
