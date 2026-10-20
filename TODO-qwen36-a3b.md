@@ -57,6 +57,26 @@ Prefill, CLI `--gemm-block`, tok/s:
   19.7 ms vs 16.4 full per 256-slot pass; the bfp16 step ~2.5 us a call). Next lever there: a faster
   expert core (hand-scheduled q4_1 dequant + bfp16 MAC), then fewer weight bytes per token.
 
+Decode (CPU decode on the q4_1 pools, 16 threads, GPU job running), tok/s:
+
+| Prompt | NPU decode (before) | CPU decode | CPU + MTP (k = 2) |
+|---|---|---|---|
+| chat, ~45 tokens (prose / code) | 9.9-11 | 14.6 | 20.8 / 22.0 |
+| 600 tokens | 10 | 14.7 | |
+| 30K chat (C++ source + question) | ~4.2 (32K bench) | 12.8 | 15.6 |
+
+- gemv_q41 (33c0da5): VNNI + VBMI on the pool bytes in place; nibbles centred ((q - 8), m + 8 d): the
+  int8 input's error 1.5 % -> 0.55 %. 100 GB/s on one row in a microbench (L3-assisted), ~40 GB/s in
+  decode with the GPU busy: decode is bandwidth-bound (~2.2 GB a token: mixers 0.8, experts 0.71,
+  q8 head 0.5, router, state).
+- The MoE tail on the CPU (163e7f0): router split over threads (9.9 -> 3.8 ms a token), every expert
+  GEMV of a phase in one parallel loop.
+- MTP (c477a69): the HF model's mtp.* (19 tensors, fetched by range requests,
+  ~/workspace/npu-scratch/a3b/mtp/fetch_mtp.py) as q4_1; the MoE MTP layer through moe_cpu. k = 2
+  beats 1 and 3 (a verify row adds distinct experts). Acceptance 50-65 %. More MTP context (4096
+  rows) did not raise acceptance at 30K and cost 2.8 s.
+- At 30K a step reads ~650 MB of KV (mixer 21 ms of 77): KV in int8 is the next lever there.
+
 ## Plan (biggest first; re-profile after each)
 
 Prefill:
