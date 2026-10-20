@@ -1197,6 +1197,9 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     // int4 repack loses 12-13 % of each weight there and flips routing)
     q41_cpu_ = !skip_pools && cpu_decode_on_ && w_->has_moe && !drop_pools_;
     if (q41_cpu_) log("CPU decode: the products on the q4_1 pools in place (gemv_q41)");
+    // its decode reads ~2.2 GB a token and is bandwidth-bound: 16 threads, not the 27B's 8, by
+    // default (GPU busy: 68 against 81 ms a token); OFLM_OPEN_DECODE_THREADS still decides
+    if (q41_cpu_ && !std::getenv("OFLM_OPEN_DECODE_THREADS")) setenv("OFLM_OPEN_DECODE_THREADS", "16", 0);
     std::vector<uint8_t> pool_tmp;
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];
