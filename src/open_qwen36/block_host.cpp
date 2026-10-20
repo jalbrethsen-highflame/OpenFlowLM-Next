@@ -2468,5 +2468,115 @@ void swiglu_tiles(const float* ug, size_t ff, float* h) {
     }
 }
 
+Q41Lay q41_std(size_t K) {
+    const size_t band = 2 * K / 256 * 5120;
+    return {2 * band, band, 2 * 5120};
+}
+Q41Lay q41_stripe(size_t stride) { return {stride, 2 * 5120, 4 * 5120}; }
+
+void q41_prep_x(const float* x, size_t K, Q41X& out) {
+    const size_t nb = K / 32;
+    out.q.resize(K);
+    out.s.resize(nb);
+    out.sum.resize(nb);
+    out.qsum.resize(nb);
+    for (size_t b = 0; b < nb; ++b) {
+        float amax = 0.f, sum = 0.f;
+        for (size_t i = 0; i < 32; ++i) { amax = std::max(amax, std::fabs(x[b * 32 + i])); sum += x[b * 32 + i]; }
+        const float sc = amax / 127.f, inv = amax > 0.f ? 127.f / amax : 0.f;
+        int32_t qs = 0;
+        for (size_t i = 0; i < 32; ++i) { out.q[b * 32 + i] = static_cast<int8_t>(std::lrint(x[b * 32 + i] * inv)); qs += out.q[b * 32 + i]; }
+        out.s[b] = sc;
+        out.sum[b] = sum;
+        out.qsum[b] = qs;
+    }
+}
+
+namespace {
+// the 64 nibble bytes of 8 k x 16 rows (byte 8 kk + j: row 2j low, 2j + 1 high) into VNNI order: dword
+// lane 2j + q = row 2j's (or 2j + 1's) k 4q .. 4q + 3
+const uint8_t* q41_perm() {
+    struct Tab {
+        alignas(64) uint8_t b[64];
+        Tab() {
+            for (int P = 0; P < 64; ++P) {
+                const int L = P / 4, t = P % 4, j = L / 2, q = L % 2;
+                b[P] = static_cast<uint8_t>((4 * q + t) * 8 + j);
+            }
+        }
+    };
+    static const Tab tab;
+    return tab.b;
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx512vbmi,fma")))
+void q41_group16(const uint8_t* const* chunks, size_t ng, size_t rb, const Q41X* const* x, size_t R, float* const* y,
+                 size_t row0) {
+    const __m512i perm = _mm512_load_si512(q41_perm()), m4 = _mm512_set1_epi8(0x0F);
+    __m512 acc[8];
+    for (size_t r = 0; r < R; ++r) acc[r] = _mm512_setzero_ps();
+    for (size_t g = 0; g < ng; ++g) {
+        const uint8_t* ch = chunks[g];
+        const uint8_t* nib = ch + 1024 + rb * 2048;
+        const uint16_t* dp = reinterpret_cast<const uint16_t*>(ch) + rb * 16;
+        const uint16_t* mp = reinterpret_cast<const uint16_t*>(ch + 512) + rb * 16;
+        for (size_t kb = 0; kb < 8; ++kb) {
+            __m512i ae[8], ao[8];
+            for (size_t r = 0; r < R; ++r) ae[r] = ao[r] = _mm512_setzero_si512();
+            for (size_t it = 0; it < 4; ++it) {
+                const __m512i v = _mm512_loadu_si512(nib + (kb * 32 + it * 8) * 8);
+                const __m512i pe = _mm512_permutexvar_epi8(perm, _mm512_and_si512(v, m4));
+                const __m512i po = _mm512_permutexvar_epi8(perm, _mm512_and_si512(_mm512_srli_epi16(v, 4), m4));
+                const size_t k0 = g * 256 + kb * 32 + it * 8;
+                for (size_t r = 0; r < R; ++r) {
+                    int64_t xv;
+                    std::memcpy(&xv, x[r]->q.data() + k0, 8);
+                    const __m512i xb = _mm512_set1_epi64(xv);
+                    ae[r] = _mm512_dpbusd_epi32(ae[r], pe, xb);
+                    ao[r] = _mm512_dpbusd_epi32(ao[r], po, xb);
+                }
+            }
+            const __m512 d16 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(dp + kb * 32))), 16));
+            const __m512 m16 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp + kb * 32))), 16));
+            const __m512 mc16 = _mm512_fmadd_ps(d16, _mm512_set1_ps(8.f), m16);   // m + 8 d
+            const size_t blk = g * 8 + kb;
+            for (size_t r = 0; r < R; ++r) {
+                const __m512i e2 = _mm512_add_epi32(ae[r], _mm512_shuffle_epi32(ae[r], _MM_PERM_CDAB));
+                const __m512i o2 = _mm512_add_epi32(ao[r], _mm512_shuffle_epi32(ao[r], _MM_PERM_CDAB));
+                const __m512i isum = _mm512_sub_epi32(_mm512_mask_blend_epi32(0xAAAA, e2, o2), _mm512_set1_epi32(8 * x[r]->qsum[blk]));
+                const __m512 fs = _mm512_cvtepi32_ps(isum);
+                acc[r] = _mm512_fmadd_ps(mc16, _mm512_set1_ps(x[r]->sum[blk]), acc[r]);
+                acc[r] = _mm512_fmadd_ps(fs, _mm512_mul_ps(d16, _mm512_set1_ps(x[r]->s[blk])), acc[r]);
+            }
+        }
+    }
+    for (size_t r = 0; r < R; ++r) _mm512_storeu_ps(y[r] + row0, acc[r]);
+}
+}  // namespace
+
+void gemv_q41_bands(const uint8_t* base, const Q41Lay& lay, size_t K, const Q41X* const* x, size_t R, float* const* y,
+                    size_t b0, size_t b1) {
+    if (R < 1 || R > 8 || K % 256) throw std::runtime_error("open_qwen36: gemv_q41: 1..8 rows, K a multiple of 256");
+    const size_t ng = K / 256;
+    const uint8_t* chunks[64];
+    if (ng > 64) throw std::runtime_error("open_qwen36: gemv_q41: K past 16384");
+    for (size_t b = b0; b < b1; ++b)
+        for (size_t h = 0; h < 2; ++h) {
+            for (size_t g = 0; g < ng; ++g) chunks[g] = base + (b / 2) * lay.s2 + (b % 2) * lay.s1 + g * lay.sk + h * 5120;
+            for (size_t rb = 0; rb < 2; ++rb) q41_group16(chunks, ng, rb, x, R, y, b * 64 + h * 32 + rb * 16);
+        }
+}
+
+void gemv_q41_rows(const uint8_t* base, const Q41Lay& lay, size_t n, size_t K, const float* x, size_t R, float* y,
+                   size_t ldy) {
+    std::vector<Q41X> xq(R);
+    const Q41X* xp[8];
+    float* yp[8];
+    for (size_t r = 0; r < R; ++r) { q41_prep_x(x + r * K, K, xq[r]); xp[r] = &xq[r]; yp[r] = y + r * ldy; }
+    const long long nb = static_cast<long long>(n / 64);
+#pragma omp parallel for schedule(static)
+    for (long long b = 0; b < nb; ++b) gemv_q41_bands(base, lay, K, xp, R, yp, static_cast<size_t>(b), static_cast<size_t>(b) + 1);
+}
+
 }  // namespace host
 }  // namespace open_qwen36

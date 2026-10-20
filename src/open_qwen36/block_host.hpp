@@ -179,5 +179,27 @@ void lmhead_q8_cpu_rows(const uint8_t* W, size_t N, size_t K, const float* x, si
 /// memcpy over the OpenMP threads (the MTP state snapshots: ~154 MB a pass on the 27B)
 void par_copy(void* dst, const void* src, size_t bytes);
 
+/// Where a q4_1 pool region keeps its 5120 B chunks (32 rows x 256 K: d bf16[256] at 0, m bf16[256]
+/// at 512, then the nibbles k-major, 16 rows per k): chunk (64-row band b, 256-K group g, 32-row half
+/// h) at base + (b / 2) s2 + (b % 2) s1 + g sk + h 5120. q41_std: the std_perm band order (bands
+/// whole, groups inside); q41_stripe: Qwen3.6-MoE's experts, 128-row stripes of two bands
+/// interleaved by k-group, stripes `stride` apart.
+struct Q41Lay { size_t s2 = 0, s1 = 0, sk = 0; };
+Q41Lay q41_std(size_t K);
+Q41Lay q41_stripe(size_t stride);
+/// x [K] as int8 per 32 (xq), each block's scale (sx) and its float sum (xs) -- gemv_q41_rows' input
+struct Q41X { std::vector<int8_t> q; std::vector<float> s, sum; std::vector<int32_t> qsum; };   // qsum: sum of q per block
+void q41_prep_x(const float* x, size_t K, Q41X& out);
+/// y[r][band rows] = W x_r for the bands [b0, b1) of a q4_1 region, r < R (1..8): each weight byte
+/// read once for all rows (AVX-512 VNNI + VBMI; int8 inputs). w = d q + m = d (q - 8) + (m + 8 d), so per
+/// 32-K block y += d sx (sum(q xq) - 8 sum(xq)) + (m + 8 d) sum(x): the int8 rounding meets the
+/// centred nibbles, not q's mean (with q in 0..15 and m ~ -8 d it cancelled, 1.5 % error against
+/// 0.5 %). No threading inside: callers split the bands.
+void gemv_q41_bands(const uint8_t* base, const Q41Lay& lay, size_t K, const Q41X* const* x, size_t R, float* const* y,
+                    size_t b0, size_t b1);
+/// The same over all n rows, OpenMP over 32-row halves: x [R, K] row-major, y [R, ldy].
+void gemv_q41_rows(const uint8_t* base, const Q41Lay& lay, size_t n, size_t K, const float* x, size_t R, float* y,
+                   size_t ldy);
+
 }  // namespace host
 }  // namespace open_qwen36
