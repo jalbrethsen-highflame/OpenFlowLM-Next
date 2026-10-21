@@ -144,6 +144,35 @@ Lessons from the kernel work:
 Next: the host stages under GPU load (DeltaNet conv / rule, the MoE gather and scatter), then the
 experts' core rate (they bind the NPU when the GPU is busy), then MBI default on.
 
+## Constraint pass (2026-10-21, GPU busy; b95d8b2 .. 5a7c17a)
+
+Pipe trace (`OFLM_OPEN_PIPE_TRACE=<csv>`, `utilities/pipe_trace.py`) at 30K showed the host as the
+constraint: one host thread 100 % busy, NPU 47 % busy (it waited on TAIL->UP and MID->OUT).
+
+| Change | 30K prompt, s |
+|---|---|
+| before | 63-64 |
+| two host threads (`OFLM_OPEN_HOST_THREADS`, default 2; an OMP team of 8 is ~as fast as 16 under load) | 44.5-46 |
+| AVX-512 mbi_quant_rows, bf16x_dot gate, z read as bf16 rows | 36.6-37.6 |
+| + dnc (`OFLM_OPEN_DNC=1`) | 39-40 |
+
+After the host fixes: NPU 83 % busy (experts 20.6 s, attention 4 s, mixer GEMMs 5.5 s); host
+~63 thread-s (DeltaNet MID 29.7, router + gather 19.7, scatter 7.2, norms / packs 7.4).
+
+dnc (designs/deltanet/dnc.py): the gated delta rule on the NPU, 16 tokens a step, bfp16 MACs, the
+state slice (16 KB) in L1. O 1.3 % / S 1.0 % from the f64 recurrence; 4.0 ms a 1024-token layer.
+In the model KL 1.06e-2 -> 1.31e-2 (argmax 528/600). It does not pay yet: host MID 29.7 -> 18.3 s
+but MIDB (gate + pack) adds 7.5 s, and the NPU gets 5.5 s more and becomes the constraint (95 %).
+To make it pay: one record a key head (both value heads replay it), the pack in phase 1, fewer
+syncs (27 MB a call), the kernel to ~1.7 ms.
+
+Kernel sets: k6 (model open_kernels), k7 = k6 + dnc by manifest merge. Do not export A3B sets from
+this worktree with --no-build while a qwen35-9b export runs here: the build dirs (attention ag /
+fa256bc, dit2) do not name the geometry and the 9B build replaces them (k7bad: NaN).
+
+Next: a hand-scheduled expert up/gate + down loop (the compiler gives ~27 bundles where 12 MACs are
+needed), the router on the NPU, dnc made to pay, NPU attention for long-context decode.
+
 ## Plan (biggest first; re-profile after each)
 
 Prefill:
