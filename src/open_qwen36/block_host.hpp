@@ -200,6 +200,9 @@ Q41Lay q41_stripe(size_t stride);
 /// x [K] as int8 per 32 (xq), each block's scale (sx) and its float sum (xs) -- gemv_q41_rows' input
 struct Q41X { std::vector<int8_t> q; std::vector<float> s, sum; std::vector<int32_t> qsum; };   // qsum: sum of q per block
 void q41_prep_x(const float* x, size_t K, Q41X& out);
+/// sum_i bf16(x_i) w_i in double (the shared expert's gate): the products are exact in double, so
+/// only the order of the sum differs from the scalar loop (AVX-512 when the CPU has it)
+double bf16x_dot(const float* x, const float* w, size_t n);
 /// y[r][band rows] = W x_r for the bands [b0, b1) of a q4_1 region, r < R (1..8): each weight byte
 /// read once for all rows (AVX-512 VNNI + VBMI; int8 inputs). w = d q + m = d (q - 8) + (m + 8 d), so per
 /// 32-K block y += d sx (sum(q xq) - 8 sum(xq)) + (m + 8 d) sum(x): the int8 rounding meets the

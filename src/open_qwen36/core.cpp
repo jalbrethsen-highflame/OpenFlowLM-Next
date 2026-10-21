@@ -3150,7 +3150,38 @@ constexpr size_t kMbiXel = 64 + 16 * 4 * 64 + 8 * 4 * 128 + 4 * 128, kMbiXslot =
 constexpr size_t kMbiYslot = 32 * 4 * 2048;   // bytes
 // per row of x [T, 2048]: int8 per (row, 256-K group) at a bf16 scale (|q| <= 127 with amax / 126),
 // the scales [T, 8] and the block sums [T, 64]
+// one row's 8 k-groups with AVX-512: the same values as the scalar loop (cvtps rounds to nearest
+// even, as nearbyint does; |x / s| <= 126.5, so the saturating pack never clips)
+__attribute__((target("avx512f,avx512bw,avx512dq")))
+void mbi_quant_row_avx512(const float* v0, int8_t* q, uint16_t* sx, int16_t* qs) {
+    for (size_t kg = 0; kg < 8; ++kg) {
+        const float* v = v0 + kg * 256;
+        __m512 m = _mm512_setzero_ps();
+        for (size_t i = 0; i < 256; i += 16) m = _mm512_max_ps(m, _mm512_abs_ps(_mm512_loadu_ps(v + i)));
+        const float amax = _mm512_reduce_max_ps(m);
+        const uint16_t sb = f32_to_bf16(amax / 126.f);
+        const float s = bf16_to_f32(sb), inv = s > 0.f ? 1.f / s : 0.f;
+        sx[kg] = sb;
+        const __m512 iv = _mm512_set1_ps(inv);
+        for (size_t b = 0; b < 8; ++b) {
+            const __m512i a = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(v + b * 32), iv));
+            const __m512i c = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(v + b * 32 + 16), iv));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(q + kg * 256 + b * 32), _mm512_cvtsepi32_epi8(a));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(q + kg * 256 + b * 32 + 16), _mm512_cvtsepi32_epi8(c));
+            qs[kg * 8 + b] = static_cast<int16_t>(_mm512_reduce_add_epi32(_mm512_add_epi32(a, c)));
+        }
+    }
+}
 void mbi_quant_rows(const float* x, size_t T, int8_t* q, uint16_t* sx, int16_t* qs) {
+    static const bool v4 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq");
+    if (v4) {
+#pragma omp parallel for schedule(static)
+        for (long long tt = 0; tt < static_cast<long long>(T); ++tt) {
+            const size_t t = static_cast<size_t>(tt);
+            mbi_quant_row_avx512(x + t * 2048, q + t * 2048, sx + t * 8, qs + t * 64);
+        }
+        return;
+    }
 #pragma omp parallel for schedule(static)
     for (long long tt = 0; tt < static_cast<long long>(T); ++tt) {
         const size_t t = static_cast<size_t>(tt);
@@ -3386,8 +3417,7 @@ void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
     ph2 += ms_since(tp2);
     // x += gate * shared, then the experts ascending
     for (size_t r = 0; r < R; ++r) {
-        double d = 0;
-        for (size_t i = 0; i < hid; ++i) d += static_cast<double>(bf16_to_f32(f32_to_bf16(xn[r * hid + i]))) * W.sgw[i];
+        const double d = host::bf16x_dot(xn + r * hid, W.sgw, hid);
         const float gate = 1.f / (1.f + std::exp(-static_cast<float>(d)));
         for (size_t i = 0; i < hid; ++i) x[r * hid + i] += gate * ysh[r * hid + i];
     }
@@ -5626,6 +5656,20 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     for (double& v : host::g_dn_p1) v = 0;
     double hst[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     int n_fa = 0;
+    // OFLM_OPEN_PIPE_TRACE=<file>: every host op, NPU op and NPU kernel run as an event (machine,
+    // layer, chunk, op, start, end ms from the pipe's start, kernel), written as CSV at the end
+    struct PEv { char m; int l, c, op; double a, b; std::string k; };
+    static const char* ptrace = std::getenv("OFLM_OPEN_PIPE_TRACE");
+    std::vector<PEv> pev;
+    std::mutex pev_mu;
+    const auto pt0 = std::chrono::steady_clock::now();
+    auto pms = [&](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double, std::milli>(t - pt0).count(); };
+    auto pevent = [&](char m, size_t l, size_t c, int op, std::chrono::steady_clock::time_point a, const std::string& k = "") {
+        if (!ptrace) return;
+        const double b = pms(std::chrono::steady_clock::now());
+        std::lock_guard<std::mutex> lk(pev_mu);
+        pev.push_back({m, static_cast<int>(l), static_cast<int>(c), op, pms(a), b, k});
+    };
 
     // ---- the NPU thread
     std::thread npu([&] {
@@ -5645,8 +5689,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 const std::string cs = std::to_string(c);
                 auto tb = std::chrono::steady_clock::now();
                 auto run = [&](const std::string& k, const std::vector<std::string>& args) {
+                    auto tk = std::chrono::steady_clock::now();
                     Inflight f = start_run(kerns_.at(k), args, static_cast<int>(l));
                     wait_run(f);
+                    pevent('K', l, c, op, tk, k);
                 };
                 const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
                 const size_t km = gb.kind == "linear" ? gb.vw : gb.qw;
@@ -5750,6 +5796,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     run(D["ffn"]["down2"].get<std::string>(), {"pp_d2_" + cs, gb.ffn_program[1].args[0], "pp_y_" + cs});
                 }
                 npu_busy_ms += ms_since(tb);
+                pevent('N', l, c, op, tb);
                 {
                     std::lock_guard<std::mutex> lk(mu);
                     busy[cell(l, c)] = 0;
@@ -5779,14 +5826,22 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         dit2_pack_a(src, rows, M, w, b.map<uint8_t*>(), dit_hs_, MT);
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * w * 9 / 8, 0);
     };
-    std::vector<float> ya, yb, yc, yd, og, hf, rprobs;
     double moe_ms[5] = {0, 0, 0, 0, 0};       // router, shared gate, gather, x sync, y read back
+    // OFLM_OPEN_HOST_THREADS=n (default 2; 3 and 4 were slower): n host threads take ready cells at once, each with
+    // 1/n of the OpenMP threads (under a loaded CPU a team of 8 is nearly as fast as one of 16, so
+    // two teams nearly double the host's throughput); the counters below go through smu
+    std::mutex smu;
+    auto sadd = [&](double& d, double v) { std::lock_guard<std::mutex> g(smu); d += v; };
+    std::mutex ysync_mu[2];
     // OFLM_OPEN_FA_CHECK=1 (debug): every NPU-attention chunk also runs host attention, and GATE
     // prints the NPU output's error against it per (layer, chunk)
     static const bool fa_check = [] { const char* e = std::getenv("OFLM_OPEN_FA_CHECK"); return e && *e == '1'; }();
     std::map<size_t, std::vector<float>> fa_ref;
     std::vector<std::vector<float>> qprep(C);      // noncausal: each chunk's prepped Q, MID -> GATE
     if (noncausal_ && pos0 != 0) throw std::runtime_error("open_qwen36: noncausal attention needs a fresh prompt (position 0)");
+    auto host_loop = [&](size_t nthr) {
+    std::vector<float> ya, yb, yc, yd, og, hf, rprobs;
+    if (nthr > 1) omp_set_num_threads(std::max(1, omp_threads_ > 0 ? omp_threads_ / static_cast<int>(nthr) : 8));
     try {
         for (;;) {
             size_t l = 0, c = 0;
@@ -5830,15 +5885,15 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 if (lin) {
                     const size_t nch = gb.qkv_dim, vw = gb.vw;
                     auto tm = std::chrono::steady_clock::now();
-                    mid_prof[0] += ms_since(th);                        // the qkv C read back
+                    sadd(mid_prof[0], ms_since(th));                        // the qkv C read back
                     if (c == 0) read_back(st, lt.state_bytes, 0);
-                    mid_prof[1] += ms_since(tm); tm = std::chrono::steady_clock::now();
+                    sadd(mid_prof[1], ms_since(tm)); tm = std::chrono::steady_clock::now();
                     ya.resize(M * nch);
                     yb.resize(M * vw);
                     og.resize(M * vw);
 #pragma omp parallel for
                     for (long long t = 0; t < static_cast<long long>(t_real); ++t) bf16_row_f32(q16 + t * nq + nch, vw, yb.data() + t * vw);
-                    mid_prof[2] += ms_since(tm); tm = std::chrono::steady_clock::now();
+                    sadd(mid_prof[2], ms_since(tm)); tm = std::chrono::steady_clock::now();
                     host::DeltaGeom g;
                     g.T = M; g.hid = hid;
                     g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
@@ -5850,14 +5905,14 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     host::deltanet_block(g, ya.data(), yb.data(), xc, hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
                                          hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
                                          reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
-                    timing_.dn_conv_ms += ph[0];
-                    timing_.dn_rule_ms += ph[1];
+                    sadd(timing_.dn_conv_ms, ph[0]);
+                    sadd(timing_.dn_rule_ms, ph[1]);
                     tm = std::chrono::steady_clock::now();
                     if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
-                    mid_prof[3] += ms_since(tm); tm = std::chrono::steady_clock::now();
+                    sadd(mid_prof[3], ms_since(tm)); tm = std::chrono::steady_clock::now();
                     if (has2(hid, vw)) to_bfp2(og.data(), vw, "pp_m2_" + cs, t_real);
                     else to_bf16(og.data(), M, vw, "pp_m_" + cs);
-                    mid_prof[4] += ms_since(tm);
+                    sadd(mid_prof[4], ms_since(tm));
                 } else {
                     const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
                     const std::string fk = fa_kernel(c);
@@ -5893,7 +5948,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         }
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
                                              man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
-                        timing_.attn_ms += ms_since(ta);
+                        sadd(timing_.attn_ms, ms_since(ta));
                         const size_t MQr = cbk ? MQ : M;            // the stream's query rows (padded past M)
                         const size_t nh = gb.nh, kvh = gb.kvh, hd = gb.hd, qb_head = (MQr / 32) * kFabQBlock;
                         xrt::bo& qbuf = buffer("fab_q_" + cs, 0);
@@ -5935,18 +5990,18 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         // Q for the noncausal stream (unscaled, as the causal one), K / V into the cache
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
                                              man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
-                        timing_.attn_ms += ms_since(ta);
+                        sadd(timing_.attn_ms, ms_since(ta));
                         to_bf16(og.data(), M, qw, "fa_q_" + cs, std::sqrt(static_cast<float>(gb.hd)));
                     } else if (noncausal_) {
                         // Q prepped for GATE (after every chunk's K / V rows are in the cache)
                         qprep[c].resize(M * qw);
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
                                              man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, qprep[c].data());
-                        timing_.attn_ms += ms_since(ta);
+                        sadd(timing_.attn_ms, ms_since(ta));
                     } else if (fk.empty()) {
                         host::attention_block(g, ya.data(), yb.data(), yc.data(), yd.data(), hc.qn.data(), hc.kn.data(),
                                               man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
-                        timing_.attn_ms += ms_since(ta);
+                        sadd(timing_.attn_ms, ms_since(ta));
                         if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs, t_real);
                         else to_bf16(og.data(), M, qw, "pp_m_" + cs);
                         // no NPU attention for this chunk: past FAT and GATE (when the layer has them)
@@ -5965,7 +6020,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         }
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
                                              man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
-                        timing_.attn_ms += ms_since(ta);
+                        sadd(timing_.attn_ms, ms_since(ta));
                         to_bf16(og.data(), M, qw, "fa_q_" + cs, std::sqrt(static_cast<float>(gb.hd)));
                     }
                     if (!noncausal_ && any_cb && !cbk) {
@@ -6017,7 +6072,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                              og.data() + (q0 - r0) * qw);
                     }
                 }
-                timing_.attn_ms += ms_since(ta);
+                sadd(timing_.attn_ms, ms_since(ta));
                 const uint16_t* q16 = buffer("pp_q_" + cs, 0).map<const uint16_t*>();
 #pragma omp parallel for
                 for (long long t = 0; t < static_cast<long long>(t_real); ++t)
@@ -6090,7 +6145,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     ridx_c[c].resize(M * topk);
                     rwt_c[c].resize(M * topk);
                     host::router_block(t_real, hid, E, topk, xc, hc.router.data(), rprobs.data(), ridx_c[c].data(), rwt_c[c].data());
-                    moe_ms[0] += ms_since(tm);
+                    sadd(moe_ms[0], ms_since(tm));
                     auto tg = std::chrono::steady_clock::now();
                     gate_c[c].resize(t_real);
                     if (mbi) {
@@ -6106,11 +6161,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
 #pragma omp parallel for
                     for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
                         const float* x = xc + static_cast<size_t>(tk) * hid;
-                        double d = 0;
-                        for (size_t i = 0; i < hid; ++i) d += static_cast<double>(bf16_to_f32(f32_to_bf16(x[i]))) * hc.sgw[i];
+                        const double d = host::bf16x_dot(x, hc.sgw.data(), hid);
                         gate_c[c][static_cast<size_t>(tk)] = 1.f / (1.f + std::exp(-static_cast<float>(d)));
                     }
-                    moe_ms[1] += ms_since(tg);
+                    sadd(moe_ms[1], ms_since(tg));
                     if (c == glast(c)) {
                         const size_t set = (c / G) % 2, c0 = gfirst(c), grows = (c - c0 + 1) * M;
                         MoeSet& ms = mset[set];
@@ -6175,7 +6229,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                 }
                                 auto ts = std::chrono::steady_clock::now();
                                 xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, slots * kMbiXslot, 0);
-                                moe_ms[3] += ms_since(ts);
+                                sadd(moe_ms[3], ms_since(ts));
                                 ms.passes.push_back(std::move(mp));
                                 done += n;
                                 continue;
@@ -6193,14 +6247,14 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             }
                             auto ts = std::chrono::steady_clock::now();
                             xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, n * hid * NTm * 2, 0);
-                            moe_ms[3] += ms_since(ts);
+                            sadd(moe_ms[3], ms_since(ts));
                             ms.passes.push_back(std::move(mp));
                             done += n;
                         }
                         ms.ysynced = false;
                     }
-                    timing_.moe_prep_ms += ms_since(tm);
-                    moe_ms[2] = timing_.moe_prep_ms - moe_ms[0] - moe_ms[1] - moe_ms[3];
+                    sadd(timing_.moe_prep_ms, ms_since(tm));
+                    { std::lock_guard<std::mutex> g(smu); moe_ms[2] = timing_.moe_prep_ms - moe_ms[0] - moe_ms[1] - moe_ms[3]; }
                 }
             } else if (op == HPACK) {
                 // h = the first 64 of every 128 columns of the up GEMM's C, packed as dit2's A
@@ -6230,12 +6284,16 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 if (mbi) {
                     // every pass's y, then each token's experts from all of them in one visit to its row
                     std::vector<const uint16_t*> yp(ms.passes.size());
-                    for (size_t p = 0; p < ms.passes.size(); ++p) {
-                        xrt::bo& yb = buffer(mbuf('y', set, p), 0);
-                        auto ty = std::chrono::steady_clock::now();
-                        if (!ms.ysynced) read_back(yb, ms.passes[p].n * kMbiYslot, 0);
-                        moe_ms[4] += ms_since(ty);
-                        yp[p] = yb.map<const uint16_t*>();
+                    {
+                        std::lock_guard<std::mutex> yg(ysync_mu[set]);   // the group's first RES reads y back
+                        for (size_t p = 0; p < ms.passes.size(); ++p) {
+                            xrt::bo& yb = buffer(mbuf('y', set, p), 0);
+                            auto ty = std::chrono::steady_clock::now();
+                            if (!ms.ysynced) read_back(yb, ms.passes[p].n * kMbiYslot, 0);
+                            sadd(moe_ms[4], ms_since(ty));
+                            yp[p] = yb.map<const uint16_t*>();
+                        }
+                        ms.ysynced = true;
                     }
 #pragma omp parallel for schedule(dynamic, 16)
                     for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
@@ -6252,7 +6310,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     xrt::bo& yb = buffer(mbuf('y', set, p), 0);
                     auto ty = std::chrono::steady_clock::now();
                     if (!ms.ysynced) read_back(yb, ms.passes[p].n * hid * NTm * 4, 0);
-                    moe_ms[4] += ms_since(ty);
+                    sadd(moe_ms[4], ms_since(ty));
                     const float* yh = yb.map<const float*>();
                     const auto& pt = ms.per_token[p];
                     // moe_block's un-interleave of y's C tiles, straight into the token's row
@@ -6269,7 +6327,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 }
                 ms.ysynced = true;
                 std::memcpy(xr, rs, t_real * hid * 4);
-                timing_.moe_read_ms += ms_since(tr);
+                sadd(timing_.moe_read_ms, ms_since(tr));
             } else {   // RES
                 xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
                 read_back(yb2, t_real * hid * 2, 0);
@@ -6277,7 +6335,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
 #pragma omp parallel for
                 for (long long i = 0; i < static_cast<long long>(t_real * hid); ++i) xr[i] = rs[i] += bf16_to_f32(y16[i]);
             }
-            hst[op] += ms_since(th);
+            sadd(hst[op], ms_since(th));
+            pevent('H', l, c, op, th);
             {
                 std::lock_guard<std::mutex> lk(mu);
                 busy[cell(l, c)] = 0;
@@ -6293,11 +6352,25 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             if (!err) err = std::current_exception();
         }
         cv.notify_all();
-        npu.join();
-        throw;
     }
+    };
+    static const size_t host_threads = [] { const char* e = std::getenv("OFLM_OPEN_HOST_THREADS"); return e ? std::max(1ul, std::strtoul(e, nullptr, 10)) : 2ul; }();
+    const size_t nhost = (fa_check || !mbi) ? 1 : host_threads;
+    std::vector<std::thread> hx;
+    for (size_t i = 1; i < nhost; ++i) hx.emplace_back(host_loop, nhost);
+    host_loop(nhost);
+    for (auto& t : hx) t.join();
+    apply_thread_budget();
     npu.join();
     if (err) std::rethrow_exception(err);
+    if (ptrace) {
+        static const char* opn[] = {"PRE", "QKV", "MID", "FAT", "GATE", "OUT", "TAIL", "UP", "HPACK", "DOWN", "RES"};
+        if (FILE* f = std::fopen(ptrace, "w")) {
+            std::fprintf(f, "m,l,c,op,a,b,k\n");
+            for (const auto& e : pev) std::fprintf(f, "%c,%d,%d,%s,%.3f,%.3f,%s\n", e.m, e.l, e.c, opn[e.op], e.a, e.b, e.k.c_str());
+            std::fclose(f);
+        }
+    }
     state_owner_ = 0;
     if (!packed) dump_hidden(xres.data(), N, hid, ids.data());
     if (mtp_.on) {
@@ -6425,8 +6498,7 @@ void Core::ffn_block(int l, const std::vector<Step>& prog, size_t ff, const floa
     for (long long tt = 0; tt < static_cast<long long>(t_real); ++tt) {
         const size_t t = static_cast<size_t>(tt);
         const float* x = xm + t * hid;
-        double d = 0;
-        for (size_t i = 0; i < hid; ++i) d += static_cast<double>(bf16_to_f32(f32_to_bf16(x[i]))) * sgw[i];
+        const double d = host::bf16x_dot(x, sgw.data(), hid);
         const float gate = 1.f / (1.f + std::exp(-static_cast<float>(d)));
         const float* yr = y.data() + t * hid;
         float* r = res + t * hid;
@@ -7011,8 +7083,7 @@ void Core::ffn_staged(int l, const std::vector<Step>& prog, size_t ff, float* xr
                    for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
                        const size_t t = static_cast<size_t>(tk);
                        const float* x = xm + t * hid;
-                       double d = 0;
-                       for (size_t i = 0; i < hid; ++i) d += static_cast<double>(bf16_to_f32(f32_to_bf16(x[i]))) * sgw[i];
+                       const double d = host::bf16x_dot(x, sgw.data(), hid);
                        const float gate = 1.f / (1.f + std::exp(-static_cast<float>(d)));
                        const float* yr = y + t * hid;
                        float* r = res + t * hid;

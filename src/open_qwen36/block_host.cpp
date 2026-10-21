@@ -2735,6 +2735,31 @@ void swiglu_tiles(const float* ug, size_t ff, float* h) {
     }
 }
 
+__attribute__((target("avx512f,avx512bw,avx512dq,fma")))
+static double bf16x_dot_avx512(const float* x, const float* w, size_t n) {
+    __m512d a0 = _mm512_setzero_pd(), a1 = _mm512_setzero_pd();
+    const __m512i one = _mm512_set1_epi32(1), bias = _mm512_set1_epi32(0x7FFF), hi = _mm512_set1_epi32(static_cast<int>(0xFFFF0000u));
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512i u = _mm512_castps_si512(_mm512_loadu_ps(x + i));
+        u = _mm512_and_si512(_mm512_add_epi32(u, _mm512_add_epi32(bias, _mm512_and_si512(_mm512_srli_epi32(u, 16), one))), hi);
+        const __m512 xb = _mm512_castsi512_ps(u), wv = _mm512_loadu_ps(w + i);
+        a0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_castps512_ps256(xb)), _mm512_cvtps_pd(_mm512_castps512_ps256(wv)), a0);
+        a1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(xb), 1))),
+                             _mm512_cvtps_pd(_mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(wv), 1))), a1);
+    }
+    double d = _mm512_reduce_add_pd(_mm512_add_pd(a0, a1));
+    for (; i < n; ++i) d += static_cast<double>(bf16_to_f32(f32_to_bf16(x[i]))) * w[i];
+    return d;
+}
+double bf16x_dot(const float* x, const float* w, size_t n) {
+    static const bool v4 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
+    if (v4) return bf16x_dot_avx512(x, w, n);
+    double d = 0;
+    for (size_t i = 0; i < n; ++i) d += static_cast<double>(bf16_to_f32(f32_to_bf16(x[i]))) * w[i];
+    return d;
+}
+
 Q41Lay q41_std(size_t K) {
     const size_t band = 2 * K / 256 * 5120;
     return {2 * band, band, 2 * 5120};
