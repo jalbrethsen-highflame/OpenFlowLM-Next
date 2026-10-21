@@ -19,10 +19,12 @@
 // bf16 MACs, no emulated fp32 multiply. Scalars come host-split (the record's aux), so the core
 // runs no scalar float arithmetic.
 //
-// The record (one 16-token step of one value head; host-packed, 9216 B):
+// The record (one 16-token step of one value head, 9216 B): the host packs one 10240 B block a key
+// head and step, [aux of the even value head | kA | qA | aux of the odd one], and the even head
+// reads its first 9216 B, the odd head its last (step's odd: aux at 8192, else at 0 and K / Q at 1024).
 //   kA   bf16 [t block 2][dk block 16][8 t][8 dk]                       4096 B
 //   qA   bf16 the same                                                  4096 B
-//   aux  bf16 at 8192:
+//   aux  bf16 (1024 B):
 //     e hi/lo [2][16], f hi/lo [2][16]: r_ts = e_t f_s (e_t = G_t / G_m, f_s = G_m / G_s)
 //     b hi/lo [2][16]: beta
 //     g hi/lo [2][2 t block][64]: G_t replicated as the [8 t][8] tile rows need it
@@ -113,12 +115,12 @@ static inline void s_out(const float *__restrict S, uint8_t *__restrict piece, u
 }
 
 // one 16-token step of the unit
-static inline void step(const uint8_t *__restrict rec, const bfloat16 *__restrict v, bfloat16 *__restrict o,
+static inline void step(const uint8_t *__restrict rec, int odd, const bfloat16 *__restrict v, bfloat16 *__restrict o,
                         float *__restrict S, uint8_t *__restrict sc) {
   aie::set_rounding(aie::rounding_mode::conv_even);
-  const bfloat16 *__restrict kA = reinterpret_cast<const bfloat16 *>(rec);
+  const bfloat16 *__restrict kA = reinterpret_cast<const bfloat16 *>(rec + (odd ? 0 : 1024));
   const bfloat16 *__restrict qA = kA + kTB * kKB * 64;
-  const bfloat16 *__restrict aux = reinterpret_cast<const bfloat16 *>(rec + kAux);
+  const bfloat16 *__restrict aux = reinterpret_cast<const bfloat16 *>(rec + (odd ? kAux : 0));
   // K, Q as bfp16 [tb][kb]; (w . K)^T as bfp16 [kb][tb] (the update's B tiles)
   {
     BOut ok = out_bfp(sc + kScKb), oq = out_bfp(sc + kScQb);

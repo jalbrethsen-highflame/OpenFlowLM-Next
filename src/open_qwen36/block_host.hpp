@@ -69,6 +69,11 @@ struct DeltaGeom {
     /// optional: phase 1 only (the conv state updated, S untouched), its outputs pointed here -- the
     /// rule then runs on the NPU (designs/deltanet/dnc.py: dnc_pack, then dnc_finish)
     DeltaP1* p1 = nullptr;
+    /// optional, with p1: phase 1 writes the real tokens' K / Q tiles and v pieces as bf16 straight
+    /// into dnc's buffers (dnc_pack's layout, dnc_steps steps) instead of p1's f32 Q / K / V
+    uint8_t* dnc_rec = nullptr;
+    uint16_t* dnc_vo = nullptr;
+    size_t dnc_steps = 0;
     /// optional (an MTP verify pass, the chunk4 path): each row's normalised k [t_real, key_heads *
     /// head_dim], delta d [t_real, value_heads * head_dim] and decay [t_real, value_heads] saved
     /// here, so delta_rollback can rebuild the state after a prefix of the rows in one pass over S
@@ -92,7 +97,7 @@ void delta_rollback(const DeltaGeom& g, size_t m, const float* S0, const float* 
 /// per-token one then the delta rule.
 /// dnc.py's inputs for one chunk of `steps` 16-token steps: records [value_heads][steps][9216] and v
 /// pieces into vo [value_heads][steps][4][16][32] bf16 (rows past t_real: no-ops, a = 1, beta = 0)
-void dnc_pack(const DeltaGeom& g, const DeltaP1& p, size_t steps, uint8_t* rec, uint16_t* vo);
+void dnc_pack(const DeltaGeom& g, const DeltaP1& p, size_t steps, uint8_t* rec, uint16_t* vo);   // g.dnc_rec: decays and padding only
 /// dnc's o (in vo) -> og [T][vw]: / sqrt(head_dim), the gated norm (nw) times silu(z) (g.z16 rows), as
 /// the CPU rule's output; rows past t_real zero
 void dnc_finish(const DeltaGeom& g, const uint16_t* vo, size_t steps, const float* nw, float* og);

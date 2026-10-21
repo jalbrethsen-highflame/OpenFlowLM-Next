@@ -15,7 +15,7 @@ if mode == "gen":
     K = bf(norm(rng.normal(size=(T, KH, D)))); Qm = bf(norm(rng.normal(size=(T, KH, D)))); V = bf(rng.normal(size=(T, H, D)))
     la = -np.abs(rng.normal(0.05, 0.08, (T, H))); b = 1 / (1 + np.exp(-rng.normal(0, 1, (T, H))))
     S0 = rng.normal(0, 0.3, (H, D, D)).astype(np.float32).astype(np.float64)
-    rec = np.zeros((H, NS, 9216), np.uint8); vo = np.zeros((H, NS, 4, 16, 32), bfloat16); s = np.zeros((H, 16, 4, 256), np.float32)
+    rec = np.zeros((H // 2, NS, 10240), np.uint8); vo = np.zeros((H, NS, 4, 16, 32), bfloat16); s = np.zeros((H, 16, 4, 256), np.float32)
     tiles = lambda x: bfv(x).reshape(2, 8, 16, 8).transpose(0, 2, 1, 3)
     for h in range(H):
         kh = h // 2
@@ -32,7 +32,9 @@ if mode == "gen":
             hh, ll = hilo(np.repeat(Gam.reshape(2, 8), 8, axis=1)); aux[96:224] = hh.reshape(-1); aux[224:352] = ll.reshape(-1)
             aux[352:480] = bfv(np.tile(w.reshape(2, 8), (1, 8))).reshape(-1)
             hh, ll = hilo(Gam[15]); aux[480] = hh; aux[481] = ll
-            rec[h, n] = np.frombuffer(tiles(K[sl, kh]).tobytes() + tiles(Qm[sl, kh]).tobytes() + aux.tobytes(), np.uint8)
+            kq = tiles(K[sl, kh]).tobytes() + tiles(Qm[sl, kh]).tobytes()          # [aux even | K, Q | aux odd]
+            if h % 2 == 0: rec[h // 2, n, :9216] = np.frombuffer(aux.tobytes() + kq, np.uint8)
+            else: rec[h // 2, n, 1024:] = np.frombuffer(kq + aux.tobytes(), np.uint8)
             for q in range(4): vo[h, n, q] = bfv(V[sl, h, 32 * q:32 * q + 32])
     (out / "rec.bin").write_bytes(rec.tobytes()); (out / "vo.bin").write_bytes(vo.tobytes()); (out / "s.bin").write_bytes(s.tobytes())
     Or = np.zeros((T, H, D)); Sr = np.zeros((H, D, D))

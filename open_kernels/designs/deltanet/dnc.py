@@ -6,14 +6,15 @@ dv 32 fp32, 16 KB) stays in L1 while the head's tokens stream through.
 
 Per column and head:
   rec    shim -> mem tile -> the 4 rows (broadcast): STEPS records of 9216 B (K and Q tiles, the
-         decays; dnc_core.h)
+         decays; dnc_core.h), read from the key head's 10240 B blocks (the even value head their
+         first 9216 B, the odd one their last)
   vs     shim -> mem tile, 4 KB objects split 4 ways (1 KB a row): first the state's 16 pieces
          (from `s`, the layer's state in the tile layout), then STEPS v pieces (from `vo`)
   os     the rows -> mem tile (join, 4 KB) -> shim: STEPS o pieces, written over the v pieces in
          `vo` (each v piece is read before its o is made), then the state's 16 pieces back to `s`
 
 Buffers (host layouts):
-  rec  [32 heads][STEPS][9216]
+  rec  [16 key heads][STEPS][10240]: [aux of value head 2 kh | K, Q tiles | aux of 2 kh + 1]
   vo   [32 heads][STEPS][4 rows][16 t][32] bf16    (v in, o out)
   s    [32 heads][16 pieces][4 rows][256] f32       (each row's 16 KB slice: S^T tiles [db][kb][8][8])
 
@@ -46,10 +47,10 @@ N_ROWS, N_COLS = 4, 8
 HEADS = 32
 HPC = HEADS // N_COLS                    # value heads a column
 STEPS = int(os.environ.get("DNC_STEPS", 64))
-REC, PIECE, SPC, SCB = 9216, 1024, 16, 18432
+REC, BLK, PIECE, SPC, SCB = 9216, 10240, 1024, 16, 18432
 OBJ = N_ROWS * PIECE                     # a mem-tile object of vs / os
 DEFS = [f"-D{d}" for d in os.environ.get("DNC_DEFS", "").split(",") if d]
-REC_BYTES = HEADS * STEPS * REC
+REC_BYTES = HEADS // 2 * STEPS * BLK
 VO_BYTES = HEADS * STEPS * OBJ
 S_BYTES = HEADS * SPC * OBJ
 
@@ -72,7 +73,7 @@ def dnc(rec: In, vo: Out, s: Out, *, steps: CompileTime[int], srchash: CompileTi
 
     k_sin = ef("dnc_sin", [pc_ty, st_ty, np.int32])
     k_sout = ef("dnc_sout", [st_ty, pc_ty, np.int32])
-    k_step = ef("dnc_step", [rec_ty, pc_ty, pc_ty, st_ty, sc_ty])
+    k_step = ef("dnc_step", [rec_ty, pc_ty, pc_ty, st_ty, sc_ty, np.int32])
 
     R = [ObjectFifo(rec_ty, name=f"R{c}", depth=2) for c in range(N_COLS)]
     R_l1 = [R[c].cons().forward(obj_type=rec_ty, name=f"R{c}_l1", depth=2, tile=Tile(c, 1)) for c in range(N_COLS)]
@@ -88,7 +89,7 @@ def dnc(rec: In, vo: Out, s: Out, *, steps: CompileTime[int], srchash: CompileTi
     SC = [[Buffer(sc_ty, name=f"SC_{r}_{c}") for c in range(N_COLS)] for r in range(N_ROWS)]
 
     def core(r_in, vs_in, os_out, ksin, ksout, kstep, Sb, scb):
-        for _ in range_(HPC):
+        for hh in range_(HPC):
             for p in range_(SPC):
                 e = vs_in.acquire(1)
                 ksin(e, Sb, p)
@@ -97,7 +98,7 @@ def dnc(rec: In, vo: Out, s: Out, *, steps: CompileTime[int], srchash: CompileTi
                 re = r_in.acquire(1)
                 ve = vs_in.acquire(1)
                 oe = os_out.acquire(1)
-                kstep(re, ve, oe, Sb, scb)
+                kstep(re, ve, oe, Sb, scb, hh)
                 os_out.release(1)
                 vs_in.release(1)
                 r_in.release(1)
@@ -125,7 +126,8 @@ def dnc(rec: In, vo: Out, s: Out, *, steps: CompileTime[int], srchash: CompileTi
                 h = c * HPC + hh
                 pv.fill(VS_hs[c], a_s, lin(S_BYTES, h * SPC * OBJ, SPC * OBJ))
                 pv.fill(VS_hs[c], a_vo, lin(VO_BYTES, h * steps * OBJ, steps * OBJ))
-                pr.fill(R_hs[c], a_rec, lin(REC_BYTES, h * steps * REC, steps * REC))
+                pr.fill(R_hs[c], a_rec, TensorAccessPattern((REC_BYTES,), (h // 2) * steps * BLK + (h % 2) * 1024,
+                                                            [steps, 4, REC // 4], [BLK, REC // 4, 1]))   # shim BD wraps < 1024 words
         pr.finish()
         pv.finish()
         po.finish()

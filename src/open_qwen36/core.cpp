@@ -935,9 +935,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     for (int l = 0; l < nl_; ++l)
         for (const auto& [slots, k] : types_[l]->gemm_block.moe_batch.kernels) {
             any_batch = true;
-            if (kerns_.at(k).slots != slots)
+            const size_t pv = types_[l]->gemm_block.moe_batch.p;
+            if (kerns_.at(k).slots != slots / pv)
                 throw std::runtime_error("open_qwen36: " + k + " carries " + std::to_string(kerns_.at(k).slots) +
-                                         " expert slots, the manifest says " + std::to_string(slots));
+                                         " expert visits, the manifest says " + std::to_string(slots) + " slots / " + std::to_string(pv));
         }
     bool any_moe = false;
     for (const auto& t : types_) any_moe = any_moe || !t->gemm_block.moe_kernel.empty();
@@ -3461,6 +3462,7 @@ Core::Inflight Core::dec_npu_start(int l, const float* xn, size_t R, const ExRow
     for (const auto& [sl, k] : mb.kernels)
         if (sl >= exn.size()) { slots = sl; kn = &k; break; }
     if (!kn || slots > 16) throw std::runtime_error("open_qwen36: dec_npu: no mbi stream of at most 16 slots holds the experts");
+    if (mb.p != 1) throw std::runtime_error("open_qwen36: dec_npu: wants mbi streams with one column a visit (p 1)");
     if (!globals_.count("dmb_x")) {
         // rows 1..3 of every slot stay empty (headers 0 from alloc): decode rows land in row 0
         globals_.emplace("dmb_x", alloc(16 * kMbiXslot));
@@ -5596,7 +5598,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     auto mbuf = [&](char what, size_t set, size_t p) { return std::string("pmb_") + what + std::to_string(set) + "_" + std::to_string(p); };
     if (mbp) {
         const size_t maxs = mbp->kernels.rbegin()->first, NTm = mbp->nt;
-        mb_np = (w_->moe.experts + (G * M * w_->moe.topk + NTm - 1) / NTm + maxs - 1) / maxs;   // visits <= E + G M topk / NT
+        // slots <= P (E + G M topk / (NT P))
+        mb_np = (mbp->p * w_->moe.experts + (G * M * w_->moe.topk + NTm - 1) / NTm + maxs - 1) / maxs +
+                mbp->kernels.size();   // + the remainder's smaller passes
         for (size_t set = 0; set < 2; ++set)
             for (size_t p = 0; p < mb_np; ++p) {
                 need(mbuf('x', set, p), globals_.at(mbp->args[1]).size());
@@ -5612,7 +5616,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     std::vector<int> dset_of(L * C, -1);
     if (dnc_on) {
         for (size_t k = 0; k < kDncSets; ++k) {
-            need("dnc_rec" + std::to_string(k), 32 * kDncSteps * 9216);
+            need("dnc_rec" + std::to_string(k), 16 * kDncSteps * 10240);
             need("dnc_vo" + std::to_string(k), 32 * kDncSteps * 4096);
         }
         for (size_t l = 0; l < L; ++l)
@@ -5679,6 +5683,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // f32, state sync, out pack) and deltanet_block's phases
     static const bool mid_prof_on = std::getenv("OFLM_OPEN_MID_PROF") != nullptr;
     double mid_prof[5] = {0, 0, 0, 0, 0};
+    double midb_prof[4] = {0, 0, 0, 0};   // MIDB (dnc): o read back, gated norm, OUT pack, state
     for (double& v : host::g_dn_prof) v = 0;
     for (double& v : host::g_dn_p1) v = 0;
     double hst[13] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -5936,7 +5941,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     g.z16 = q16 + nch; g.ldz = nq;
                     double ph[2] = {0, 0};
                     host::DeltaP1 p1;
-                    if (dnc_on) g.p1 = &p1;
+                    if (dnc_on) {
+                        const std::string ks = std::to_string(dset_of[cell(l, c)]);
+                        g.p1 = &p1;
+                        g.dnc_rec = buffer("dnc_rec" + ks, 0).map<uint8_t*>();
+                        g.dnc_vo = buffer("dnc_vo" + ks, 0).map<uint16_t*>();
+                        g.dnc_steps = kDncSteps;
+                    }
                     host::deltanet_block(g, ya.data(), nullptr, xc, hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
                                          hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
                                          reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
@@ -5947,9 +5958,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         const std::string ks = std::to_string(dset_of[cell(l, c)]);
                         xrt::bo& rb = buffer("dnc_rec" + ks, 0);
                         xrt::bo& vb = buffer("dnc_vo" + ks, 0);
+                        auto tp = std::chrono::steady_clock::now();
                         host::dnc_pack(g, p1, kDncSteps, rb.map<uint8_t*>(), vb.map<uint16_t*>());
-                        rb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 32 * kDncSteps * 9216, 0);
+                        sadd(mid_prof[3], ms_since(tp)); tp = std::chrono::steady_clock::now();   // MID_PROF: pack, then sync
+                        rb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 16 * kDncSteps * 10240, 0);
                         vb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 32 * kDncSteps * 4096, 0);
+                        sadd(mid_prof[4], ms_since(tp));
                         if (c == 0) {
                             xrt::bo& sb = buffer("dnc_s" + std::to_string(l), 0);
                             host::dnc_state_to_tiles(g, reinterpret_cast<const float*>(sp + gb.state_s_off), sb.map<float*>());
@@ -5960,13 +5974,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             auto wr = [&](const std::string& f, const void* p, size_t n) {
                                 if (FILE* fo = std::fopen((std::string(dd) + "/" + f).c_str(), "wb")) { std::fwrite(p, 1, n, fo); std::fclose(fo); }
                             };
-                            wr("rec.bin", rb.map<const uint8_t*>(), 32 * kDncSteps * 9216);
+                            wr("rec.bin", rb.map<const uint8_t*>(), 16 * kDncSteps * 10240);
                             wr("vo.bin", vb.map<const uint8_t*>(), 32 * kDncSteps * 4096);
                             wr("s.bin", buffer("dnc_s" + std::to_string(l), 0).map<const uint8_t*>(), 32 * 16 * 4096);
                             const size_t tr = t_real;
                             wr("treal.bin", &tr, sizeof tr);
                         }
-                        sadd(mid_prof[4], ms_since(th));
                     } else {
                         tm = std::chrono::steady_clock::now();
                         if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
@@ -6181,7 +6194,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 const size_t vw = gb.vw, nq = gb.qkv_dim + gb.vw;
                 const std::string ks = std::to_string(dset_of[cell(l, c)]);
                 xrt::bo& vb = buffer("dnc_vo" + ks, 0);
+                auto tq = std::chrono::steady_clock::now();
                 read_back(vb, 32 * kDncSteps * 4096, 0);
+                sadd(midb_prof[0], ms_since(tq)); tq = std::chrono::steady_clock::now();
                 const uint16_t* q16 = buffer("pp_q_" + cs, 0).map<const uint16_t*>();
                 host::DeltaGeom g;
                 g.T = M; g.hid = hid;
@@ -6198,8 +6213,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         if (FILE* fo = std::fopen((std::string(dd) + "/" + f).c_str(), "wb")) { std::fwrite(b2->map<const uint8_t*>(), 1, n, fo); std::fclose(fo); }
                 }
                 host::dnc_finish(g, vb.map<const uint16_t*>(), kDncSteps, hc.nw.data(), og.data());
+                sadd(midb_prof[1], ms_since(tq)); tq = std::chrono::steady_clock::now();
                 if (has2(hid, vw)) to_bfp2(og.data(), vw, "pp_m2_" + cs, t_real);
                 else to_bf16(og.data(), M, vw, "pp_m_" + cs);
+                sadd(midb_prof[2], ms_since(tq)); tq = std::chrono::steady_clock::now();
                 if (c + 1 == C) {
                     xrt::bo& sb = buffer("dnc_s" + std::to_string(l), 0);
                     read_back(sb, 32 * 16 * 4096, 0);
@@ -6207,6 +6224,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     host::dnc_state_from_tiles(g, sb.map<const float*>(), reinterpret_cast<float*>(st.map<uint8_t*>() + gb.state_s_off));
                     st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
                 }
+                sadd(midb_prof[3], ms_since(tq));
                 {
                     std::lock_guard<std::mutex> lk(mu);
                     dset_cell[static_cast<size_t>(dset_of[cell(l, c)])] = -1;
@@ -6278,9 +6296,19 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                     owed[e].push_back({static_cast<int>((c2 - c0) * M + t), rwt_c[c2][t * topk + k]});
                                 }
                         }
+                        static FILE* hist = [] { const char* e = std::getenv("OFLM_OPEN_MOE_HIST"); return e ? std::fopen(e, "w") : nullptr; }();
+                        if (hist) {
+                            std::lock_guard<std::mutex> g(smu);
+                            std::fprintf(hist, "%zu %zu", l, c);
+                            for (size_t e = 0; e < E; ++e) std::fprintf(hist, " %zu", owed[e].size());
+                            std::fprintf(hist, "\n");
+                            std::fflush(hist);
+                        }
+                        // a visit: P slots of NTm tokens that share the expert's weight stream (mbi p)
+                        const size_t Pv = mbp->p, NTv = NTm * Pv;
                         std::vector<std::pair<uint32_t, size_t>> visits;
                         for (size_t e = 0; e < E; ++e)
-                            for (size_t off = 0; off < owed[e].size(); off += NTm) visits.push_back({static_cast<uint32_t>(e), off});
+                            for (size_t off = 0; off < owed[e].size(); off += NTv) visits.push_back({static_cast<uint32_t>(e), off});
                         ms.passes.clear();
                         ms.per_token.clear();
 
@@ -6288,18 +6316,22 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             const size_t left = visits.size() - done;
                             size_t slots = 0;
                             const std::string* kn = nullptr;
-                            for (const auto& [sl, k] : mbp->kernels) { slots = sl; kn = &k; if (sl >= left) break; }
-                            const size_t n = std::min(left, slots), p = ms.passes.size();
+                            // the largest stream that the visits left fill (the smallest at the end): an
+                            // unused slot still streams a whole expert, and rounding the last pass up
+                            // to the next stream left 14 % of the slots empty at 30K
+                            for (const auto& [sl, k] : mbp->kernels)
+                                if (!kn || sl / Pv <= left) { slots = sl; kn = &k; }
+                            const size_t n = std::min(left, slots / Pv), p = ms.passes.size();
                             if (p >= mb_np) throw std::runtime_error("open_qwen36: a MoE group needs more expert passes than its buffers hold");
                             MoePass mp;
-                            mp.kernel = *kn; mp.n = n; mp.ex.assign(slots, 0);   // unused slots stream expert 0, ignored
+                            mp.kernel = *kn; mp.n = n * Pv; mp.ex.assign(slots / Pv, 0);   // unused visits stream expert 0, ignored
                             ms.per_token.emplace_back(grows);
                             auto& pt = ms.per_token.back();
                             for (size_t i = 0; i < n; ++i) {
                                 const auto& [e, off] = visits[done + i];
                                 mp.ex[i] = e;
-                                for (size_t j = 0; j < std::min(NTm, owed[e].size() - off); ++j)
-                                    pt[owed[e][off + j].first].push_back({i * NTm + j, owed[e][off + j].second});
+                                for (size_t j = 0; j < std::min(NTv, owed[e].size() - off); ++j)
+                                    pt[owed[e][off + j].first].push_back({i * NTv + j, owed[e][off + j].second});
                             }
                             xrt::bo& xb = buffer(mbuf('x', set, p), 0);
                             if (mbi) {
@@ -6308,9 +6340,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
 #pragma omp parallel for
                                 for (long long i = 0; i < static_cast<long long>(slots); ++i) {
                                     uint8_t* xs = xm + static_cast<size_t>(i) * kMbiXslot;
-                                    if (static_cast<size_t>(i) >= n) { mbi_headers(xs, 0, 0, 0); continue; }
-                                    const auto& [e, off] = visits[done + static_cast<size_t>(i)];
-                                    const size_t nt = std::min(NTm, owed[e].size() - off);
+                                    const size_t vi = static_cast<size_t>(i) / Pv;
+                                    if (vi >= n) { mbi_headers(xs, 0, 0, 0); continue; }
+                                    const auto& [e, off0] = visits[done + vi];
+                                    const size_t off = off0 + (static_cast<size_t>(i) % Pv) * NTm;
+                                    const size_t nt = owed[e].size() > off ? std::min(NTm, owed[e].size() - off) : 0;
                                     mbi_headers(xs, S[2 * e], S[2 * e + 1], nt);
                                     for (size_t g4 = 0; 4 * g4 < nt; ++g4) {
                                         const int8_t* q4[4] = {};
@@ -6509,6 +6543,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                              "alpha/beta %.1f window %.1f rule %.1f | state sync %.1f out pack %.1f ms\n",
                      mid_prof[0], mid_prof[1], mid_prof[2], host::g_dn_prof[0] / 1e3, host::g_dn_prof[1] / 1e3,
                      host::g_dn_prof[2] / 1e3, host::g_dn_prof[3] / 1e3, timing_.dn_rule_ms, mid_prof[3], mid_prof[4]);
+    if (mid_prof_on && dnc_on)
+        std::fprintf(stderr, "open_qwen36: dnc MIDB: o read back %.1f gated norm %.1f out pack %.1f state %.1f ms\n",
+                     midb_prof[0], midb_prof[1], midb_prof[2], midb_prof[3]);
     if (mid_prof_on)
         std::fprintf(stderr, "open_qwen36: dn phase 1 on thread 0: taps %.1f silu %.1f qk norm %.1f V copy %.1f ms\n",
                      host::g_dn_p1[0] / 1e3, host::g_dn_p1[1] / 1e3, host::g_dn_p1[2] / 1e3, host::g_dn_p1[3] / 1e3);
