@@ -16,7 +16,7 @@ Per column and slot (expert e):
   core     u, g accumulators per band; h = silu(g) u (bf16 tanh form) quantized per (token, band)
            into hq (the down's A tiles, L1); the down over each k-group with the band scales folded
            into d and mc; y as bf16. Token-group pairs past the row's real tokens are skipped.
-  y        the rows join at the mem tile: [ob 32][row 4][4 row groups][NTG][64] bf16 per slot.
+  y        the rows join at the mem tile and stream out token-major: [token 64][2048] bf16 a slot.
 
 256 slots of 64 tokens (16384 token visits): 13.3 ms with the GPU idle (DMA floor 10.5 ms), ~21 ms
 with a GPU job running (the NPU cores slow ~1.6x then, so the core steps bound it); mbe 16.0 ms for
@@ -128,8 +128,12 @@ def mbi(pool: In, x: In, y: Out, *, slots: CompileTime[int], srchash: CompileTim
         for s in subs:
             s._consumer_obj_type = xel_ty
         X_l1.append(subs)
-    # y: the rows' bands join at the mem tile, in row order
-    C = [ObjectFifo(c4_ty, name=f"C{c}", depth=2) for c in range(N_COLS)]
+    # y: the rows' bands join at the mem tile, in row order ([row][rg][tg][t][16] bf16), and stream
+    # out token-major (the dims apply to each row part: [tg t][rg][16], a token's 64 columns of the
+    # band), so the drain lands y as [token][2048] (a host visit reads 4 KB in one run, not 128
+    # lines at 8 KB strides)
+    C = [ObjectFifo(c4_ty, name=f"C{c}", depth=2, dims_to_stream=[(16, 16), (4, 4 * NTG * 16), (16, 1)])
+         for c in range(N_COLS)]
     C_l1 = [C[c].prod().join([r * ACC for r in range(N_ROWS)], obj_types=[c_ty] * N_ROWS,
                              names=[f"C{c}_{r}" for r in range(N_ROWS)], depths=[1] * N_ROWS, tile=Tile(c, 1))
             for c in range(N_COLS)]
@@ -192,6 +196,9 @@ def mbi(pool: In, x: In, y: Out, *, slots: CompileTime[int], srchash: CompileTim
     X_p = [X[c].prod(tile=Tile(c, 0)) for c in range(N_COLS)]
     C_c = [C[c].cons(tile=Tile(c, 0)) for c in range(N_COLS)]
 
+    def y_tap(slot: int) -> TensorAccessPattern:              # [ob][token][64 columns] -> [token][2048]
+        return TensorAccessPattern((Y_BYTES,), slot * YSLOT, [NOB, 4 * NT, 128], [128, HID * 2, 1])
+
     def sequence(a_pool, a_x, a_y, W_hs, X_hs, C_hs):
         # The next round's x is issued after this round's up / gate fills: the mem tile's x object
         # frees when this round's up / gate ends, and the next x then streams during the down (issued
@@ -203,7 +210,7 @@ def mbi(pool: In, x: In, y: Out, *, slots: CompileTime[int], srchash: CompileTim
         for rnd in range(rounds):
             slot = [rnd * N_COLS + c for c in range(N_COLS)]
             for c in range(N_COLS):                  # drains before fills (npu-model-porting)
-                py.drain(C_hs[c], a_y, lin(Y_BYTES, slot[c] * YSLOT, YSLOT))
+                py.drain(C_hs[c], a_y, y_tap(slot[c]))
             for pb in range(NPB):
                 for c in range(N_COLS):
                     pw.fill(W_hs[c], a_pool, up_tap(slot[c], pb))

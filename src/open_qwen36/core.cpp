@@ -5067,7 +5067,7 @@ void moe_scatter_avx512(float* o, const float* base, size_t hid, size_t NG, floa
 // mbi (designs/moe_batch/mbi.py) at hidden 2048: a slot is 64 tokens, row r of it tokens 16 r ..
 // 16 r + 15, and its x is [row 4][k-group 8][element]; an element is [header 64 B: S_ug, S_dn, the
 // row's real tokens | xa int8 [16 k-tiles][4 token groups][4][16] | qs int16 [8 blocks][4 tg][64]
-// (lane 16 t + n: token t's block sum) | sx bf16 [4 tg][64]]. y bf16 [ob 32][row 4][rg 4][tg 4][t 4][16].
+// (lane 16 t + n: token t's block sum) | sx bf16 [4 tg][64]]. y bf16 [token 64][2048] a slot.
 constexpr size_t kMbiXel = 64 + 16 * 4 * 64 + 8 * 4 * 128 + 4 * 128, kMbiXslot = 4 * 8 * kMbiXel;
 constexpr size_t kMbiYslot = 32 * 4 * 2048;   // bytes
 // per row of x [T, 2048]: int8 per (row, 256-K group) at a bf16 scale (|q| <= 127 with amax / 126),
@@ -5102,39 +5102,36 @@ void mbi_headers(uint8_t* xs, int s_ug, int s_dn, size_t ntok) {
             std::memcpy(xs + (r * 8 + kg) * kMbiXel, h, sizeof h);
         }
 }
+// 16 copies of a 16-bit value (32 bytes)
+inline void mbi_fill16(uint8_t* d, uint16_t v) {
+    uint16_t b[16];
+    for (auto& e : b) e = v;
+    std::memcpy(d, b, 32);
+}
 // token j of a slot from its quantized row
 void mbi_pack_token(uint8_t* xs, size_t j, const int8_t* q, const uint16_t* sx, const int16_t* qs) {
     const size_t r = j / 16, tg = (j % 16) / 4, t = j % 4;
     for (size_t kg = 0; kg < 8; ++kg) {
         uint8_t* el = xs + (r * 8 + kg) * kMbiXel;
         for (size_t kt = 0; kt < 16; ++kt) std::memcpy(el + 64 + ((kt * 4 + tg) * 4 + t) * 16, q + kg * 256 + kt * 16, 16);
-        int16_t* qd = reinterpret_cast<int16_t*>(el + 64 + 4096);
-        for (size_t b = 0; b < 8; ++b)
-            for (size_t n = 0; n < 16; ++n) qd[(b * 4 + tg) * 64 + t * 16 + n] = qs[kg * 8 + b];
-        uint16_t* sd = reinterpret_cast<uint16_t*>(el + 64 + 8192);
-        for (size_t n = 0; n < 16; ++n) sd[tg * 64 + t * 16 + n] = sx[kg];
+        uint8_t* qd = el + 64 + 4096;
+        for (size_t b = 0; b < 8; ++b) mbi_fill16(qd + ((b * 4 + tg) * 64 + t * 16) * 2, static_cast<uint16_t>(qs[kg * 8 + b]));
+        mbi_fill16(el + 64 + 8192 + (tg * 64 + t * 16) * 2, sx[kg]);
     }
 }
 // o[2048] += w y for token j of a slot's bf16 y
 __attribute__((target("avx512f,avx512vl,avx512bw,fma")))
 void mbi_scatter_avx512(float* o, const uint16_t* ys, size_t j, float wt) {
-    const size_t r = j / 16, tg = (j % 16) / 4, t = j % 4;
-    const uint16_t* b = ys + r * 1024 + tg * 64 + t * 16;
+    const uint16_t* b = ys + j * 2048;
     const __m512 w = _mm512_set1_ps(wt);
-    for (size_t ob = 0; ob < 32; ++ob)
-        for (size_t rg = 0; rg < 4; ++rg) {
-            const __m512 v = _mm512_castsi512_ps(_mm512_slli_epi32(
-                _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + ob * 4096 + rg * 256))), 16));
-            float* d = o + ob * 64 + rg * 16;
-            _mm512_storeu_ps(d, _mm512_fmadd_ps(w, v, _mm512_loadu_ps(d)));
-        }
+    for (size_t i = 0; i < 2048; i += 16) {
+        const __m512 v = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i))), 16));
+        _mm512_storeu_ps(o + i, _mm512_fmadd_ps(w, v, _mm512_loadu_ps(o + i)));
+    }
 }
 void mbi_scatter_scalar(float* o, const uint16_t* ys, size_t j, float wt) {
-    const size_t r = j / 16, tg = (j % 16) / 4, t = j % 4;
-    const uint16_t* b = ys + r * 1024 + tg * 64 + t * 16;
-    for (size_t ob = 0; ob < 32; ++ob)
-        for (size_t rg = 0; rg < 4; ++rg)
-            for (size_t n = 0; n < 16; ++n) o[ob * 64 + rg * 16 + n] += wt * bf16_to_f32(b[ob * 4096 + rg * 256 + n]);
+    const uint16_t* b = ys + j * 2048;
+    for (size_t i = 0; i < 2048; ++i) o[i] += wt * bf16_to_f32(b[i]);
 }
 void moe_scatter_scalar(float* o, const float* base, size_t hid, size_t NG, float wt) {
     for (size_t band = 0; band < hid / 64; ++band)

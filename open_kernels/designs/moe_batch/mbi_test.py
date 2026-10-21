@@ -98,9 +98,7 @@ if mode == "gen":
     print("pool", len(pool), "x", len(xb), "y", E * TOK * HID * 2)
 else:
     ref = np.load(out / "ref.npy"); E = ref.shape[0]
-    y = np.fromfile(out / "y.bin", bfloat16).astype(np.float64).reshape(E, HID // 64, ROWS, 4, NTG, 4, 16)
-    # [ob][row][rg][tg][t][n]: token 16 row + 4 tg + t, out row 64 ob + 16 rg + n
-    got = y.transpose(0, 2, 4, 5, 1, 3, 6).reshape(E, TOK, HID)
+    got = np.fromfile(out / "y.bin", bfloat16).astype(np.float64).reshape(E, TOK, HID)   # [slot][token][2048]
     nvs = np.load(out / "nv.npy") if (out / "nv.npy").exists() else np.full(E, TOK)
     for e in range(E):
         n = int(nvs[e]); g, r = got[e, :n], ref[e, :n]
