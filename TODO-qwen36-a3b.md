@@ -104,6 +104,46 @@ Next for prefill: an expert core on the int8 x int4 MAC mode (the q4_1 nibbles a
 broadcast from the mem tile: 128 tokens a weight stream). The current kernel is bound by DMA and core
 together, so neither alone gains much.
 
+## mbi: the experts on the int8 x int4 MAC mode (2026-10-20, 065cb6c, 1a28e22)
+
+designs/moe_batch/mbi.py (export with OPEN_QWEN36_MBI=1; kernel set ~/workspace/npu-scratch/a3b/k5):
+one expert per column, the four rows split a visit's 64 tokens, weights broadcast from the mem tile;
+the pool's routed experts transformed at load (signed nibbles, int16 d / mc at one shift an expert
+matrix), x packed by the host as int8 k-group elements, bf16 y. Kernel alone, 256 slots of 64
+tokens: 13.3 ms with the GPU idle (DMA floor 10.5 ms; mbe 16.0 ms for half the tokens).
+
+Prefill, CLI, chat prompts of C++ source, tok/s:
+
+| Prompt | GPU | k4 (mbe) | k5 (mbi), group 4096 | k5, group 8192 |
+|---|---|---|---|---|
+| 30K | idle | 916 | 1403 | 1489 |
+| 64K | idle | | 1311 | |
+| 120K | idle | 789 | 1133 | |
+| 30K | busy (load 12) | 598 | 807 | 792 |
+| 120K | busy from mid-run | | | 842 |
+
+Accuracy, 600 tokens against per-token: mean KL 9.95e-3 -> 1.06e-2, argmax 535 -> 526 of 600 (the
+bf16 tanh silu adds ~1 % to h; MBI_SILU_FP32 is the exact one at +18 us a band).
+
+At 120K (GPU idle) the NPU is busy 102 of 106 s: experts 47.8 s, attention 36.4 s (at the bfp16 MAC
+peak, ~16 TMAC/s), GEMMs ~18 s. With the GPU busy at 30K the host is the limit (NPU idle 4.6-9 s):
+DeltaNet conv + rule 9.5 s, MoE tail (router 2.2, gather 3.4, x sync 1.1) ~10 s, scatter 4.8 s.
+
+Lessons from the kernel work:
+- fp32 multiplies are emulated on this core (~250 cycles a 64-lane pair): split fp32 into bf16
+  high + low and use two native bf16 MACs (mbi_epi); vecmath's fp32 silu costs ~34 cycles an
+  element, the bf16 tanh form ~5.
+- A kernel stack that overflows writes over the next object-fifo buffer: wrong results, no error
+  (h row group 0 of every later band). Read the frame size (llvm-objdump: paddxm [sp]).
+- A static variable in a core kernel hung the design (TDR); so did __builtin_aie2p_read_tm.
+- #pragma unroll 8 on the block loop spilled a 7 KB frame; unroll 4 is faster (1.46 us a call).
+- GPU load slows the NPU cores ~1.6x (probe times), not only DDR.
+- Pipeline(3) waits per task: one task per up/gate band and one for the down (pool order) cut the
+  DMA floor 19.5 -> 10.5 ms; issue the next round's x fill before the down fills.
+
+Next: the host stages under GPU load (DeltaNet conv / rule, the MoE gather and scatter), then the
+experts' core rate (they bind the NPU when the GPU is busy), then MBI default on.
+
 ## Plan (biggest first; re-profile after each)
 
 Prefill:
