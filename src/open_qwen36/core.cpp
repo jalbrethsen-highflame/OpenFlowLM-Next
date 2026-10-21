@@ -856,6 +856,8 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     for (const auto& [slots, k] : w_->expert_batch.kernels) wanted[k] = true;
     // the prompt pipe's NPU delta rule (OFLM_OPEN_DNC=1), when the set carries it
     if (man_.kernels.count("dnc") && std::getenv("OFLM_OPEN_DNC") && *std::getenv("OFLM_OPEN_DNC") == '1') wanted["dnc"] = true;
+    // the decode QKV split on the NPU (OFLM_OPEN_MBV=1), when the set carries it
+    if (man_.kernels.count("mbv_k2048") && std::getenv("OFLM_OPEN_MBV") && *std::getenv("OFLM_OPEN_MBV") == '1') wanted["mbv_k2048"] = true;
     if (!w_->prompt_gemm.is_null())
         for (const auto& [shape, k] : w_->prompt_gemm["kernels"].items()) wanted[k.get<std::string>()] = true;
     for (const auto& [name, d] : w_->kernels)
@@ -1034,6 +1036,7 @@ void Core::load_kernel(const std::string& name, const KernelDesc& d) {
     std::memcpy(k.instr->map<void*>(), insts.data(), insts.size());
     k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
     if (d.patch == "moeroute2") k.moe2 = stream_patch::moe2_table(k.words, name, w_->moe);
+    else if (d.patch == "argbase") k.argp = stream_patch::arg_table(k.words, 0, name);
     else if (d.patch == "moebatch") {
         // every expert fill is a placeholder (slot s compiled as expert s), so the table is
         // moeroute2's with the whole expert range as slots; the stream's length is its highest
@@ -1248,6 +1251,16 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
         const char* e = std::getenv("OFLM_OPEN_DEC_NPU");
         dec_npu_ = e ? std::min<size_t>(32, std::strtoul(e, nullptr, 10)) : p1 ? 16 : 0;
     }
+    // OFLM_OPEN_MBV=1: the QKV GEMVs' first rows on the NPU (mbv) instead of experts (one NPU context
+    // in decode: a switch costs ~5 ms)
+    mbv_on_ = q41_cpu_ && !skip_pools && !drop_pools_ && man_.kernels.count("mbv_k2048") && std::getenv("OFLM_OPEN_MBV") &&
+              *std::getenv("OFLM_OPEN_MBV") == '1';
+    if (mbv_on_) {
+        dec_npu_ = 0;
+        mbv_s_.assign(static_cast<size_t>(nl_), -1);
+        mbv_off_.assign(static_cast<size_t>(nl_), 0);
+        log("CPU decode: the QKV GEMVs' first " + std::to_string(kMbvRows) + " rows on the NPU (mbv)");
+    }
     if (dec_npu_) log("CPU decode: up to " + std::to_string(dec_npu_) + " routed experts a layer on the NPU (mbi), beside the CPU's");
     std::vector<uint8_t> pool_tmp;
     for (int l = 0; l < nl_; ++l) {
@@ -1280,6 +1293,18 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                     S[2 * e + 1] = static_cast<int8_t>(host::mbi_shift(dn, ndn, 5120));
                     host::mbi_transform(ug, nug, 5120, S[2 * e]);
                     host::mbi_transform(dn, ndn, 5120, S[2 * e + 1]);
+                }
+            }
+            if (mbv_on_ && !lt.gemm_block.program.empty()) {
+                // the QKV region's first kMbvRows rows in mbi's transform (only mbv reads them)
+                const Step& st = lt.gemm_block.program[0];
+                const size_t n = std::stoul(st.kernel.substr(6, st.kernel.find("_k") - 6)), k = std::stoul(st.kernel.substr(st.kernel.find("_k") + 2));
+                const auto it = lt.gemm_block.weights.find(st.args[0]);
+                if (k == 2048 && n >= kMbvRows && it != lt.gemm_block.weights.end() && it->second.from == "pool" && !it->second.ops.empty()) {
+                    const size_t off = op_region(lt, "pool", it->second.ops[0]).first, nch = kMbvRows / 32 * (k / 256);
+                    mbv_s_[static_cast<size_t>(l)] = host::mbi_shift(pool_host + off, nch, 5120);
+                    host::mbi_transform(pool_host + off, nch, 5120, mbv_s_[static_cast<size_t>(l)]);
+                    mbv_off_[static_cast<size_t>(l)] = off;
                 }
             }
             pool.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -3516,6 +3541,46 @@ void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
                      calls, double(nex) / calls, ph1 / calls, ph2 / calls, tot / calls);
 }
 
+void Core::mbv_gemv(int l, const uint8_t* w, size_t n, size_t k, const float* in, size_t R, float* out) {
+    constexpr size_t NN = kMbvRows, Q = NN / 64 / 32, YB = 32 * Q * 4 * 256 * 4;   // y: [c][j][r][4 rg][4 tg][64] f32
+    Kern& mk = kerns_.at("mbv_k2048");
+    if (!globals_.count("mbv_x")) {
+        globals_.emplace("mbv_x", alloc(kMbiXslot));
+        globals_.emplace("mbv_y", alloc(YB));
+    }
+    static thread_local std::vector<int8_t> q;
+    static thread_local std::vector<uint16_t> sx;
+    static thread_local std::vector<int16_t> qs;
+    q.resize(R * 2048); sx.resize(R * 8); qs.resize(R * 64);
+    mbi_quant_rows(in, R, q.data(), sx.data(), qs.data());
+    xrt::bo& xb = buffer("mbv_x", l);
+    uint8_t* xs = xb.map<uint8_t*>();
+    mbi_headers(xs, mbv_s_[static_cast<size_t>(l)], 0, R);
+    for (size_t j = 0; j < R; ++j) mbi_pack_token(xs, j, q.data() + j * 2048, sx.data() + j * 8, qs.data() + j * 64);
+    xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 8 * kMbiXel, 0);
+    if (mk.argbase != mbv_off_[static_cast<size_t>(l)]) {
+        stream_patch::arg_apply(mk.iw(), mk.argp, mbv_off_[static_cast<size_t>(l)]);
+        mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        mk.argbase = mbv_off_[static_cast<size_t>(l)];
+    }
+    Inflight f = start_run(mk, {"pool", "mbv_x", "mbv_y"}, l);
+    // the CPU's rows meanwhile (q41_std: band b at b K / 256 10240)
+    host::gemv_q41_rows(w + NN / 64 * (k / 256 * 10240), host::q41_std(k), n - NN, k, in, R, out + NN, n);
+    wait_run(f);
+    xrt::bo& yb = buffer("mbv_y", l);
+    read_back(yb, YB, 0);
+    const float* y = yb.map<const float*>();
+    for (size_t c = 0; c < 8; ++c)
+        for (size_t j = 0; j < Q; ++j)
+            for (size_t r = 0; r < 4; ++r) {
+                const size_t b = (4 * c + r) * Q + j;
+                const float* yt = y + ((c * Q + j) * 4 + r) * 1024;
+                for (size_t rg = 0; rg < 4; ++rg)
+                    for (size_t t = 0; t < R; ++t)
+                        for (size_t i = 0; i < 16; ++i) out[t * n + 64 * b + 16 * rg + i] = yt[(rg * 4 + t / 4) * 64 + (t % 4) * 16 + i];
+            }
+}
+
 Core::Inflight Core::dec_npu_start(int l, const float* xn, size_t R, const ExRows& exn) {
     const MoeBatch& mb = types_[l]->gemm_block.moe_batch;
     const std::string* kn = nullptr;
@@ -3605,7 +3670,28 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             k = std::stoul(kn.substr(kn.find("_k") + 2));
             out.resize(R * n);
             auto tg = std::chrono::steady_clock::now();
-            host::gemv_q41_rows(q41_weight(l, st.args[0]), host::q41_std(k), n, k, in, R, out.data(), n);
+            // OFLM_OPEN_MBV_AB=1 (debug): mbv on even layers only, the linear layers' QKV GEMV times
+            // summed by parity -- an A/B under the same DDR load
+            static const bool mbv_ab = std::getenv("OFLM_OPEN_MBV_AB") && *std::getenv("OFLM_OPEN_MBV_AB") == '1';
+            static double ab_ms[2] = {0, 0};
+            static size_t ab_n[2] = {0, 0};
+            const bool qkv = st.args[0] == types_[l]->gemm_block.program[0].args[0];
+            const bool ab_lin = mbv_ab && qkv && types_[l]->gemm_block.kind == "linear";
+            if (mbv_on_ && mbv_s_[static_cast<size_t>(l)] >= 0 && qkv && R <= 16 && !(mbv_ab && l % 2)) {
+                mbv_gemv(l, q41_weight(l, st.args[0]), n, k, in, R, out.data());
+            } else {
+                host::gemv_q41_rows(q41_weight(l, st.args[0]), host::q41_std(k), n, k, in, R, out.data(), n);
+            }
+            if (ab_lin) {
+                ab_ms[l % 2] += ms_since(tg);
+                if (++ab_n[l % 2] % 400 == 0 && l % 2)
+                    std::fprintf(stderr, "open_qwen36: mbv A/B (linear QKV): NPU + CPU %.3f ms, CPU %.3f ms a call (%zu calls each)\n",
+                                 ab_ms[0] / ab_n[0], ab_ms[1] / ab_n[1], ab_n[1]);
+            }
+            if (mbv_on_) {
+                timing_.part0_ms += ms_since(tg);
+                return;
+            }
             timing_.part0_ms += ms_since(tg);
             return;
         }

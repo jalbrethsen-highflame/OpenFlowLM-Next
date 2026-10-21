@@ -254,6 +254,21 @@ inline void moe_apply(uint32_t* iw, const std::vector<MoePatch>& table, const ui
     }
 }
 
+/// `argbase`: every DDR patch on argument `arg` (word, compiled offset) -- a stream built with its
+/// region at byte 0 of the argument, moved to another offset of the same buffer at run time (mbv:
+/// one GEMV stream for the QKV region of any layer's pool).
+struct ArgPatch { size_t word; uint32_t off; };
+inline std::vector<ArgPatch> arg_table(const std::vector<uint32_t>& w, uint32_t arg, const std::string& kn) {
+    std::vector<ArgPatch> t;
+    for (size_t i = 4; i < w.size(); i += op_len(w[i]))
+        if (w[i] == 0x81 && i + 11 < w.size() && w[i + 8] == arg) t.push_back({i + 10, w[i + 10]});
+    if (t.empty()) throw std::runtime_error("argbase: " + kn + " has no patch on argument " + std::to_string(arg));
+    return t;
+}
+inline void arg_apply(uint32_t* iw, const std::vector<ArgPatch>& t, uint64_t base) {
+    for (const auto& p : t) iw[p.word] = static_cast<uint32_t>(p.off + base);
+}
+
 /// Point a `moeroute2` table's fills at experts idx[0..topk-1].
 inline void moe2_apply(uint32_t* iw, const std::vector<MoePatch>& table, const uint32_t* idx,
                        const MoeGeometry& g = MoeGeometry{}) {

@@ -316,6 +316,8 @@ private:
         size_t slots = 0;                            ///< moebatch: expert slots the stream carries
         std::vector<stream_patch::AttnPatch> attn;
         stream_patch::AttnGeometry geom;     ///< attnpos: the manifest's rows plus this kernel's window
+        std::vector<stream_patch::ArgPatch> argp;    ///< argbase: arg 0's fills, and the offset they point at now
+        uint64_t argbase = 0;
         uint32_t* iw() { return instr->map<uint32_t*>(); }
     };
 
@@ -402,6 +404,14 @@ private:
     /// never ran on.
     void apply_thread_budget() const;
     void mem_report(const char* when) const;   ///< OFLM_OPEN_MEM_LOG=1: resident bytes by kind
+    /// OFLM_OPEN_MBV=1 (designs/moe_batch/mbv.py, kernel mbv_k2048): a decode QKV GEMV's first
+    /// kMbvRows rows on the NPU (those pool rows in mbi's transform, shift mbv_s_[l]) while the CPU
+    /// does the rest
+    static constexpr size_t kMbvRows = 8192;
+    bool mbv_on_ = false;
+    std::vector<int> mbv_s_;
+    std::vector<size_t> mbv_off_;
+    void mbv_gemv(int l, const uint8_t* w, size_t n, size_t k, const float* in, size_t R, float* out);
     bool moe_redispatch_ = false;  ///< OFLM_OPEN_MOE_REDISPATCH: run each MoE pass twice and print both
     std::vector<float> gout_, sg_ug_, sg_y_;   ///< the block route's GEMM outputs, kept across layers
     std::map<std::string, std::vector<float>> split_y_;   ///< a split step's hi + lo, per y global (gemm_run)
