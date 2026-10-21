@@ -6167,9 +6167,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     const MoeBatch* mbp = nullptr;
     for (size_t l = 0; l < L && !mbp; ++l)
         if (is_moe(l)) mbp = &types_[l]->gemm_block.moe_batch;
-    // (the kernel set's gemm_dit.moe_group when the env does not say: Flint's 8192)
+    // (the kernel set's gemm_dit.moe_group when the env does not say -- Flint's 8192 -- from prompts of
+    // moe_group_min tokens: a prompt of one group cannot overlap its experts with the next work, 8K 954 ->
+    // 748 tok/s)
     static const char* moe_group_env = std::getenv("OFLM_OPEN_MOE_GROUP");
-    const size_t moe_group_tok = moe_group_env ? std::strtoul(moe_group_env, nullptr, 10) : D.value("moe_group", size_t{4096});
+    const size_t moe_group_tok = moe_group_env ? std::strtoul(moe_group_env, nullptr, 10)
+                               : ids.size() >= D.value("moe_group_min", size_t{0}) ? D.value("moe_group", size_t{4096}) : size_t{4096};
     const size_t G = std::max<size_t>(1, moe_group_tok / M), ngroups = (C + G - 1) / G;
     auto gfirst = [&](size_t c) { return c / G * G; };
     auto glast = [&](size_t c) { return std::min(C, (c / G + 1) * G) - 1; };

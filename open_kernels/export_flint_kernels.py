@@ -257,6 +257,7 @@ def manifest(bset: dict) -> dict:
                 "win": {str(L): {"kernel": fa(L, lk, WINDOW)[0], "lk": lk} for L, lk in FA_WIN.items()}}
     # experts over groups of 8192 tokens (bit-identical; 32K GPU idle: 35.2 -> 33.5 s, slots fuller at top-6)
     gd["moe_group"] = 8192
+    gd["moe_group_min"] = 12288          # (a prompt of one group stalls the pipe: 8K 954 -> 748 tok/s)
     gd.update({"hs": True, "kernels": {}, "npad": {str(n): n for n in (QW + 2 * KVW, HID, 2 * FF_SH, 2 * FF_D)},
                "small": tier(512), "tiny": {**tier(256), "mt": 64}})
     inv = [1.0 / (10000.0 ** (2 * i / HD)) for i in range(HD // 2)]
