@@ -59,6 +59,10 @@ struct DeltaGeom {
     /// qkv argument -- the prompt pipe's GEMM output, read without an f32 copy (same result)
     const uint16_t* qkv16 = nullptr;
     size_t ld16 = 0;
+    /// optional: z as bf16 rows (row stride ldz elements; the prompt pipe's GEMM output) instead of
+    /// the f32 z argument, read where the output gate needs it
+    const uint16_t* z16 = nullptr;
+    size_t ldz = 0;
     /// optional (an MTP verify pass, the chunk4 path): each row's normalised k [t_real, key_heads *
     /// head_dim], delta d [t_real, value_heads * head_dim] and decay [t_real, value_heads] saved
     /// here, so delta_rollback can rebuild the state after a prefix of the rows in one pass over S

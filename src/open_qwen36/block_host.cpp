@@ -208,6 +208,14 @@ __attribute__((always_inline)) inline dnv dn_exp(dnv x) {
 }
 __attribute__((always_inline)) inline dnv dn_silu(dnv x) { return x / (dn_bc(1.f) + dn_exp(-x)); }
 
+// row t, head h of z (128 values): the f32 argument, or g.z16's bf16 row converted into buf
+inline const float* dn_zrow(const DeltaGeom& g, const float* z, size_t vw, size_t t, size_t h, float* buf) {
+    if (!g.z16) return z + t * vw + h * 128;
+    const uint16_t* zs = g.z16 + t * g.ldz + h * 128;
+    for (size_t j = 0; j < 128; ++j) buf[j] = bf16_to_f32(zs[j]);
+    return buf;
+}
+
 // The gated delta rule in chunks of (up to) 4 tokens, head_dim 128 -- the same recurrence
 // (S_t = a_t S_{t-1} + k_t d_t^T, d_t = b_t (v_t - a_t S_{t-1}^T k_t), o_t = S_t^T q_t) in its
 // exact chunked form: with G_t = a_0..a_t and r_ts = a_{s+1}..a_t,
@@ -297,7 +305,8 @@ void delta_rule_chunk4(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt,
                 }
                 rms_vec(o, D, nw, g.eps, on);
                 float* out = og + (t0 + t) * vw + h * D;
-                const float* zz = z + (t0 + t) * vw + h * D;
+                alignas(64) float zb[D];
+                const float* zz = dn_zrow(g, z, vw, t0 + t, h, zb);
                 for (size_t j = 0; j < D; j += 16) dn_st(out + j, dn_ld(on + j) * dn_silu(dn_ld(zz + j)));
             }
             // S <- G_last S + sum_s r[last][s] k_s d_s^T, fused with the next chunk's S^T k, S^T q
@@ -468,7 +477,8 @@ void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, 
                 for (size_t j = 0; j < dim; ++j) o[j] *= inv_sqrt;
                 rms_vec(o.data(), dim, nw, g.eps, on.data());
                 float* out = og + t * vw + h * dim;
-                const float* zz = z + t * vw + h * dim;
+                alignas(64) float zb[128];
+                const float* zz = dn_zrow(g, z, vw, t, h, zb);
                 for (size_t j = 0; j < dim; ++j) out[j] = on[j] * silu(zz[j]);
             }
         }
@@ -516,7 +526,8 @@ void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, 
             dn_st(o + 64, o4 * is); dn_st(o + 80, o5 * is); dn_st(o + 96, o6 * is); dn_st(o + 112, o7 * is);
             rms_vec(o, dim, nw, g.eps, on);
             float* out = og + t * vw + h * dim;
-            const float* zz = z + t * vw + h * dim;
+            alignas(64) float zb[128];
+            const float* zz = dn_zrow(g, z, vw, t, h, zb);
             for (size_t j = 0; j < 128; j += 16) dn_st(out + j, dn_ld(on + j) * dn_silu(dn_ld(zz + j)));
         }
     }
@@ -801,8 +812,11 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
         size_t b = a + 1;
         while (b < R && !(g.reset && g.reset[b])) ++b;
         if (g.reset && g.reset[a]) std::fill(S, S + g.value_heads * g.s_rows * dim, 0.f);
-        delta_rule_heads(g, b - a, grp, inv_sqrt, Q.data() + a * key_w, Kk.data() + a * key_w, V.data() + a * vw,
-                         decay.data() + a * g.value_heads, beta.data() + a * g.value_heads, z + a * vw, nw, S, og + a * vw);
+        DeltaGeom ga = g;
+        if (g.z16) ga.z16 = g.z16 + a * g.ldz;
+        delta_rule_heads(ga, b - a, grp, inv_sqrt, Q.data() + a * key_w, Kk.data() + a * key_w, V.data() + a * vw,
+                         decay.data() + a * g.value_heads, beta.data() + a * g.value_heads, g.z16 ? nullptr : z + a * vw, nw, S,
+                         og + a * vw);
         a = b;
     }
     if (phase_ms) {

@@ -5889,10 +5889,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     if (c == 0) read_back(st, lt.state_bytes, 0);
                     sadd(mid_prof[1], ms_since(tm)); tm = std::chrono::steady_clock::now();
                     ya.resize(M * nch);
-                    yb.resize(M * vw);
                     og.resize(M * vw);
-#pragma omp parallel for
-                    for (long long t = 0; t < static_cast<long long>(t_real); ++t) bf16_row_f32(q16 + t * nq + nch, vw, yb.data() + t * vw);
                     sadd(mid_prof[2], ms_since(tm)); tm = std::chrono::steady_clock::now();
                     host::DeltaGeom g;
                     g.T = M; g.hid = hid;
@@ -5900,9 +5897,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
                     g.t_real = t_real;
                     g.reset = packed ? rflag.data() + r0 : nullptr;
-                    g.qkv16 = q16; g.ld16 = nq;                    // qkv read as the C rows (z converted above)
+                    g.qkv16 = q16; g.ld16 = nq;                    // qkv and z read as the C rows
+                    g.z16 = q16 + nch; g.ldz = nq;
                     double ph[2] = {0, 0};
-                    host::deltanet_block(g, ya.data(), yb.data(), xc, hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
+                    host::deltanet_block(g, ya.data(), nullptr, xc, hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
                                          hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
                                          reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
                     sadd(timing_.dn_conv_ms, ph[0]);
