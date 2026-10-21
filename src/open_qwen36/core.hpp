@@ -303,6 +303,8 @@ public:
     const std::vector<std::vector<float>>& seg_x() const { return seg_x_; }
 
 private:
+    /// experts with the rows that chose them: (expert, [(row, weight)])
+    using ExRows = std::vector<std::pair<uint32_t, std::vector<std::pair<size_t, float>>>>;
     struct Kern {
         std::string name;
         std::string patch;
@@ -557,6 +559,8 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// blocked is how long THIS call sat in wait() -- the same number serially, and the only
     /// honest one to add up once a dispatch has been running while the host did something else.
     std::pair<double, double> wait_run(Inflight& f);
+    /// the decode experts `exn` (at most 16) of layer l on the smallest mbi stream that holds them
+    Inflight dec_npu_start(int l, const float* xn, size_t R, const ExRows& exn);
     void route(Kern& k, int layer, uint64_t act_off);
     /// LFM2-MoE: the router on the host (manifest layout.router) -- reads xm out of act,
     /// writes the routing record, patches the expert kernel like route() does.
@@ -759,6 +763,11 @@ private:
     /// (host::mbi_transform at load), mbi_s_[l] their shifts [expert][S_ug, S_dn]
     bool mbi_on_ = false;
     std::vector<std::vector<int8_t>> mbi_s_;
+    /// OFLM_OPEN_DEC_NPU=n (mbi, CPU decode): up to n of a step's routed experts per layer on the
+    /// NPU's mbi stream, at the same time as the CPU's; dec_npu_start packs and starts it
+    size_t dec_npu_ = 0;
+    double dec_npu_wait_ms_ = 0, dec_npu_prep_ms_ = 0;
+    size_t dec_npu_runs_ = 0;
     /// OFLM_OPEN_KV8 (default on with q41_cpu_): the CPU decode's attention reads an int8 copy of
     /// each full layer's cache (host::kv8_quant_rows); kv8_valid_[l] rows of it match the bf16 cache
     std::vector<std::vector<uint8_t>> kv8_;
@@ -777,7 +786,9 @@ private:
         const uint8_t* up0 = nullptr; size_t up_stride = 0, gate_off = 0; host::Q41Lay up_lay;
         const uint8_t* dn0 = nullptr; size_t dn_stride = 0; host::Q41Lay dn_lay;
         const int8_t* mbi_s = nullptr;   ///< the experts in mbi's transform: [expert][S_ug, S_dn]
+        int npu_layer = -1;              ///< the pool's layer: OFLM_OPEN_DEC_NPU may run some experts on the NPU
     };
+
     /// x += the MoE block of xn for R rows on the CPU (the shared expert gated, then the routed
     /// experts ascending; each expert's weights read once for the rows that chose it)
     void moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x);

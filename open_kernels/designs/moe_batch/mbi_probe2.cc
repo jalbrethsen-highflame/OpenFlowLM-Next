@@ -13,6 +13,14 @@ void mbi_probe2(const uint8_t *__restrict w, const uint8_t *__restrict x, float 
   for (unsigned i = 0; i < 256; ++i) { acc[i] = (float)di[i]; acc[256 + i] = (float)mi[i]; }
   acc[512] = (float)sh;
   acc[513] = (float)aie::reduce_max(aie::abs(aie::load_v<32>(reinterpret_cast<const bfloat16 *>(w))));
+#elif defined(MBI_PDN) || defined(MBI_PHQ)
+  {   // hmeta (at x + 7680): the down's shift and 16 real tokens
+    int32_t *hm = reinterpret_cast<int32_t *>(const_cast<uint8_t *>(x) + 7680);
+    hm[0] = 18;
+    hm[3] = 16;
+  }
+#endif
+#if defined(MBI_DBG_PREP)
 #elif defined(MBI_PDN)
   // the down step: hq and hmeta in the x buffer (8192 + 1088 B), the band in w
   for (unsigned it = 0; it < PROBE_ITERS; ++it)
@@ -23,6 +31,7 @@ void mbi_probe2(const uint8_t *__restrict w, const uint8_t *__restrict x, float 
     mbi_hq_band(acc, reinterpret_cast<const float *>(w), reinterpret_cast<int8_t *>(const_cast<uint8_t *>(x)),
                 const_cast<uint8_t *>(x) + 7680, it & 7);
 #elif defined(MBI_V3)
+  reinterpret_cast<int32_t *>(const_cast<uint8_t *>(x))[2] = 16;   // the x header's real tokens
   for (unsigned it = 0; it < PROBE_ITERS; ++it) mbi_band_kg3(w, x, acc);
 #else
   for (unsigned it = 0; it < PROBE_ITERS; ++it) mbi_band_kg(w, x, acc);

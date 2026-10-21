@@ -73,6 +73,7 @@ CB = ACC * 2                                     # one core's y band, bf16
 YSLOT = NOB * N_ROWS * CB
 X_BYTES, Y_BYTES = SLOTS * XSLOT, SLOTS * YSLOT
 STACK = int(os.environ.get("MBI_STACK", "0x1000"), 0)
+MBI_CFLAGS = os.environ.get("MBI_CFLAGS", "").split()   # extra Peano flags (e.g. -mllvm scheduler options)
 L1 = 2 * BAND + 2 * XEL + CB + 2 * ACC * 4 + HQ + HMETA + STACK
 
 assert NT == 16, "mbi_core.h is written for 16 tokens a core (four token groups, two a pass)"
@@ -102,7 +103,7 @@ def mbi(pool: In, x: In, y: Out, *, slots: CompileTime[int], srchash: CompileTim
     y_ty = np.ndarray[(Y_BYTES,), np.dtype[np.uint8]]
 
     inc = include_dirs() + [str(HERE)]
-    flags = [f"-DMBI_NT={NT}"] + [f"-D{d}" for d in os.environ.get("MBI_DEFS", "").split(",") if d]
+    flags = [f"-DMBI_NT={NT}"] + [f"-D{d}" for d in os.environ.get("MBI_DEFS", "").split(",") if d] + MBI_CFLAGS
 
     def ef(sym, args):
         return ExternalFunction(sym, source_file=str(HERE / f"{sym}.cc"), arg_types=args, include_dirs=inc,
@@ -233,7 +234,7 @@ _src = b"".join([(HERE / "mbi.py").read_bytes(), (HERE / "mbi_core.h").read_byte
                 + [(HERE.parent.parent / "include" / "vecmath.h").read_bytes()]
                 + [f"{k}={v}".encode() for k, v in (("NT", NT), ("HID", HID), ("FF", FF), ("EXPERTS", EXPERTS),
                                                      ("POOL_DOWN", POOL_DOWN), ("POOL_BYTES", POOL_BYTES),
-                                                     ("DEFS", os.environ.get("MBI_DEFS", "")), ("STACK", STACK))])
+                                                     ("DEFS", os.environ.get("MBI_DEFS", "")), ("STACK", STACK), ("CFLAGS", " ".join(MBI_CFLAGS)))])
 SPECIALIZE = {"slots": SLOTS, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}
 
 if __name__ == "__main__":

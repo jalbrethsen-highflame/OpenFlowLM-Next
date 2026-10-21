@@ -23,13 +23,13 @@ def mbi_probe2(w: In, x: In, acc: Out, *, srchash: CompileTime[int] = 0):
     x_ty = np.ndarray[(X_B,), np.dtype[np.uint8]]
     a_ty = np.ndarray[(A_B // 4,), np.dtype[np.float32]]
     k = ExternalFunction("mbi_probe2", source_file=str(HERE / "mbi_probe2.cc"), arg_types=[w_ty, x_ty, a_ty],
-                         include_dirs=include_dirs() + [str(HERE)], compile_flags=[f"-DMBI_NT={NT}", f"-DPROBE_ITERS={ITERS}"] + [f"-D{v}" for v in os.environ.get("MBI_DEFS", "").split(",") if v])
+                         include_dirs=include_dirs() + [str(HERE)], compile_flags=[f"-DMBI_NT={NT}", f"-DPROBE_ITERS={ITERS}"] + [f"-D{v}" for v in os.environ.get("MBI_DEFS", "").split(",") if v] + os.environ.get("MBI_CFLAGS", "").split())
     W, X, A = ObjectFifo(w_ty, name="W", depth=1), ObjectFifo(x_ty, name="X", depth=1), ObjectFifo(a_ty, name="A", depth=1)
     def core(wi, xi, ao, kern):
         a = wi.acquire(1); b = xi.acquire(1); c = ao.acquire(1)
         kern(a, b, c)
         wi.release(1); xi.release(1); ao.release(1)
-    ws = [Worker(core, [W.cons(), X.cons(), A.prod(), k], tile=Tile(0, 2), stack_size=0x1000)]
+    ws = [Worker(core, [W.cons(), X.cons(), A.prod(), k], tile=Tile(0, 2), stack_size=0x1800)]
     wp, xp, ac = W.prod(tile=Tile(0, 0)), X.prod(tile=Tile(0, 0)), A.cons(tile=Tile(0, 0))
     def lin(n):
         return TensorAccessPattern((n,), 0, [1, n], [n, 1])
@@ -42,5 +42,5 @@ def mbi_probe2(w: In, x: In, acc: Out, *, srchash: CompileTime[int] = 0):
 
 
 DESIGN = mbi_probe2
-_src = b"".join([(HERE / f).read_bytes() for f in ("mbi_probe2.py", "mbi_probe2.cc", "mbi_core.h")] + [f"{NT},{ITERS},{os.environ.get('MBI_DEFS', '')}".encode()])
+_src = b"".join([(HERE / f).read_bytes() for f in ("mbi_probe2.py", "mbi_probe2.cc", "mbi_core.h")] + [f"{NT},{ITERS},{os.environ.get('MBI_DEFS', '')},{os.environ.get('MBI_CFLAGS', '')}".encode()])
 SPECIALIZE = {"srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

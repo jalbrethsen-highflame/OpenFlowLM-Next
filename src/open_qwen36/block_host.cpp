@@ -2786,9 +2786,19 @@ void q41_group16(const uint8_t* const* chunks, size_t ng, size_t rb, const Q41X*
     const __m512 unscale = _mm512_set1_ps(std::ldexp(1.f, -std::max(shift, 0)));
     __m512 acc[8];
     for (size_t r = 0; r < R; ++r) acc[r] = _mm512_setzero_ps();
+    static const size_t pf = [] { const char* e = std::getenv("OFLM_Q41_PF"); return e ? std::strtoul(e, nullptr, 10) : 2ul; }();
     for (size_t g = 0; g < ng; ++g) {
         const uint8_t* ch = chunks[g];
         const uint8_t* nib = ch + 1024 + rb * 2048;
+        // the chunks sit 10-20 KB apart: fetch the one pf (2) ahead (its 2 KB of nibbles, its d / m lines)
+        if (pf && g + pf < ng) {
+            const uint8_t* nx = chunks[g + pf];
+            for (size_t o = 0; o < 2048; o += 64) _mm_prefetch(reinterpret_cast<const char*>(nx + 1024 + rb * 2048 + o), _MM_HINT_T0);
+            for (size_t o = 0; o < 512; o += 64) {
+                _mm_prefetch(reinterpret_cast<const char*>(nx + o), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(nx + 512 + o), _MM_HINT_T0);
+            }
+        }
         const uint16_t* dp = reinterpret_cast<const uint16_t*>(ch) + rb * 16;
         const uint16_t* mp = reinterpret_cast<const uint16_t*>(ch + 512) + rb * 16;
         for (size_t kb = 0; kb < 8; ++kb) {
