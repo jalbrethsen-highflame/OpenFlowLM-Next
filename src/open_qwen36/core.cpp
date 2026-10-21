@@ -1242,6 +1242,15 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
         throw std::runtime_error("open_qwen36: the mbi expert kernels transform the pools' routed experts, so decode "
                                  "must read them on the CPU (OFLM_OPEN_CPU_DECODE=1, the pools kept)");
     if (mbi_on_) mbi_s_.assign(static_cast<size_t>(nl_), {});
+    moe_g_ = w_->moe;
+    shared_mbi_ = mbi_on_ && !skip_pools && !drop_pools_ && std::getenv("OFLM_OPEN_SHARED_MBI") && *std::getenv("OFLM_OPEN_SHARED_MBI") == '1';
+    if (shared_mbi_) {
+        // the copy at the pool's end: [up | gate] stripes (2 ff / 128 of them), then the down
+        const uint64_t ug = moe_g_.expert_stripes(), dn = moe_g_.up_bytes;
+        moe_g_.sh_ug = (w_->pool_bytes - ug - dn) / 4096 * 4096;
+        moe_g_.sh_dn = moe_g_.sh_ug + ug;
+        log("prompt pipe: the shared expert as an mbi expert (a copy at pool byte " + std::to_string(moe_g_.sh_ug) + ")");
+    }
     // OFLM_OPEN_DEC_NPU (default 16; 0 off): routed experts a decode layer on the NPU beside the CPU's,
     // half of a pass's by default (OFLM_OPEN_DEC_NPU_SHARE). With the GPU busy the layer's MoE took
     // 15 % less time (A/B by layer parity, OFLM_OPEN_DEC_NPU_AB)
@@ -1293,6 +1302,33 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                     S[2 * e + 1] = static_cast<int8_t>(host::mbi_shift(dn, ndn, 5120));
                     host::mbi_transform(ug, nug, 5120, S[2 * e]);
                     host::mbi_transform(dn, ndn, 5120, S[2 * e + 1]);
+                }
+                if (shared_mbi_) {
+                    // the shared expert (std_perm bands: band b at b K / 256 10240, its two 32-row chunks
+                    // at kg 10240 and + 5120) into the routed layout (stripe s: [proj][kg][4 chunks]; down
+                    // stripe s: [kg][4 chunks]), then mbi's transform; its shifts after the routed ones
+                    const size_t hd = w_->hidden, ff = g.up_bytes * 8 / 5 / hd, CH = 5120, ugb = hd / 256 * 10240, dnb = ff / 256 * 10240;
+                    for (const PackOp& op : lt.pool)
+                        if (op.dst + pools::op_bytes(op, w_->chunk_bytes) > moe_g_.sh_ug)
+                            throw std::runtime_error("open_qwen36: OFLM_OPEN_SHARED_MBI: the pool has no room for the shared expert's copy");
+                    uint8_t* dug = pool_host + moe_g_.sh_ug;
+                    uint8_t* ddn = pool_host + moe_g_.sh_dn;
+                    for (size_t sp = 0; sp < ff / 128; ++sp)
+                        for (size_t pj = 0; pj < 2; ++pj)
+                            for (size_t kg = 0; kg < hd / 256; ++kg)
+                                for (size_t ci = 0; ci < 4; ++ci)
+                                    std::memcpy(dug + (sp * 2 + pj) * g.stripe + (kg * 4 + ci) * CH,
+                                                pool_host + (pj ? g.share_gate : g.share_up) + (2 * sp + ci / 2) * ugb + kg * 10240 + (ci % 2) * CH, CH);
+                    for (size_t st = 0; st < hd / 128; ++st)
+                        for (size_t kg = 0; kg < ff / 256; ++kg)
+                            for (size_t ci = 0; ci < 4; ++ci)
+                                std::memcpy(ddn + st * 128 * ff * 5 / 8 + (kg * 4 + ci) * CH,
+                                            pool_host + g.share_down + (2 * st + ci / 2) * dnb + kg * 10240 + (ci % 2) * CH, CH);
+                    S.resize(2 * E + 2);
+                    S[2 * E] = static_cast<int8_t>(host::mbi_shift(dug, nug, CH));
+                    S[2 * E + 1] = static_cast<int8_t>(host::mbi_shift(ddn, ndn, CH));
+                    host::mbi_transform(dug, nug, CH, S[2 * E]);
+                    host::mbi_transform(ddn, ndn, CH, S[2 * E + 1]);
                 }
             }
             if (mbv_on_ && !lt.gemm_block.program.empty()) {
@@ -5762,8 +5798,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         // full-size ones (index 0 ..), then one a smaller size (the smallest two), each its own size,
         // sized for the group's real rows (a short prompt does not fill a 4096-row group).
         // slots <= P (min(E, rows topk) + rows topk / (NT P))
-        const size_t rows = std::min(G * M, ids.size()), pairs = rows * w_->moe.topk;
-        mb_full = (mbp->p * std::min<size_t>(w_->moe.experts, pairs) + (pairs + NTm - 1) / NTm) / maxs;
+        const size_t rows = std::min(G * M, ids.size()), pairs = rows * (w_->moe.topk + (shared_mbi_ ? 1 : 0));
+        mb_full = (mbp->p * std::min<size_t>(w_->moe.experts + (shared_mbi_ ? 1 : 0), pairs) + (pairs + NTm - 1) / NTm) / maxs;
         mb_small.clear();
         for (auto it = mbp->kernels.rbegin(); it != mbp->kernels.rend(); ++it)
             if (it->first < maxs) mb_small.push_back(it->first);
@@ -5959,15 +5995,17 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 } else if (op == UP && ffn_dev) {
                     // a MoE layer: the shared expert here, then the chunk's routed-expert passes
                     const std::vector<Step>& fp = is_moe(l) ? gb.shared_program : gb.ffn_program;
-                    run(D["ffn"]["up2p"].get<std::string>(), {"pp_a2_" + cs, fp[0].args[0], "pp_hu"});
-                    run(D["ffn"]["down2u"].get<std::string>(), {"pp_hu", fp[1].args[0], "pp_y_" + cs});
+                    if (!(shared_mbi_ && is_moe(l))) {   // OFLM_OPEN_SHARED_MBI: in the mbi passes instead
+                        run(D["ffn"]["up2p"].get<std::string>(), {"pp_a2_" + cs, fp[0].args[0], "pp_hu"});
+                        run(D["ffn"]["down2u"].get<std::string>(), {"pp_hu", fp[1].args[0], "pp_y_" + cs});
+                    }
                     if (is_moe(l) && c == glast(c)) {
                         const size_t set = (c / G) % 2;
                         auto tm = std::chrono::steady_clock::now();
                         for (size_t p = 0; p < mset[set].passes.size(); ++p) {
                             const MoePass& mp = mset[set].passes[p];
                             Kern& mk = kerns_.at(mp.kernel);
-                            stream_patch::moe2_apply(mk.iw(), mk.moe2, mp.ex.data(), w_->moe);
+                            stream_patch::moe2_apply(mk.iw(), mk.moe2, mp.ex.data(), moe_g_);
                             mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                             if (mbi) run(mp.kernel, {mbp->args[0], mbuf('x', set, mp.buf), mbuf('y', set, mp.buf)});
                             else run(mp.kernel, {mbp->args[0], mbuf('x', set, mp.buf), mbuf('h', set, mp.buf), mbuf('y', set, mp.buf)});
@@ -6450,8 +6488,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     const float r = static_cast<float>(1.0 / std::sqrt(ss / static_cast<double>(hid) + peps));
                     for (size_t j = 0; j < hid; ++j) xc[o + j] = rs[o + j] * r * pw[j];
                 }
-                if (up2) to_bfp2(xc, hid, "pp_a2_" + cs, t_real);
-                else to_bf16(xc, M, hid, "pp_a_" + cs);
+                if (shared_mbi_ && is_moe(l)) {
+                    // the shared expert rides in the mbi passes: no input for its GEMMs
+                } else if (up2) {
+                    to_bfp2(xc, hid, "pp_a2_" + cs, t_real);
+                } else {
+                    to_bf16(xc, M, hid, "pp_a_" + cs);
+                }
                 if (is_moe(l)) {
                     // the router (staged_tail's) and the shared expert's gate (ffn_staged's) for this
                     // chunk; at the group's last chunk, every group token gathered into the set's
@@ -6486,9 +6529,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         const size_t set = (c / G) % 2, c0 = gfirst(c), grows = (c - c0 + 1) * M;
                         MoeSet& ms = mset[set];
                         // owed[e]: (group row, weight); group row (c2 - c0) M + t is prompt row c2 M + t
-                        std::vector<std::vector<std::pair<int, float>>> owed(E);
+                        const size_t Ev = E + (shared_mbi_ ? 1 : 0);   // index E: the shared expert, every row at its gate
+                        std::vector<std::vector<std::pair<int, float>>> owed(Ev);
                         for (size_t c2 = c0; c2 <= c; ++c2) {
                             const size_t tr2 = std::min(M, N - std::min(N, c2 * M));
+                            if (shared_mbi_)
+                                for (size_t t = 0; t < tr2; ++t) owed[E].push_back({static_cast<int>((c2 - c0) * M + t), gate_c[c2][t]});
                             for (size_t t = 0; t < tr2; ++t)
                                 for (size_t k = 0; k < topk; ++k) {
                                     const int32_t e = ridx_c[c2][t * topk + k];
@@ -6508,7 +6554,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         // a visit: P slots of NTm tokens that share the expert's weight stream (mbi p)
                         const size_t Pv = mbp->p, NTv = NTm * Pv;
                         std::vector<std::pair<uint32_t, size_t>> visits;
-                        for (size_t e = 0; e < E; ++e)
+                        for (size_t e = 0; e < owed.size(); ++e)
                             for (size_t off = 0; off < owed[e].size(); off += NTv) visits.push_back({static_cast<uint32_t>(e), off});
                         ms.passes.clear();
                         ms.per_token.clear();
@@ -6627,7 +6673,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     from = ms.scat[gi];
                 }
                 auto tr = std::chrono::steady_clock::now();
-                if (!ms.shared_in[gi]) {
+                if (!ms.shared_in[gi] && !shared_mbi_) {
                     // the shared expert first, as the plain RES adds it (the same sums, bit for bit)
                     xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
                     read_back(yb2, t_real * hid * 2, 0);
@@ -6671,13 +6717,16 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 }
                 sadd(timing_.moe_read_ms, ms_since(tr));
             } else if (is_moe(l)) {   // RES of a MoE layer: the gated shared expert, then the routed experts
-                xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
-                read_back(yb2, t_real * hid * 2, 0);
-                const uint16_t* y16 = yb2.map<const uint16_t*>();
                 const size_t set = (c / G) % 2, grow0 = (c - gfirst(c)) * M;   // this chunk's first group row
                 MoeSet& ms = mset[set];
-#pragma omp parallel for
-                for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
+                const uint16_t* y16 = nullptr;
+                if (!shared_mbi_) {
+                    xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
+                    read_back(yb2, t_real * hid * 2, 0);
+                    y16 = yb2.map<const uint16_t*>();
+                }
+#pragma omp parallel for if (!shared_mbi_)
+                for (long long tk = 0; tk < static_cast<long long>(shared_mbi_ ? 0 : t_real); ++tk) {
                     const size_t o = static_cast<size_t>(tk) * hid;
                     const float gt = gate_c[c][static_cast<size_t>(tk)];
                     for (size_t i = 0; i < hid; ++i) rs[o + i] += gt * bf16_to_f32(y16[o + i]);

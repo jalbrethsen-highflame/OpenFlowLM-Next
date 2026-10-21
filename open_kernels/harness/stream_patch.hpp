@@ -41,6 +41,9 @@ struct MoeGeometry {
     unsigned experts = 256;
     unsigned topk = 8;               ///< routed slots (the placeholder experts 0..topk-1)
     uint64_t base = 0;               ///< where the routed [up | gate] stripes start (LFM2-MoE: past the mixer's projections)
+    /// the shared expert copied in the routed layout (its [up | gate] stripes, its down) and addressed as
+    /// expert `experts` by moe2_apply; 0: no copy
+    uint64_t sh_ug = 0, sh_dn = 0;
     uint64_t expert_stripes() const { return 2 * up_bytes; }     ///< one expert's up + gate stripes
     uint64_t expert_bytes() const { return 3 * up_bytes; }       ///< moe_table's host-concatenated [up | gate | down]
 };
@@ -274,6 +277,10 @@ inline void moe2_apply(uint32_t* iw, const std::vector<MoePatch>& table, const u
                        const MoeGeometry& g = MoeGeometry{}) {
     for (const auto& p : table) {
         uint64_t e = idx[p.slot & 0xff];
+        if (e == g.experts && g.sh_ug) {
+            iw[p.word] = static_cast<uint32_t>(((p.slot & 0x100) == 0 ? g.sh_ug : g.sh_dn) + p.intra);
+            continue;
+        }
         iw[p.word] = static_cast<uint32_t>((p.slot & 0x100) == 0 ? g.base + e * g.expert_stripes() + p.intra
                                                                   : g.pool_down + e * g.up_bytes + p.intra);
     }

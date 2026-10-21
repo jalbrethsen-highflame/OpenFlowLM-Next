@@ -408,6 +408,11 @@ private:
     /// kMbvRows rows on the NPU (those pool rows in mbi's transform, shift mbv_s_[l]) while the CPU
     /// does the rest
     static constexpr size_t kMbvRows = 8192;
+    /// OFLM_OPEN_SHARED_MBI=1: the prompt pipe runs the shared expert as expert index `experts` of the
+    /// mbi passes (a copy in the routed layout at moe_g_.sh_ug / sh_dn, transformed; mbi_s_ has its
+    /// shifts) instead of its own GEMMs
+    bool shared_mbi_ = false;
+    stream_patch::MoeGeometry moe_g_;
     bool mbv_on_ = false;
     std::vector<int> mbv_s_;
     std::vector<size_t> mbv_off_;
