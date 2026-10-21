@@ -5744,11 +5744,26 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // the NPU takes the lowest ready cell, preferring one in the hardware context it is in
     // (attention vs GEMM: a context switch costs a few ms each way)
     int last_fa = -1;
+    // OFLM_OPEN_CTX_STICKY=1: prefer any ready op in the hardware context the NPU is in (GEMMs,
+    // attention, the experts, dnc): a switch costs ~5 ms (the next kernel's time: a 0.46 ms GEMM
+    // took 5.5 after one), 742 of them at 30K (~3.5 s), 1699 with dnc (~8.6 s). No gain measured
+    // (747 -> 712-737 switches): they come from the structure, one expert-context visit a group
+    static const bool ctx_sticky = [] { const char* e = std::getenv("OFLM_OPEN_CTX_STICKY"); return e && *e == '1'; }();
+    int last_ctx = -1;
+    auto ctx_of = [&](size_t l, size_t c) {
+        const int o = ops[l][stage[cell(l, c)]];
+        return o == FAT ? 1 : o == DNC ? 2 : o == UP && is_moe(l) && c == glast(c) ? 3 : 0;
+    };
     auto pick = [&](bool npu, size_t& ol, size_t& oc) {
         bool found = false;
         for (size_t l = 0; l < L; ++l)
             for (size_t c = 0; c < C; ++c)
                 if (ready(l, c, npu)) {
+                    if (npu && ctx_sticky) {
+                        if (last_ctx < 0 || ctx_of(l, c) == last_ctx) { ol = l; oc = c; return true; }
+                        if (!found) { ol = l; oc = c; found = true; }
+                        continue;
+                    }
                     if (!npu || last_fa < 0) { ol = l; oc = c; return true; }
                     const bool f = ops[l][stage[cell(l, c)]] == FAT;
                     if (f == (last_fa == 1)) { ol = l; oc = c; return true; }
@@ -5914,6 +5929,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     std::lock_guard<std::mutex> lk(mu);
                     busy[cell(l, c)] = 0;
                     last_fa = op == FAT ? 1 : 0;
+                    last_ctx = op == FAT ? 1 : op == DNC ? 2 : op == UP && is_moe(l) && c == glast(c) ? 3 : 0;
                     ++stage[cell(l, c)];
                 }
                 cv.notify_all();

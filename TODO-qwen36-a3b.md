@@ -36,6 +36,7 @@ Items (gain: expected, until measured; measure inside one run where possible):
 | P6 | prefill | mixer out f32 -> memory -> bfp16 pack (to_bfp2), 16.8 MB a chunk round trip | waste | 0.17-0.26 s at 4K | MID_PROF out pack, MIDB out pack | -1 to -2 host thread-s at 30K | open |
 | P7 | prefill | expert slots 77 % full; each core receives every visit's full weights | hardware layout | per-core stream floor | null-kernel timing | large, uncertain (new tiling) | open |
 | P8 | prefill | empty expert slots from rounding the last pass up | waste | 14 % of slots | slot count in the trace | -2.2 s NPU at 30K | done (ec27d29) |
+| P9 | prefill | hardware context switches cost ~5 ms each (next kernel 0.46 -> 5.5 ms); 742 at 30K (~3.5 s NPU), 1699 with dnc (~8.6 s, why dnc did not pay); structural: one expert visit a group | waste | 3.5 s NPU at 30K | trace: kernel time after a switch vs not | -1.6 s at G 8192; more needs half-array designs | open (sticky scheduling: no gain) |
 | D1 | decode | dense GEMVs (0.93 GB a pass) only on the CPU, the slower reader | placement | gemv 15-35 ms a pass | CPU_DECODE_TRACE gemv | +20-25 % decode | open |
 | D2 | decode | half of a pass's experts on the NPU | placement | -15 % MoE a layer | DEC_NPU_AB parity A/B | done | done (5b10a84) |
 | D3 | decode | MTP draft length | tuning | k<=4, PCUM 0.4 | acceptance counts (load-independent) | done | done (5b10a84) |
