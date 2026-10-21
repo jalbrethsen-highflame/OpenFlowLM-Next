@@ -56,4 +56,14 @@ Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setu
     <description>Build, verify and run the open XDNA2 kernels for LiquidAI LFM2-MoE (LFM2.5-24B-A2B, LFM2.5-8B-A1B; model_type lfm2_moe) from a Q4_0 GGUF -- the lfm2moe recipe, the merged one-context layer image (lm.py), the separate-image fallback (cx/dx *_MIX + ex.py), the host sigmoid router and the q8 head. Use when rebuilding these sets, adding another LFM2-MoE size, or debugging a wrong token / ERT timeout on this family.</description>
     <location>.opencode/skill/open-lfm2moe-kernels/SKILL.md</location>
   </skill>
+  <skill>
+    <name>npu-speed-push</name>
+    <description>Method for making an NPU model meet throughput targets while other jobs share the machine: constraint tracker, theory-of-constraints loop, memory safety beside a GPU job, measurement under load, the bit-identical rule, A3B wins and dead ends.</description>
+    <location>.opencode/skill/npu-speed-push/SKILL.md</location>
+  </skill>
+  <skill>
+    <name>full-elf-context</name>
+    <description>Several designs in one XDNA2 hardware context: full-ELF assembly, or classic xclbin flow with CDO configuration runs (OFLM_OPEN_ONE_CTX); switch cost 5.5 ms -> ~1 ms.</description>
+    <location>.opencode/skill/full-elf-context/SKILL.md</location>
+  </skill>
 </available_skills>

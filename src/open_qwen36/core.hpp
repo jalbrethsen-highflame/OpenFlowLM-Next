@@ -333,6 +333,17 @@ private:
     std::unique_ptr<xrt::device> owned_dev_;
     xrt::device* dev_ = nullptr;
     std::map<std::string, std::unique_ptr<xrt::hw_context>> ctxs_;
+    /// OFLM_OPEN_ONE_CTX=1: every design in one hardware context. A design change is a run of the new
+    /// design's configuration stream (its xclbin's CDO as register writes, the memory tiles' DMA
+    /// channels reset first) in front of its own stream: ~0.7-1 ms, where the firmware's switch
+    /// between contexts cost ~5.5 ms. 2: wait for each configuration run (debug).
+    int one_ctx_ = -1;
+    std::unique_ptr<xrt::hw_context> one_;
+    std::unique_ptr<xrt::kernel> cfg_k_;
+    struct CfgStream { std::unique_ptr<xrt::bo> instr; size_t words = 0; };
+    std::map<std::string, CfgStream> cfgs_;
+    std::string cfg_cur_;                      ///< the context name whose configuration the array holds
+    size_t cfg_runs_ = 0;
     std::map<std::string, Kern> kerns_;
 
     std::vector<xrt::bo> pools_, consts_, act_, state_;   ///< per layer
@@ -566,6 +577,8 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
         bool ctx_change = false; ///< the dispatch before it ran in another hardware context
         std::chrono::steady_clock::time_point t0, t1;   ///< entry, and the moment start() returned
         xrt::run r;
+        xrt::run cfg;            ///< OFLM_OPEN_ONE_CTX: the configuration run queued in front of it, if any
+        bool has_cfg = false;
         bool active() const { return k != nullptr; }
     };
     /// Build the command, set its arguments and start() it. Nothing waits.

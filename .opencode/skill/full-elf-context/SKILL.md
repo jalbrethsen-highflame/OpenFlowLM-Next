@@ -1,6 +1,6 @@
 ---
 name: full-elf-context
-description: Run several mlir-aie designs (kernel sets) in ONE XDNA2 hardware context by assembling their built streams into a full ELF (aiecc --get-full-elf --expand-load-pdis, aiebu-asm), switching between them with register-write reconfiguration (0.3-0.7 ms instead of ~2.1 ms per xclbin context switch). Use when a pipeline alternates between several xclbins and the switches cost time, when building or debugging open_kernels/compose_elf.py or the diffusion engine's ELFs, when a full-ELF run hangs with ERT_CMD_STATE_TIMEOUT (especially while another process uses the NPU), when XRT kernel creation is slow, or when a baked-in runtime value (an RTP write) has to vary per run.
+description: Run several mlir-aie designs (kernel sets) in ONE XDNA2 hardware context -- either by assembling their built streams into a full ELF (aiecc --get-full-elf --expand-load-pdis, aiebu-asm), switching between them with register-write reconfiguration (0.3-0.7 ms instead of ~2.1 ms per xclbin context switch). Use when a pipeline alternates between several xclbins and the switches cost time, when building or debugging open_kernels/compose_elf.py or the diffusion engine's ELFs, when a full-ELF run hangs with ERT_CMD_STATE_TIMEOUT (especially while another process uses the NPU), when XRT kernel creation is slow, or when a baked-in runtime value (an RTP write) has to vary per run. Also the classic-xclbin variant (each design's CDO replayed as an instruction stream in one shared context, OFLM_OPEN_ONE_CTX) for engines that patch their instruction streams between calls.
 ---
 
 # One hardware context for several designs
@@ -97,3 +97,53 @@ The TXN format (`compose_elf.txn_ops`):
 - ops back to back: write32 24 B, maskwrite/maskpoll 28 B, load_pdi 16 B;
 - blockwrite: its size at +12; custom ops (≥128): their size at +4.
 - The parse must end exactly at the header's byte count.
+
+## Classic flow: one context, CDO configuration runs (patchable streams)
+
+A full ELF's control code cannot be patched, but the open LLM engine rewrites instruction
+words between calls (expert offsets, KV positions). The A3B push (2026-10-21) kept the classic
+`xrt::kernel("MLIR_AIE")` + instruction-BO flow and moved the reconfiguration into it.
+Code: `Core::context`, `parse_cdo`, `cfg_prefix`, `Core::start_run` in
+`src/open_qwen36/core.cpp`; env `OFLM_OPEN_ONE_CTX=1` (2 = wait for each configuration run).
+
+**The cost it removes.** On this Strix (npu5, XRT 2.25) the firmware's PDI load costs ~0.17 ms
+a core: ~0.17 ms for a 1-core design, ~5.2-5.6 ms for a full 32-core array, whatever the PDI
+size (138 KB and 323 KB cost the same). It is the same in one hw context with two kernels and
+in a full ELF with plain `load_pdi`. The firmware skips a load of the PDI already loaded.
+
+**How it works.**
+1. All designs run in ONE hw context (the first xclbin's) through `MLIR_AIE` kernels on that
+   context. IRON kernels share one signature (opcode, instr, ninstr, bo0-bo4).
+2. For each context name of the set, at load: parse the CDO blocks inside its xclbin (find
+   `"CDO\0"` with header word count 4; commands 0x102 mask write, 0x103 write, 0x105 DMA write,
+   0x107 / 0x108 64-bit forms, 0x111 nop) and emit them as TXN ops: maskwrite 28 B, write32
+   24 B, blockwrite (<= 1024 words each). The addresses are the same in both formats.
+3. Put a reset prefix in front, built from the UNION of what any design of the set writes:
+   - disable every core any design uses (`0x32000`, mask 1);
+   - reset (bit 1 set, then clear) every core DMA channel any design uses (`0x1DE00-0x1DE1C`),
+     and every memory tile's 12 channels (`0xA0600 + 8i`, `0xA0630 + 8i`, all 8 columns);
+   - write 0 to every stream-switch port register any design sets (core / shim
+     `0x3F000-0x3F3FF`, memory tile `0xB0000-0xB03FF`).
+4. In `start_run`, when the next kernel's context differs from the one configured, start the
+   configuration run first (no wait: one context runs its commands in order), then the real
+   run. Wait on the configuration run before its `xrt::run` object dies, or XRT aborts with
+   "xrt::run destructed while command is still in progress".
+
+**Why each part is needed (each one failed without it).**
+- IRON cores loop forever and their memory-tile channels loop over their BD chains, so a
+  design is still active after its run. Without the memory-tile reset, the first run on a
+  fresh context was right and every later one was garbage (rel. error ~1).
+- The CDO writes only the registers its own design uses. Without the union prefix, a stale
+  route or core of the previous design hung the next one (ERT state 8 on `mb_s128`).
+- aiecc's `--expand-load-pdis` output starts the load with an op 8 (`0x00010008`, 16 B). In the
+  classic flow that op hangs the run (state 8 after 4 s); drop it. The CDO path never emits it.
+- Do not reconfigure a design on top of itself; issue the configuration only on a change.
+
+**Numbers.** Configuration run 0.7-1.3 ms (dnc 0.71, mbi 0.96 from MLIR; ~0.9-1.3 from CDO
+with the prefix); the design's own stream then runs at its steady speed. A3B 30K prompt with
+the GPU busy: 712-722 configuration runs, NPU busy -2.2 to -2.8 s, wall -1.2 to -1.5 s;
+600-token logits byte-identical. Instruction memory: 11 configurations, 3.4 MB.
+
+**Probe it first.** A private harness copy with `kernelx NAME CTX insts@KNAME`, `elfctx`
+and `kernelf` commands times: steady runs, runs right after a switch, and outputs dumped after
+an A B A B B A sequence compared byte for byte with the classic two-context run.

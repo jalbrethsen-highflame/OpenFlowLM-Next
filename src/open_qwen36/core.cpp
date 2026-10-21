@@ -983,7 +983,138 @@ Core::~Core() {
     }
 }
 
+namespace {
+// OFLM_OPEN_ONE_CTX: a design's configuration as NPU instructions -- the CDO commands of its xclbin's
+// PDI (writes, masked writes, block writes; the same addresses), which reset and load the cores and
+// set the locks, the stream switches and the DMAs of the tiles the design uses.
+struct CdoOps {
+    std::vector<uint32_t> words;   // instruction ops, no header
+    size_t nops = 0;
+    std::set<uint32_t> core_ctl, dma_ctl, sw;   // core control, core DMA channel control, switch ports
+};
+CdoOps parse_cdo(const std::vector<uint8_t>& x, const std::string& what) {
+    CdoOps o;
+    auto note = [&](uint32_t a) {
+        const uint32_t row = (a >> 20) & 31, off = a & 0xFFFFF;
+        if (row >= 2 && off == 0x32000) o.core_ctl.insert(a);
+        else if (row >= 2 && off >= 0x1DE00 && off < 0x1DE20) o.dma_ctl.insert(a);
+        else if (row == 1 ? (off >= 0xB0000 && off < 0xB0400) : (off >= 0x3F000 && off < 0x3F400)) o.sw.insert(a);
+    };
+    auto mw = [&](uint32_t a, uint32_t v, uint32_t m) { o.words.insert(o.words.end(), {3u, 0u, a, 0u, v, m, 28u}); ++o.nops; note(a); };
+    auto w32 = [&](uint32_t a, uint32_t v) { o.words.insert(o.words.end(), {0u, 0u, a, 0u, v, 24u}); ++o.nops; note(a); };
+    auto rd = [&](size_t at) {
+        if (at + 4 > x.size()) throw std::runtime_error("open_qwen36: " + what + ": CDO runs past the file");
+        uint32_t v;
+        std::memcpy(&v, x.data() + at, 4);
+        return v;
+    };
+    size_t blocks = 0;
+    static const char magic[4] = {'C', 'D', 'O', 0};
+    for (size_t k = 4; k + 16 <= x.size(); ++k) {
+        if (std::memcmp(x.data() + k, magic, 4) != 0 || rd(k - 4) != 4) continue;
+        size_t at = k + 16, end = at + 4 * static_cast<size_t>(rd(k + 8));
+        if (end > x.size()) throw std::runtime_error("open_qwen36: " + what + ": a CDO block runs past the file");
+        ++blocks;
+        while (at < end) {
+            const uint32_t cw = rd(at);
+            at += 4;
+            const uint32_t id = cw & 0xFFFF;
+            size_t n = cw >> 16;
+            if (n == 0xFF) { n = rd(at); at += 4; }
+            const size_t pl = at;
+            at += 4 * n;
+            if (id == 0x111) continue;                                         // nop
+            if (id == 0x102 && n == 3) mw(rd(pl), rd(pl + 8), rd(pl + 4));      // mask write: address, mask, value
+            else if (id == 0x103 && n == 2) w32(rd(pl), rd(pl + 4));             // write: address, value
+            else if (id == 0x107 && n == 4 && rd(pl) == 0) mw(rd(pl + 4), rd(pl + 12), rd(pl + 8));
+            else if (id == 0x108 && n == 3 && rd(pl) == 0) w32(rd(pl + 4), rd(pl + 8));
+            else if (id == 0x105 && n >= 2 && rd(pl) == 0) {                   // dma write: address, words
+                const uint32_t a = rd(pl + 4);
+                for (size_t q = 0; q < n - 2; q += 1024) {
+                    const size_t c = std::min<size_t>(1024, n - 2 - q);
+                    o.words.insert(o.words.end(), {1u, 0u, a + static_cast<uint32_t>(4 * q), static_cast<uint32_t>(16 + 4 * c)});
+                    for (size_t j = 0; j < c; ++j) {
+                        o.words.push_back(rd(pl + 8 + 4 * (q + j)));
+                        note(a + static_cast<uint32_t>(4 * (q + j)));
+                    }
+                    ++o.nops;
+                }
+            } else {
+                throw std::runtime_error("open_qwen36: " + what + ": CDO command " + std::to_string(id) + " (" +
+                                         std::to_string(n) + " words) has no instruction form");
+            }
+        }
+        k = end - 1;
+    }
+    if (!blocks) throw std::runtime_error("open_qwen36: " + what + " has no CDO (OFLM_OPEN_ONE_CTX)");
+    return o;
+}
+// What any design of the set may have left running, stopped: the cores disabled, their DMA channels
+// and every memory tile's reset (an IRON design's channels loop over their buffer descriptors and
+// are still active after a run), and every stream switch port some design sets cleared.
+std::vector<uint32_t> cfg_prefix(const std::vector<const CdoOps*>& all, size_t& nops) {
+    std::set<uint32_t> core_ctl, dma_ctl, sw;
+    for (const CdoOps* c : all) {
+        core_ctl.insert(c->core_ctl.begin(), c->core_ctl.end());
+        dma_ctl.insert(c->dma_ctl.begin(), c->dma_ctl.end());
+        sw.insert(c->sw.begin(), c->sw.end());
+    }
+    for (uint32_t col = 0; col < 8; ++col)
+        for (uint32_t ch = 0; ch < 6; ++ch) {
+            dma_ctl.insert((col << 25) | (1u << 20) | (0xA0600u + 8 * ch));   // memory tile S2MM
+            dma_ctl.insert((col << 25) | (1u << 20) | (0xA0630u + 8 * ch));   // MM2S
+        }
+    std::vector<uint32_t> o;
+    nops = 0;
+    for (uint32_t a : core_ctl) { o.insert(o.end(), {3u, 0u, a, 0u, 0u, 1u, 28u}); ++nops; }
+    for (uint32_t v : {2u, 0u})
+        for (uint32_t a : dma_ctl) { o.insert(o.end(), {3u, 0u, a, 0u, v, 2u, 28u}); ++nops; }
+    for (uint32_t a : sw) { o.insert(o.end(), {0u, 0u, a, 0u, 0u, 24u}); ++nops; }
+    return o;
+}
+}  // namespace
+
 xrt::hw_context& Core::context(const std::string& name) {
+    if (one_ctx_ < 0) {
+        const char* e = std::getenv("OFLM_OPEN_ONE_CTX");
+        one_ctx_ = e ? std::atoi(e) : 0;
+    }
+    if (one_ctx_ > 0) {
+        if (!one_) {
+            // every context's configuration up front: the prefix stops what any of them may leave
+            std::map<std::string, CdoOps> ops;
+            std::vector<const CdoOps*> all;
+            for (const auto& [n, f] : w_->contexts) {
+                fs::path p = fs::path(cfg_.kernel_dir) / f;
+                if (!fs::exists(p)) throw std::runtime_error("open_qwen36: missing kernel " + p.string());
+                all.push_back(&(ops[n] = parse_cdo(read_file(p), p.string())));
+            }
+            size_t npre = 0;
+            const std::vector<uint32_t> pre = cfg_prefix(all, npre);
+            fs::path p0 = fs::path(cfg_.kernel_dir) / w_->contexts.at(name);
+            xrt::xclbin xcl(p0.string());
+            auto uuid = dev_->register_xclbin(xcl);
+            one_ = std::make_unique<xrt::hw_context>(*dev_, uuid);
+            cfg_k_ = std::make_unique<xrt::kernel>(*one_, "MLIR_AIE");
+            size_t bytes = 0;
+            for (const auto& [n, c] : ops) {
+                std::vector<uint32_t> w = {0x06040100u, 0x108u, static_cast<uint32_t>(npre + c.nops), 0};
+                w.insert(w.end(), pre.begin(), pre.end());
+                w.insert(w.end(), c.words.begin(), c.words.end());
+                w[3] = static_cast<uint32_t>(4 * w.size());
+                CfgStream& cs = cfgs_[n];
+                cs.words = w.size();
+                cs.instr = std::make_unique<xrt::bo>(*dev_, 4 * w.size(), xrt::bo::flags::cacheable, cfg_k_->group_id(1));
+                std::memcpy(cs.instr->map<void*>(), w.data(), 4 * w.size());
+                cs.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                bytes += 4 * w.size();
+            }
+            std::fprintf(stderr, "open_qwen36: one context (OFLM_OPEN_ONE_CTX=%d): %zu configurations, %.1f MB, prefix %zu ops\n",
+                         one_ctx_, cfgs_.size(), bytes / 1e6, npre);
+        }
+        if (!cfgs_.count(name)) throw std::runtime_error("open_qwen36: no configuration for context " + name);
+        return *one_;
+    }
     auto it = ctxs_.find(name);
     if (it != ctxs_.end()) return *it->second;
     fs::path p = fs::path(cfg_.kernel_dir) / w_->contexts.at(name);
@@ -1632,6 +1763,22 @@ Core::Inflight Core::start_run(Kern& k, const std::vector<std::string>& args, in
     f.ctx_change = last_dispatched_ && last_dispatched_->ctx != k.ctx;
     last_dispatched_ = &k;
     ++dispatches_;
+    if (one_ctx_ > 0 && k.ctx != cfg_cur_) {
+        // the array holds another design: its configuration run first (the context runs its
+        // commands in order)
+        const CfgStream& c = cfgs_.at(k.ctx);
+        f.cfg = xrt::run(*cfg_k_);
+        f.cfg.set_arg(0, kOpcode);
+        f.cfg.set_arg(1, *c.instr);
+        f.cfg.set_arg(2, static_cast<int>(c.words));
+        int i = 3;
+        for (const auto& a : args) f.cfg.set_arg(i++, buffer(a, layer));
+        f.cfg.start();
+        f.has_cfg = true;
+        if (one_ctx_ > 1) f.cfg.wait();
+        cfg_cur_ = k.ctx;
+        ++cfg_runs_;
+    }
     f.r = xrt::run(*k.k);
     f.r.set_arg(0, kOpcode);
     f.r.set_arg(1, *k.instr);
@@ -1645,6 +1792,8 @@ Core::Inflight Core::start_run(Kern& k, const std::vector<std::string>& args, in
 }
 
 std::pair<double, double> Core::wait_run(Inflight& f) {
+    // the configuration run in front of it ran first; XRT must see it done before it is destroyed
+    if (f.has_cfg) { f.cfg.wait(); f.has_cfg = false; }
     Kern& k = *f.k;
     const int layer = f.layer;
     const double gap_ms = f.gap_ms;
@@ -6867,6 +7016,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                          "hpack %.0f res %.0f idle %.0f\n",
                  N, C, M, L, timing_.total_ms, npu_busy_ms, n_fa, fa_ms, npu_idle_ms, hst[PRE], hst[MID], timing_.dn_conv_ms,
                  timing_.dn_rule_ms, timing_.attn_ms, hst[GATE], hst[TAIL], hst[HPACK], hst[RES], host_idle_ms);
+    if (one_ctx_ > 0) std::fprintf(stderr, "open_qwen36: one context: %zu configuration runs so far\n", cfg_runs_);
     if (mbp)
         std::fprintf(stderr, "open_qwen36: pipe MoE: experts on the NPU %.0f ms; host route + gather %.0f (router %.0f, gate %.0f, "
                              "gather %.0f, x sync %.0f, slot plan %.0f), scatter %.0f (y read back %.0f) ms\n",

@@ -191,6 +191,15 @@ each layer over the whole prompt before the next layer. LFM2-MoE 24B went 19 -> 
   shares power between CPU and NPU, so host stages vary +-20 % run to run; compare A/B runs
   back to back.
 
+## 6b. After the port: speed work
+
+- Use `npu-speed-push` for the method (constraint tracker, measurement beside a GPU job,
+  memory safety, the bit-identical rule, A3B's wins and dead ends).
+- Hardware-context switches between full-array xclbins cost ~5.5 ms on the Strix (~0.17 ms a
+  core), not the 0.6-0.8 ms above. Either merge into one image (section 5) or keep the designs
+  and run their CDOs as configuration streams in one context (`full-elf-context`, "Classic
+  flow"; `OFLM_OPEN_ONE_CTX`).
+
 ## 7. Hygiene
 
 - Generated kernel TUs (`designs/<x>/*.cc` written by gen_kernels.py) must be gitignored AND
