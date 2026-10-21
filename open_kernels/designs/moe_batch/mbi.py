@@ -48,6 +48,8 @@ from ironutil import Pipeline, include_dirs  # noqa: E402
 
 N_ROWS, N_COLS = 4, 8
 NT = int(os.environ.get("MBI_NT", 16))           # tokens a core
+P = int(os.environ.get("MBI_P", 1))              # columns that share one expert's weight stream
+NG = N_COLS // P                                 # experts in flight
 NTG = NT // 4
 HID = int(os.environ.get("MBI_HID", 2048))
 FF = int(os.environ.get("MBI_FF", 512))
@@ -78,7 +80,7 @@ L1 = 2 * BAND + 2 * XEL + CB + 2 * ACC * 4 + HQ + HMETA + STACK
 
 assert NT == 16, "mbi_core.h is written for 16 tokens a core (four token groups, two a pass)"
 assert FF % 128 == 0 and HID % 256 == 0 and FF % 256 == 0 and FF <= 512, "the h buffer holds two down k-groups"
-assert SLOTS % N_COLS == 0 and SLOTS <= EXPERTS
+assert N_COLS % P == 0 and SLOTS % N_COLS == 0 and SLOTS // P <= EXPERTS
 assert POOL_DOWN + EXPERTS * DOWN_BYTES <= POOL_BYTES
 assert L1 <= 64 << 10, f"mbi.py: a core wants {L1} B of L1"
 
@@ -115,9 +117,10 @@ def mbi(pool: In, x: In, y: Out, *, slots: CompileTime[int], srchash: CompileTim
     k_dn = ef("mbi_dn", [band_ty, hq_ty, hm_ty, acc_ty, np.int32])
     k_out = ef("mbi_out", [acc_ty, c_ty, hm_ty])
 
-    # weights: one element a band k-group, broadcast from the mem tile to the column's four rows
-    W = [ObjectFifo(band_ty, name=f"W{c}", depth=2) for c in range(N_COLS)]
-    W_l1 = [W[c].cons().forward(obj_type=band_ty, name=f"W{c}_l1", depth=2, tile=Tile(c, 1)) for c in range(N_COLS)]
+    # weights: one element a band k-group, broadcast from the mem tile to the four rows of the P
+    # columns that share the expert (a visit of 64 P tokens: column c takes its 64 tokens c % P)
+    W = [ObjectFifo(band_ty, name=f"W{g}", depth=2) for g in range(NG)]
+    W_l1 = [W[g].cons().forward(obj_type=band_ty, name=f"W{g}_l1", depth=2, tile=Tile(g * P, 1)) for g in range(NG)]
     # x: the slot's four rows in one mem-tile object, split by row, each part replayed NPB * 2 times
     # and consumed one k-group element at a time (consumer_obj_type: split() does not take it)
     X = [ObjectFifo(xslot_ty, name=f"X{c}", depth=1) for c in range(N_COLS)]
@@ -180,7 +183,7 @@ def mbi(pool: In, x: In, y: Out, *, slots: CompileTime[int], srchash: CompileTim
             c_out.release(1)
 
     workers = [Worker(core_fn,
-                      [W_l1[c].cons(), X_l1[c][r].cons(), C_l1[c][r].prod(), k_zero, k_ug, k_hq, k_dn, k_out,
+                      [W_l1[c // P].cons(), X_l1[c][r].cons(), C_l1[c][r].prod(), k_zero, k_ug, k_hq, k_dn, k_out,
                        au[r][c], ag[r][c], hq[r][c], hm[r][c]],
                       tile=Tile(c, 2 + r), stack_size=STACK)
                for c in range(N_COLS) for r in range(N_ROWS)]
@@ -193,7 +196,7 @@ def mbi(pool: In, x: In, y: Out, *, slots: CompileTime[int], srchash: CompileTim
         return TensorAccessPattern((POOL_BYTES,), POOL_DOWN + slot * DOWN_BYTES, [NOB * KG_DN, 4, 2560],
                                    [BAND, 2560, 1])
 
-    W_p = [W[c].prod(tile=Tile(c, 0)) for c in range(N_COLS)]
+    W_p = [W[g].prod(tile=Tile(g * P, 0)) for g in range(NG)]
     X_p = [X[c].prod(tile=Tile(c, 0)) for c in range(N_COLS)]
     C_c = [C[c].cons(tile=Tile(c, 0)) for c in range(N_COLS)]
 
@@ -210,16 +213,17 @@ def mbi(pool: In, x: In, y: Out, *, slots: CompileTime[int], srchash: CompileTim
             px.fill(X_hs[c], a_x, lin(X_BYTES, c * XSLOT, XSLOT))
         for rnd in range(rounds):
             slot = [rnd * N_COLS + c for c in range(N_COLS)]
+            visit = [rnd * NG + g for g in range(NG)]   # compiled as expert visit (moebatch patches it)
             for c in range(N_COLS):                  # drains before fills (npu-model-porting)
                 py.drain(C_hs[c], a_y, y_tap(slot[c]))
             for pb in range(NPB):
-                for c in range(N_COLS):
-                    pw.fill(W_hs[c], a_pool, up_tap(slot[c], pb))
+                for g in range(NG):
+                    pw.fill(W_hs[g], a_pool, up_tap(visit[g], pb))
             if rnd + 1 < rounds:
                 for c in range(N_COLS):
                     px.fill(X_hs[c], a_x, lin(X_BYTES, (slot[c] + N_COLS) * XSLOT, XSLOT))
-            for c in range(N_COLS):
-                pw.fill(W_hs[c], a_pool, down_tap(slot[c]))
+            for g in range(NG):
+                pw.fill(W_hs[g], a_pool, down_tap(visit[g]))
         pw.finish()
         px.finish()
         py.finish()
@@ -232,11 +236,11 @@ DESIGN = mbi
 _src = b"".join([(HERE / "mbi.py").read_bytes(), (HERE / "mbi_core.h").read_bytes()]
                 + sorted(f.read_bytes() for f in HERE.glob("mbi_*.cc"))
                 + [(HERE.parent.parent / "include" / "vecmath.h").read_bytes()]
-                + [f"{k}={v}".encode() for k, v in (("NT", NT), ("HID", HID), ("FF", FF), ("EXPERTS", EXPERTS),
+                + [f"{k}={v}".encode() for k, v in (("NT", NT), ("P", P), ("HID", HID), ("FF", FF), ("EXPERTS", EXPERTS),
                                                      ("POOL_DOWN", POOL_DOWN), ("POOL_BYTES", POOL_BYTES),
                                                      ("DEFS", os.environ.get("MBI_DEFS", "")), ("STACK", STACK), ("CFLAGS", " ".join(MBI_CFLAGS)))])
 SPECIALIZE = {"slots": SLOTS, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}
 
 if __name__ == "__main__":
-    print(f"HID={HID} FF={FF} NT={NT} L1={L1} SLOTS={SLOTS} EXPERTS={EXPERTS} XEL={XEL} XSLOT={XSLOT} "
+    print(f"HID={HID} FF={FF} NT={NT} P={P} L1={L1} SLOTS={SLOTS} EXPERTS={EXPERTS} XEL={XEL} XSLOT={XSLOT} "
           f"YSLOT={YSLOT} POOL_DOWN={POOL_DOWN} POOL_BYTES={POOL_BYTES}")

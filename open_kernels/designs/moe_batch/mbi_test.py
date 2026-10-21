@@ -1,6 +1,6 @@
-"""inputs + reference for mbi.py (MBI_SLOTS = MBI_EXPERTS = E, slot s = expert s):
-mbi_test.py gen OUTDIR [E] [full | rand] | check OUTDIR"""
-import sys, numpy as np
+"""inputs + reference for mbi.py (MBI_SLOTS = MBI_EXPERTS = E, slot s = expert s / MBI_P: the
+kernel's visit v is compiled as expert v): MBI_P=p mbi_test.py gen OUTDIR [E] [full | rand] | check OUTDIR"""
+import os, sys, numpy as np
 from pathlib import Path
 from ml_dtypes import bfloat16
 
@@ -13,6 +13,7 @@ CH = 5120
 STRIPE = 128 * HID * 5 // 8
 EXP_UG = 2 * (FF // 128) * STRIPE
 DOWN_BYTES = HID * FF * 5 // 8
+P = int(os.environ.get("MBI_P", 1))
 XEL = 64 + 16 * NTG * 64 + 8 * NTG * 128 + NTG * 128
 
 
@@ -58,7 +59,9 @@ if mode == "gen":
     xb = bytearray(E * ROWS * 8 * XEL)
     ref = np.zeros((E, TOK, HID))
     nvs = np.full(E, TOK) if NV_MODE == "full" else rng.integers(1, TOK + 1, E)
-    for e in range(E):
+    for slot in range(E):
+      e = slot // P
+      if slot % P == 0:
         up, gate, dn = q41_matrix(rng, FF, HID), q41_matrix(rng, FF, HID), q41_matrix(rng, HID, FF)
         S_ug, S_dn = shift_for([up, gate]), shift_for([dn])
         for sp in range(FF // 128):
@@ -72,6 +75,7 @@ if mode == "gen":
                 for ci in range(4):
                     off = E * EXP_UG + e * DOWN_BYTES + st * 128 * FF * 5 // 8 + (kg * 4 + ci) * CH
                     pool[off:off + CH] = chunk_bytes(*dn, 128 * st + 32 * ci, kg, S_dn)
+      if True:
         xf = rng.normal(0, 1, (TOK, HID))
         x = np.zeros_like(xf)
         for r in range(ROWS):
@@ -81,18 +85,18 @@ if mode == "gen":
                 xq = np.clip(np.rint(xs / sx[:, None]), -127, 127).astype(np.int8)
                 x[r * NT:(r + 1) * NT, kg * 256:(kg + 1) * 256] = xq * sx[:, None]
                 hdr = np.zeros(16, np.int32); hdr[0], hdr[1] = S_ug, S_dn
-                hdr[2] = min(max(int(nvs[e]) - NT * r, 0), NT)
+                hdr[2] = min(max(int(nvs[slot]) - NT * r, 0), NT)
                 xa = xq.reshape(NTG, 4, 16, 16).transpose(2, 0, 1, 3)          # [kt][tg][t][k]
                 s = xq.astype(np.int32).reshape(NT, 8, 32).sum(2)               # [tok][blk]
                 qs = np.repeat(s.T.reshape(8, NTG, 4, 1), 16, 3).astype(np.int16)
                 sxt = np.repeat(sx.reshape(NTG, 4, 1), 16, 2).astype(bfloat16)
                 el = hdr.tobytes() + xa.tobytes() + qs.tobytes() + sxt.tobytes()
                 assert len(el) == XEL
-                off = ((e * ROWS + r) * 8 + kg) * XEL
+                off = ((slot * ROWS + r) * 8 + kg) * XEL
                 xb[off:off + XEL] = el
         h = silu(x @ deq(*gate).T) * (x @ deq(*up).T)
-        ref[e] = h @ deq(*dn).T
-        print(f"expert {e}: S_ug {S_ug} S_dn {S_dn} |y| {np.abs(ref[e]).mean():.3e}")
+        ref[slot] = h @ deq(*dn).T
+        print(f"slot {slot} expert {e}: S_ug {S_ug} S_dn {S_dn} |y| {np.abs(ref[e]).mean():.3e}")
     (out / "pool.bin").write_bytes(bytes(pool)); (out / "x.bin").write_bytes(bytes(xb))
     np.save(out / "ref.npy", ref); np.save(out / "nv.npy", nvs)
     print("pool", len(pool), "x", len(xb), "y", E * TOK * HID * 2)

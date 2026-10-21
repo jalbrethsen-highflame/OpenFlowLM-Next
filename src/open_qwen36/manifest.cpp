@@ -424,6 +424,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                         b.nt = get<uint64_t>(bj, "nt", bw);
                         b.args = get<std::vector<std::string>>(bj, "args", bw);
                         if (bj.contains("kind")) b.kind = bj["kind"].get<std::string>();
+                        if (bj.contains("p")) b.p = bj["p"].get<size_t>();
+                        if (b.p == 0 || 8 % b.p || (b.p > 1 && b.kind != "mbi")) fail(bw, "p must divide 8 (mbi only)");
                         if (!b.kind.empty() && b.kind != "mbi") fail(bw, "unknown kind " + b.kind);
                         const size_t nargs = b.kind == "mbi" ? 3 : 4;
                         if (b.nt == 0 || b.args.size() != nargs || b.args[0] != "pool")

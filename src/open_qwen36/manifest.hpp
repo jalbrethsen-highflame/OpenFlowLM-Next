@@ -98,6 +98,9 @@ struct MoeBatch {
     std::map<size_t, std::string> kernels;   ///< slots -> kernel name
     std::vector<std::string> args;           ///< pool, then the x / h / y globals (mbi: x / y)
     size_t nt = 0;                           ///< token slots per expert visit
+    /// mbi: the columns that share one expert's weight stream (a visit is p slots of nt tokens;
+    /// the stream's expert fills are per visit)
+    size_t p = 1;
     /// "" (moe_batch.py / mbe.py: bf16 x, h through DDR) or "mbi" (designs/moe_batch/mbi.py: int8
     /// k-group x elements, bf16 y, and the pool's routed experts transformed at load)
     std::string kind;

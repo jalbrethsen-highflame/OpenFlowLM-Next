@@ -344,6 +344,27 @@ static inline void mbi_hq_band(float *__restrict au, const float *__restrict ag,
       sa.from_vector(aie::load_v<16>(sk + b * MBI_NT));
       aie::store_v(rel + b * MBI_NT, aie::to_fixed<int16>(fmulN<16>(sa.template to_vector<float>(), r), 14));
     }
+#ifdef MBI_HKG
+    // MBI_HKG (opt-in: no faster when the DMA binds, rel 2.2 % against 1.7 %): one h scale a k-group: the four bands' int8 h requantized to smax (q rel, rel <= 1 in Q14;
+    // the largest band's values stay as they are) and their block sums made again, so the down
+    // has no per-band scale in its loop
+    for (unsigned b = 0; b < 4; ++b)
+      for (unsigned tg = 0; tg < ntg; ++tg) {
+        const aie::vector<int16, 64> rv = mbi_tok4i(rel + b * MBI_NT + tg * 4);
+        for (unsigned b2 = 0; b2 < 2; ++b2) {
+          aie::vector<int16, 64> qs16;
+          for (unsigned j = 0; j < 2; ++j) {
+            int8_t *__restrict p = hq + ((kg * 16 + 4 * b + 2 * b2 + j) * MBI_NTG + tg) * 64;
+            const aie::vector<int8, 64> q = aie::mul(aie::load_v<64>(p).template unpack<int16>(), rv).template to_vector<int8>(14);
+            aie::store_v(p, q);
+            const aie::vector<int16, 64> q16 = q.template unpack<int16>();
+            qs16 = j ? aie::add(qs16, q16) : q16;
+          }
+          for (unsigned t = 0; t < 4; ++t)
+            qsum[(kg * 8 + b * 2 + b2) * MBI_NT + tg * 4 + t] = (int16)aie::reduce_add(qs16.template extract<16>(t));
+        }
+      }
+#endif
   }
   aie::set_rounding(saved);
 }
@@ -357,6 +378,7 @@ static inline void mbi_dn_kg(const uint8_t *__restrict band, const int8_t *__res
   const int shift = *reinterpret_cast<const int32_t *>(hmeta);
   const unsigned ntg = mbi_ntg(reinterpret_cast<const int32_t *>(hmeta)[3]);
   const int16 *__restrict rel = reinterpret_cast<const int16 *>(hmeta + MBI_HM_REL) + kg * 4 * MBI_NT;
+  (void)rel;
   const bfloat16 *__restrict smax = reinterpret_cast<const bfloat16 *>(hmeta + MBI_HM_SMAX) + kg * MBI_NT;
   const int16 *__restrict qsum = reinterpret_cast<const int16 *>(hmeta + MBI_HM_QS);
   const int8_t *__restrict xa = hq + kg * 16 * MBI_NTG * 64;
@@ -373,9 +395,11 @@ static inline void mbi_dn_kg(const uint8_t *__restrict band, const int8_t *__res
 #pragma unroll MBI_DN_UNROLL
 #endif
       for (unsigned blk = 0; blk < 8; ++blk) {
+#ifndef MBI_HKG
         const unsigned bp = blk >> 1;
         const aie::vector<int16, 64> r0 = mbi_tok4i(rel + bp * MBI_NT + tg * 4);
         const aie::vector<int16, 64> r1 = mbi_tok4i(rel + bp * MBI_NT + (tg + 1) * 4);
+#endif
         const aie::vector<int4, 256> b0 = aie::load_v<128>(nib + blk * 256).template cast_to<int4>();
         const aie::vector<int4, 256> b1 = aie::load_v<128>(nib + blk * 256 + 128).template cast_to<int4>();
         const aie::vector<int16, 64> dt = mbi_rep4(aie::load_v<16>(di + blk * 32));
@@ -385,11 +409,18 @@ static inline void mbi_dn_kg(const uint8_t *__restrict band, const int8_t *__res
         m1.mul(aie::load_v<64>(xa + ((2 * blk) * MBI_NTG + tg + 1) * 64), b0);
         m0.mac(aie::load_v<64>(xa + ((2 * blk + 1) * MBI_NTG + tg) * 64), b1);
         m1.mac(aie::load_v<64>(xa + ((2 * blk + 1) * MBI_NTG + tg + 1) * 64), b1);
+        const int16 *__restrict qb = qsum + (kg * 8 + blk) * MBI_NT;
+#ifndef MBI_HKG
         a0 = aie::mac(a0, m0.template to_vector<int16>(0), aie::mul(dt, r0).template to_vector<int16>(14));
         a1 = aie::mac(a1, m1.template to_vector<int16>(0), aie::mul(dt, r1).template to_vector<int16>(14));
-        const int16 *__restrict qb = qsum + (kg * 8 + blk) * MBI_NT;
         a0 = aie::mac(a0, aie::mul(mt, r0).template to_vector<int16>(14), mbi_tok4i(qb + tg * 4));
         a1 = aie::mac(a1, aie::mul(mt, r1).template to_vector<int16>(14), mbi_tok4i(qb + (tg + 1) * 4));
+#else
+        a0 = aie::mac(a0, m0.template to_vector<int16>(0), dt);
+        a1 = aie::mac(a1, m1.template to_vector<int16>(0), dt);
+        a0 = aie::mac(a0, mt, mbi_tok4i(qb + tg * 4));
+        a1 = aie::mac(a1, mt, mbi_tok4i(qb + (tg + 1) * 4));
+#endif
       }
       float *__restrict o0 = acc + (rg * MBI_NTG + tg) * 64;
       mbi_epi(o0, a0, shift, mbi_tok4b(smax + tg * 4));
