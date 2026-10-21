@@ -38,6 +38,10 @@
 
 namespace open_qwen36 {
 
+namespace {
+bool g_mbi_qsc = false;   // the mbi x elements' compact block sums (moe_batch.xq "compact"; one model a process)
+}  // namespace
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -851,8 +855,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
                        : " (no gemm_block program in this kernel set, or its layer types disagree)"));
     // the token-batched expert kernel: every stream's slot count must be what the manifest says
     if (const char* env = std::getenv("OFLM_OPEN_MOE_BATCH")) moe_batch_on_ = std::string(env) != "0";
-    for (int l = 0; l < nl_; ++l)
+    for (int l = 0; l < nl_; ++l) {
         mbi_on_ = mbi_on_ || (moe_batch_on_ && types_[l]->gemm_block.moe_batch.kind == "mbi");
+        if (types_[l]->gemm_block.moe_batch.kind == "mbi") g_mbi_qsc = types_[l]->gemm_block.moe_batch.xq == "compact";
+    }
     if (const char* env = std::getenv("OFLM_OPEN_ATTN_BLOCK")) attn_block_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_LAYER_MAJOR")) layer_major_on_ = std::string(env) != "0";
     if (const char* env = std::getenv("OFLM_OPEN_STAGE_MAJOR")) stage_major_on_ = std::string(env) != "0";
@@ -3216,7 +3222,9 @@ namespace {
 // 16 r + 15, and its x is [row 4][k-group 8][element]; an element is [header 64 B: S_ug, S_dn, the
 // row's real tokens | xa int8 [16 k-tiles][4 token groups][4][16] | qs int16 [8 blocks][4 tg][64]
 // (lane 16 t + n: token t's block sum) | sx bf16 [4 tg][64]]. y bf16 [token 64][2048] a slot.
-constexpr size_t kMbiXel = 64 + 16 * 4 * 64 + 8 * 4 * 128 + 4 * 128, kMbiXslot = 4 * 8 * kMbiXel;
+// moe_batch.xq "compact" (g_mbi_qsc): qs is int16 [4 tg][2 block halves][4 tokens][4 blocks] (256 B).
+inline size_t mbi_xel() { return 64 + 16 * 4 * 64 + (g_mbi_qsc ? 256 : 8 * 4 * 128) + 4 * 128; }
+inline size_t mbi_xslot() { return 4 * 8 * mbi_xel(); }
 constexpr size_t kMbiYslot = 32 * 4 * 2048;   // bytes
 // per row of x [T, 2048]: int8 per (row, 256-K group) at a bf16 scale (|q| <= 127 with amax / 126),
 // the scales [T, 8] and the block sums [T, 64]
@@ -3278,7 +3286,7 @@ void mbi_headers(uint8_t* xs, int s_ug, int s_dn, size_t ntok) {
     for (size_t r = 0; r < 4; ++r)
         for (size_t kg = 0; kg < 8; ++kg) {
             int32_t h[3] = {s_ug, s_dn, static_cast<int32_t>(std::min<size_t>(16, ntok > 16 * r ? ntok - 16 * r : 0))};
-            std::memcpy(xs + (r * 8 + kg) * kMbiXel, h, sizeof h);
+            std::memcpy(xs + (r * 8 + kg) * mbi_xel(), h, sizeof h);
         }
 }
 // 16 copies of a 16-bit value (32 bytes)
@@ -3291,9 +3299,15 @@ inline void mbi_fill16(uint8_t* d, uint16_t v) {
 void mbi_pack_token(uint8_t* xs, size_t j, const int8_t* q, const uint16_t* sx, const int16_t* qs) {
     const size_t r = j / 16, tg = (j % 16) / 4, t = j % 4;
     for (size_t kg = 0; kg < 8; ++kg) {
-        uint8_t* el = xs + (r * 8 + kg) * kMbiXel;
+        uint8_t* el = xs + (r * 8 + kg) * mbi_xel();
         for (size_t kt = 0; kt < 16; ++kt) std::memcpy(el + 64 + ((kt * 4 + tg) * 4 + t) * 16, q + kg * 256 + kt * 16, 16);
         uint8_t* qd = el + 64 + 4096;
+        if (g_mbi_qsc) {
+            int16_t* qc = reinterpret_cast<int16_t*>(qd);
+            for (size_t b = 0; b < 8; ++b) qc[((tg * 2 + b / 4) * 4 + t) * 4 + b % 4] = qs[kg * 8 + b];
+            mbi_fill16(el + 64 + 4096 + 256 + (tg * 64 + t * 16) * 2, sx[kg]);
+            continue;
+        }
         for (size_t b = 0; b < 8; ++b) mbi_fill16(qd + ((b * 4 + tg) * 64 + t * 16) * 2, static_cast<uint16_t>(qs[kg * 8 + b]));
         mbi_fill16(el + 64 + 8192 + (tg * 64 + t * 16) * 2, sx[kg]);
     }
@@ -3316,7 +3330,7 @@ void mbi_pack_group4(uint8_t* xs, size_t g, const int8_t* const* q, const uint16
     for (int t = 0; t < 4; ++t) { qq[t] = q[t] ? q[t] : zq; ss[t] = sx[t] ? sx[t] : zs; qv[t] = qs[t] ? qs[t] : zqs; }
     const size_t r = g / 4, tg = g % 4;
     for (size_t kg = 0; kg < 8; ++kg) {
-        uint8_t* el = xs + (r * 8 + kg) * kMbiXel;
+        uint8_t* el = xs + (r * 8 + kg) * mbi_xel();
         for (size_t kt = 0; kt < 16; ++kt) {
             const size_t o = kg * 256 + kt * 16;
             __m512i v = _mm512_castsi128_si512(_mm_loadu_si128(reinterpret_cast<const __m128i*>(qq[0] + o)));
@@ -3325,12 +3339,21 @@ void mbi_pack_group4(uint8_t* xs, size_t g, const int8_t* const* q, const uint16
             v = _mm512_inserti32x4(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(qq[3] + o)), 3);
             _mm512_storeu_si512(el + 64 + (kt * 4 + tg) * 64, v);
         }
-        for (size_t b = 0; b < 8; ++b) {
-            uint8_t* d = el + 64 + 4096 + (b * 4 + tg) * 128;
-            _mm512_storeu_si512(d, mbi_pair16(qv[0][kg * 8 + b], qv[1][kg * 8 + b]));
-            _mm512_storeu_si512(d + 64, mbi_pair16(qv[2][kg * 8 + b], qv[3][kg * 8 + b]));
+        if (g_mbi_qsc) {
+            // [2 block halves][4 tokens][4 blocks]: each half of a token's 8 sums is 8 contiguous bytes
+            int16_t* qc = reinterpret_cast<int16_t*>(el + 64 + 4096) + tg * 32;
+            for (int t = 0; t < 4; ++t) {
+                std::memcpy(qc + t * 4, qv[t] + kg * 8, 8);
+                std::memcpy(qc + 16 + t * 4, qv[t] + kg * 8 + 4, 8);
+            }
+        } else {
+            for (size_t b = 0; b < 8; ++b) {
+                uint8_t* d = el + 64 + 4096 + (b * 4 + tg) * 128;
+                _mm512_storeu_si512(d, mbi_pair16(qv[0][kg * 8 + b], qv[1][kg * 8 + b]));
+                _mm512_storeu_si512(d + 64, mbi_pair16(qv[2][kg * 8 + b], qv[3][kg * 8 + b]));
+            }
         }
-        uint8_t* d = el + 64 + 8192 + tg * 128;
+        uint8_t* d = el + 64 + 4096 + (g_mbi_qsc ? 256 : 4096) + tg * 128;
         _mm512_storeu_si512(d, mbi_pair16(static_cast<int16_t>(ss[0][kg]), static_cast<int16_t>(ss[1][kg])));
         _mm512_storeu_si512(d + 64, mbi_pair16(static_cast<int16_t>(ss[2][kg]), static_cast<int16_t>(ss[3][kg])));
     }
@@ -3549,7 +3572,7 @@ void Core::mbv_gemv(int l, const uint8_t* w, size_t n, size_t k, const float* in
     constexpr size_t NN = kMbvRows, Q = NN / 64 / 32, YB = 32 * Q * 4 * 256 * 4;   // y: [c][j][r][4 rg][4 tg][64] f32
     Kern& mk = kerns_.at("mbv_k2048");
     if (!globals_.count("mbv_x")) {
-        globals_.emplace("mbv_x", alloc(kMbiXslot));
+        globals_.emplace("mbv_x", alloc(mbi_xslot()));
         globals_.emplace("mbv_y", alloc(YB));
     }
     static thread_local std::vector<int8_t> q;
@@ -3561,7 +3584,7 @@ void Core::mbv_gemv(int l, const uint8_t* w, size_t n, size_t k, const float* in
     uint8_t* xs = xb.map<uint8_t*>();
     mbi_headers(xs, mbv_s_[static_cast<size_t>(l)], 0, R);
     for (size_t j = 0; j < R; ++j) mbi_pack_token(xs, j, q.data() + j * 2048, sx.data() + j * 8, qs.data() + j * 64);
-    xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 8 * kMbiXel, 0);
+    xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 8 * mbi_xel(), 0);
     if (mk.argbase != mbv_off_[static_cast<size_t>(l)]) {
         stream_patch::arg_apply(mk.iw(), mk.argp, mbv_off_[static_cast<size_t>(l)]);
         mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -3595,7 +3618,7 @@ Core::Inflight Core::dec_npu_start(int l, const float* xn, size_t R, const ExRow
     if (mb.p != 1) throw std::runtime_error("open_qwen36: dec_npu: wants mbi streams with one column a visit (p 1)");
     if (!globals_.count("dmb_x")) {
         // rows 1..3 of every slot stay empty (headers 0 from alloc): decode rows land in row 0
-        globals_.emplace("dmb_x", alloc(32 * kMbiXslot));
+        globals_.emplace("dmb_x", alloc(32 * mbi_xslot()));
         globals_.emplace("dmb_y", alloc(32 * kMbiYslot));
     }
     static thread_local std::vector<int8_t> q;
@@ -3608,7 +3631,7 @@ Core::Inflight Core::dec_npu_start(int l, const float* xn, size_t R, const ExRow
     const int8_t* S = mbi_s_.at(static_cast<size_t>(l)).data();
     std::vector<uint32_t> ids(slots, 0);
     for (size_t i = 0; i < slots; ++i) {
-        uint8_t* xs = xm + i * kMbiXslot;
+        uint8_t* xs = xm + i * mbi_xslot();
         int32_t h[3] = {0, 0, 0};
         if (i < exn.size()) {
             const uint32_t e = exn[i].first;
@@ -3619,8 +3642,8 @@ Core::Inflight Core::dec_npu_start(int l, const float* xn, size_t R, const ExRow
                 mbi_pack_token(xs, j, q.data() + r * 2048, sx.data() + r * 8, qs.data() + r * 64);
             }
         }
-        for (size_t kg = 0; kg < 8; ++kg) std::memcpy(xs + kg * kMbiXel, h, sizeof h);
-        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 8 * kMbiXel, i * kMbiXslot);
+        for (size_t kg = 0; kg < 8; ++kg) std::memcpy(xs + kg * mbi_xel(), h, sizeof h);
+        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 8 * mbi_xel(), i * mbi_xslot());
     }
     Kern& mk = kerns_.at(*kn);
     stream_patch::moe2_apply(mk.iw(), mk.moe2, ids.data(), w_->moe);
@@ -6585,7 +6608,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                 const int8_t* S = mbi_s_.at(l).data();
 #pragma omp parallel for
                                 for (long long i = 0; i < static_cast<long long>(slots); ++i) {
-                                    uint8_t* xs = xm + static_cast<size_t>(i) * kMbiXslot;
+                                    uint8_t* xs = xm + static_cast<size_t>(i) * mbi_xslot();
                                     const size_t vi = static_cast<size_t>(i) / Pv;
                                     if (vi >= n) { mbi_headers(xs, 0, 0, 0); continue; }
                                     const auto& [e, off0] = visits[done + vi];
@@ -6606,7 +6629,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                     }
                                 }
                                 auto ts = std::chrono::steady_clock::now();
-                                xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, slots * kMbiXslot, 0);
+                                xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, slots * mbi_xslot(), 0);
                                 sadd(moe_ms[3], ms_since(ts));
                                 ms.passes.push_back(std::move(mp));
                                 done += n;

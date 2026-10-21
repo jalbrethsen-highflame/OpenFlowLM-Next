@@ -1100,7 +1100,11 @@ MBI_NT = 64
 # visit 64 P tokens. P 2 halves the weight reads of the busy experts (DDR-bound with the GPU busy:
 # 256 slots 18.5 -> 14.7 ms); the cores' weight stream then binds.
 MBI_P = int(os.environ.get("OPEN_QWEN36_MBI_P", "1"))
-MBI_XSLOT = 4 * 8 * (64 + 16 * 4 * 64 + 8 * 4 * 128 + 4 * 128)     # mbi.py's XSLOT at HID 2048
+# OPEN_QWEN36_MBI_QSC (default on; 0 the 16x replicated sums): the x elements carry each token's block
+# sums once (mbi.py MBI_QSC, moe_batch.xq "compact"; the kernel's qsum term as int16 matrix products,
+# bit-identical): x 8768 -> 4928 B an element, host gather + x sync -2.5 s at 30K with the GPU busy
+MBI_QSC = os.environ.get("OPEN_QWEN36_MBI_QSC", "1") != "0"
+MBI_XSLOT = 4 * 8 * (64 + 16 * 4 * 64 + (256 if os.environ.get("OPEN_QWEN36_MBI_QSC", "1") != "0" else 8 * 4 * 128) + 4 * 128)   # mbi.py's XSLOT at HID 2048
 MBI_YSLOT = 32 * 4 * 2048                                         # mbi.py's YSLOT at HID 2048
 if MBI:
     MB_NT = MBI_NT
@@ -1246,7 +1250,8 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
     if not dense:
         check_buffer_args("moe_batch", mb_args)
     moe_batch = {"kernels": {str(s): f"mb_s{s}" for s in mb_slots}, "args": mb_args, "nt": MB_NT,
-                 **({"kind": "mbi"} if MBI else {}), **({"p": MBI_P} if MBI and MBI_P != 1 else {})}
+                 **({"kind": "mbi"} if MBI else {}), **({"p": MBI_P} if MBI and MBI_P != 1 else {}),
+                 **({"xq": "compact"} if MBI and MBI_QSC else {})}
 
     # Block attention as two bf16 GEMMs per kv head (OPEN-PREFILL-ATTN, designs/attn_block): the
     # group's 8 query heads x T tokens against the window, scores then values, the row softmax on
@@ -1369,10 +1374,10 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
         if MBI:
             if hid != 2048 or ff != 512:
                 raise OpRangeError(f"mbi: built for hidden 2048 / expert ff 512, not {hid} / {ff}")
-            psfx = f"_p{MBI_P}" if MBI_P != 1 else ""
+            psfx = (f"_p{MBI_P}" if MBI_P != 1 else "") + ("_qsc" if MBI_QSC else "")
             out["builds"][name] = {"design": "moe_batch/mbi.py", "build_dir": f"moe_batch/build_mbi_s{s}{psfx}{sfx}",
                                    "env": {"MBI_SLOTS": str(s), "MBI_EXPERTS": str(E), "MBI_POOL_DOWN": str(L.POOL_DOWN),
-                                           "MBI_POOL_BYTES": str(L.POOL_BYTES), "MBI_P": str(MBI_P)}}
+                                           "MBI_POOL_BYTES": str(L.POOL_BYTES), "MBI_P": str(MBI_P), "MBI_QSC": "1" if MBI_QSC else "0"}}
             continue
         out["builds"][name] = {"design": "moe_batch/mbe.py" if MBE else "moe_batch/moe_batch.py",
                                "build_dir": f"moe_batch/build_{'mbe_' if MBE else ''}s{s}{sfx}",

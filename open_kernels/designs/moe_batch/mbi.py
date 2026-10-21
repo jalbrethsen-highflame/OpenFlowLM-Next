@@ -64,7 +64,8 @@ POOL_DOWN = int(os.environ.get("MBI_POOL_DOWN", EXPERTS * EXP_UG))
 POOL_BYTES = int(os.environ.get("MBI_POOL_BYTES", POOL_DOWN + EXPERTS * DOWN_BYTES))
 NPB, KG_UP, NOB, KG_DN = FF // 64, HID // 256, HID // 64, FF // 256
 
-XHDR, XA, QS, SX = 64, 16 * NTG * 64, 8 * NTG * 128, NTG * 128
+QSC = os.environ.get("MBI_QSC", "0") == "1"      # compact block sums (mbi_core.h MBI_QS_COMPACT): [NTG][2][4 tokens][4 blocks]
+XHDR, XA, QS, SX = 64, 16 * NTG * 64, (NTG * 4 * 8 * 2 if QSC else 8 * NTG * 128), NTG * 128
 XEL = XHDR + XA + QS + SX                        # one k-group of one row's tokens
 XROW = KG_UP * XEL
 XSLOT = N_ROWS * XROW
@@ -106,6 +107,7 @@ def mbi(pool: In, x: In, y: Out, *, slots: CompileTime[int], srchash: CompileTim
 
     inc = include_dirs() + [str(HERE)]
     flags = [f"-DMBI_NT={NT}"] + [f"-D{d}" for d in os.environ.get("MBI_DEFS", "").split(",") if d] + MBI_CFLAGS
+    flags += ["-DMBI_QS_COMPACT"] if QSC else []
 
     def ef(sym, args):
         return ExternalFunction(sym, source_file=str(HERE / f"{sym}.cc"), arg_types=args, include_dirs=inc,
@@ -236,7 +238,7 @@ DESIGN = mbi
 _src = b"".join([(HERE / "mbi.py").read_bytes(), (HERE / "mbi_core.h").read_bytes()]
                 + sorted(f.read_bytes() for f in HERE.glob("mbi_*.cc"))
                 + [(HERE.parent.parent / "include" / "vecmath.h").read_bytes()]
-                + [f"{k}={v}".encode() for k, v in (("NT", NT), ("P", P), ("HID", HID), ("FF", FF), ("EXPERTS", EXPERTS),
+                + [f"{k}={v}".encode() for k, v in (("NT", NT), ("P", P), ("QSC", QSC), ("HID", HID), ("FF", FF), ("EXPERTS", EXPERTS),
                                                      ("POOL_DOWN", POOL_DOWN), ("POOL_BYTES", POOL_BYTES),
                                                      ("DEFS", os.environ.get("MBI_DEFS", "")), ("STACK", STACK), ("CFLAGS", " ".join(MBI_CFLAGS)))])
 SPECIALIZE = {"slots": SLOTS, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

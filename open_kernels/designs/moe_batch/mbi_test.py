@@ -14,7 +14,8 @@ STRIPE = 128 * HID * 5 // 8
 EXP_UG = 2 * (FF // 128) * STRIPE
 DOWN_BYTES = HID * FF * 5 // 8
 P = int(os.environ.get("MBI_P", 1))
-XEL = 64 + 16 * NTG * 64 + 8 * NTG * 128 + NTG * 128
+QSC = os.environ.get("MBI_QSC", "0") == "1"      # compact block sums: int16 [NTG][2 block halves][4 tokens][4 blocks]
+XEL = 64 + 16 * NTG * 64 + (NTG * 4 * 8 * 2 if QSC else 8 * NTG * 128) + NTG * 128
 
 
 def q41_matrix(rng, rows, K):
@@ -88,7 +89,7 @@ if mode == "gen":
                 hdr[2] = min(max(int(nvs[slot]) - NT * r, 0), NT)
                 xa = xq.reshape(NTG, 4, 16, 16).transpose(2, 0, 1, 3)          # [kt][tg][t][k]
                 s = xq.astype(np.int32).reshape(NT, 8, 32).sum(2)               # [tok][blk]
-                qs = np.repeat(s.T.reshape(8, NTG, 4, 1), 16, 3).astype(np.int16)
+                qs = (s.reshape(NTG, 4, 2, 4).transpose(0, 2, 1, 3) if QSC else np.repeat(s.T.reshape(8, NTG, 4, 1), 16, 3)).astype(np.int16)
                 sxt = np.repeat(sx.reshape(NTG, 4, 1), 16, 2).astype(bfloat16)
                 el = hdr.tobytes() + xa.tobytes() + qs.tobytes() + sxt.tobytes()
                 assert len(el) == XEL

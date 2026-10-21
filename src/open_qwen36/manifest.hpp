@@ -101,6 +101,9 @@ struct MoeBatch {
     /// mbi: the columns that share one expert's weight stream (a visit is p slots of nt tokens;
     /// the stream's expert fills are per visit)
     size_t p = 1;
+    /// mbi: "compact" when the x elements carry each token's block sums once (mbi.py MBI_QSC: qs int16
+    /// [4 token groups][2 block halves][4 tokens][4 blocks]) instead of 16 times
+    std::string xq;
     /// "" (moe_batch.py / mbe.py: bf16 x, h through DDR) or "mbi" (designs/moe_batch/mbi.py: int8
     /// k-group x elements, bf16 y, and the pool's routed experts transformed at load)
     std::string kind;

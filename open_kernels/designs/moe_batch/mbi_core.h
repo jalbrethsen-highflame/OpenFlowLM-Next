@@ -169,7 +169,16 @@ static inline void mbi_epi(float *__restrict o, const aie::accum<acc32, 64> &a, 
 }
 
 static constexpr unsigned MBI_XHDR = 64;
-static constexpr unsigned MBI_XEL3 = MBI_XHDR + MBI_XEL;
+// MBI_QS_COMPACT: the block sums once, qsc int16 [NTG][2 block halves][4 tokens][4 blocks] (256 B,
+// not 4 KB), and the (m + 8 d) qsum term as dense int16 matrix products ([4 tokens x 4 blocks] x
+// [4 blocks x 8 rows], both halves, rows 0-7 and 8-15 zipped to the [token][16 rows] lanes) added
+// once after the blocks: the same integer sums, so the same results
+#ifdef MBI_QS_COMPACT
+static constexpr unsigned MBI_QS3 = MBI_NTG * 4 * 8 * 2;
+#else
+static constexpr unsigned MBI_QS3 = MBI_QS;
+#endif
+static constexpr unsigned MBI_XEL3 = MBI_XHDR + MBI_XA + MBI_QS3 + MBI_SX;
 // The x header's int32 2 is the row's count of real tokens (0..MBI_NT; a slot's last row is often
 // short, its later rows empty). The steps skip token-group pairs past it; their sums stay zero.
 static inline unsigned mbi_ntg(int nv) { return ((unsigned)(nv + 7) >> 3) * 2; }
@@ -179,13 +188,21 @@ static inline void mbi_band_kg3(const uint8_t *__restrict band, const uint8_t *_
   const unsigned ntg = mbi_ntg(reinterpret_cast<const int32_t *>(xel)[2]);
   const int8_t *__restrict xa = reinterpret_cast<const int8_t *>(xel + MBI_XHDR);
   const int16 *__restrict qs = reinterpret_cast<const int16 *>(xel + MBI_XHDR + MBI_XA);
-  const bfloat16 *__restrict sxb = reinterpret_cast<const bfloat16 *>(xel + MBI_XHDR + MBI_XA + MBI_QS);
+  const bfloat16 *__restrict sxb = reinterpret_cast<const bfloat16 *>(xel + MBI_XHDR + MBI_XA + MBI_QS3);
   for (unsigned rg = 0; rg < 4; ++rg) {
     const uint8_t *__restrict ch = band + (rg >> 1) * MBI_CHUNK;
     const unsigned rb = rg & 1;
     const uint8_t *__restrict nib = ch + 1024 + rb * 2048;
     const int16 *__restrict di = reinterpret_cast<const int16 *>(ch) + rb * 16;
     const int16 *__restrict mi = reinterpret_cast<const int16 *>(ch + 512) + rb * 16;
+#ifdef MBI_QS_COMPACT
+    // mc for rows 0-7 and 8-15 of the group as [8 blocks][8 rows] B tiles
+    aie::vector<int16, 32> mb[2][2];                     // [rows 0-7 / 8-15][blocks 0-3 / 4-7]: [4 blocks][8 rows]
+    for (unsigned blk = 0; blk < 8; ++blk) {
+      mb[0][blk >> 2].insert(blk & 3, aie::load_v<8>(mi + blk * 32));
+      mb[1][blk >> 2].insert(blk & 3, aie::load_v<8>(mi + blk * 32 + 8));
+    }
+#endif
     for (unsigned tg = 0; tg < ntg; tg += 2) {
       aie::accum<acc32, 64> a0 = aie::zeros<acc32, 64>(), a1 = aie::zeros<acc32, 64>();
 #ifndef MBI_UNROLL_N                               // the blocks unrolled by 4: 2.5 -> 1.5 us a call (by 8: 1.9,
@@ -206,9 +223,29 @@ static inline void mbi_band_kg3(const uint8_t *__restrict band, const uint8_t *_
         m1.mac(aie::load_v<64>(xa + ((2 * blk + 1) * MBI_NTG + tg + 1) * 64), b1);
         a0 = aie::mac(a0, m0.template to_vector<int16>(0), dt);
         a1 = aie::mac(a1, m1.template to_vector<int16>(0), dt);
+#ifndef MBI_QS_COMPACT
         a0 = aie::mac(a0, mt, aie::load_v<64>(qs + (blk * MBI_NTG + tg) * 64));
         a1 = aie::mac(a1, mt, aie::load_v<64>(qs + (blk * MBI_NTG + tg + 1) * 64));
+#else
+        (void)mt;
+#endif
       }
+#ifdef MBI_QS_COMPACT
+      {
+        using MQ = aie::mmul<4, 4, 8, int16, int16>;
+        MQ p0, q0, p1, q1;
+        const aie::vector<int16, 16> s0l = aie::load_v<16>(qs + tg * 32), s0h = aie::load_v<16>(qs + tg * 32 + 16);
+        const aie::vector<int16, 16> s1l = aie::load_v<16>(qs + (tg + 1) * 32), s1h = aie::load_v<16>(qs + (tg + 1) * 32 + 16);
+        p0.mul(s0l, mb[0][0]); p0.mac(s0h, mb[0][1]);
+        q0.mul(s0l, mb[1][0]); q0.mac(s0h, mb[1][1]);
+        p1.mul(s1l, mb[0][0]); p1.mac(s1h, mb[0][1]);
+        q1.mul(s1l, mb[1][0]); q1.mac(s1h, mb[1][1]);
+        const auto z0 = aie::interleave_zip(p0.template to_vector<int32>(), q0.template to_vector<int32>(), 8);
+        const auto z1 = aie::interleave_zip(p1.template to_vector<int32>(), q1.template to_vector<int32>(), 8);
+        a0 = aie::add(a0, aie::concat(z0.first, z0.second));
+        a1 = aie::add(a1, aie::concat(z1.first, z1.second));
+      }
+#endif
       float *__restrict o0 = acc + (rg * MBI_NTG + tg) * 64;
       mbi_epi(o0, a0, shift, aie::load_v<64>(sxb + tg * 64));
       mbi_epi(o0 + 64, a1, shift, aie::load_v<64>(sxb + (tg + 1) * 64));
