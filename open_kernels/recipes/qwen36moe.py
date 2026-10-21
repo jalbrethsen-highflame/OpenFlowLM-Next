@@ -1089,11 +1089,12 @@ MBE = os.environ.get("OPEN_QWEN36_MBE", "1") != "0"
 MBE_NT = 32
 if MBE:
     MB_NT = MBE_NT
-# OPEN_QWEN36_MBI (default off): designs/moe_batch/mbi.py -- the int8 x int4 MAC mode, a column's
+# OPEN_QWEN36_MBI (default on; 0 builds mbe): designs/moe_batch/mbi.py -- the int8 x int4 MAC mode, a column's
 # four rows splitting a visit's MBI_NT = 64 tokens, the weights broadcast to them. The driver
 # transforms the routed experts of the pool at load (signed nibbles, int16 d / mc; Core,
-# moe_batch.kind "mbi"), and the host packs x as int8 k-group elements; no h buffer.
-MBI = os.environ.get("OPEN_QWEN36_MBI", "0") != "0"
+# moe_batch.kind "mbi"), and the host packs x as int8 k-group elements; no h buffer. Faster than
+# mbe at every prompt length measured (1K: experts 1.56 -> 1.07 s; 120K: 94.5 -> 47.8 s).
+MBI = os.environ.get("OPEN_QWEN36_MBI", "1") != "0"
 MBI_NT = 64
 MBI_XSLOT = 4 * 8 * (64 + 16 * 4 * 64 + 8 * 4 * 128 + 4 * 128)     # mbi.py's XSLOT at HID 2048
 MBI_YSLOT = 32 * 4 * 2048                                         # mbi.py's YSLOT at HID 2048
