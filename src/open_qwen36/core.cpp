@@ -6088,7 +6088,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         dit2_pack_a(src, rows, M, w, b.map<uint8_t*>(), dit_hs_, MT);
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE, M * w * 9 / 8, 0);
     };
-    double moe_ms[5] = {0, 0, 0, 0, 0};       // router, shared gate, gather, x sync, y read back
+    double moe_ms[6] = {0, 0, 0, 0, 0, 0};    // router, shared gate, gather, x sync, y read back, slot plan
     // OFLM_OPEN_HOST_THREADS=n (default 2; 3 and 4 were slower): n host threads take ready cells at once, each with
     // 1/n of the OpenMP threads (under a loaded CPU a team of 8 is nearly as fast as one of 16, so
     // two teams nearly double the host's throughput); the counters below go through smu
@@ -6594,6 +6594,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             if (p >= mb_np) throw std::runtime_error("open_qwen36: a MoE group needs more expert passes than its buffers hold");
                             MoePass mp;
                             mp.kernel = *kn; mp.n = n * Pv; mp.ex.assign(slots / Pv, 0); mp.buf = p;   // unused visits stream expert 0, ignored
+                            auto tpl = std::chrono::steady_clock::now();
                             ms.per_token.emplace_back(grows);
                             auto& pt = ms.per_token.back();
                             for (size_t i = 0; i < n; ++i) {
@@ -6602,6 +6603,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                 for (size_t j = 0; j < std::min(NTv, owed[e].size() - off); ++j)
                                     pt[owed[e][off + j].first].push_back({i * NTv + j, owed[e][off + j].second});
                             }
+                            sadd(moe_ms[5], ms_since(tpl));
                             xrt::bo& xb = buffer(mbuf('x', set, p), 0);
                             if (mbi) {
                                 uint8_t* xm = xb.map<uint8_t*>();
@@ -6867,8 +6869,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                  timing_.dn_rule_ms, timing_.attn_ms, hst[GATE], hst[TAIL], hst[HPACK], hst[RES], host_idle_ms);
     if (mbp)
         std::fprintf(stderr, "open_qwen36: pipe MoE: experts on the NPU %.0f ms; host route + gather %.0f (router %.0f, gate %.0f, "
-                             "gather %.0f, x sync %.0f), scatter %.0f (y read back %.0f) ms\n",
-                     timing_.moe_run_ms, timing_.moe_prep_ms, moe_ms[0], moe_ms[1], moe_ms[2], moe_ms[3], timing_.moe_read_ms, moe_ms[4]);
+                             "gather %.0f, x sync %.0f, slot plan %.0f), scatter %.0f (y read back %.0f) ms\n",
+                     timing_.moe_run_ms, timing_.moe_prep_ms, moe_ms[0], moe_ms[1], moe_ms[2], moe_ms[3], moe_ms[5], timing_.moe_read_ms, moe_ms[4]);
     if (mid_prof_on)
         std::fprintf(stderr, "open_qwen36: linear MID: qkv read %.1f state read %.1f to f32 %.1f | dn setup %.1f conv %.1f "
                              "alpha/beta %.1f window %.1f rule %.1f | state sync %.1f out pack %.1f ms\n",

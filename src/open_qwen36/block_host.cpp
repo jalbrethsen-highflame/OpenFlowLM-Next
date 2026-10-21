@@ -2273,26 +2273,46 @@ void router_cols8(size_t nt, size_t hid, size_t E, size_t e0, const float* x, co
         for (int v = 0; v < 4; ++v) _mm512_storeu_ps(lg + u * E + e0 + 16 * v, acc[u][v]);
 }
 
+// prompt rows: 6 tokens x 64 experts of accumulators in registers over hid steps [i0, i1), the
+// partial sums kept in lg between steps (the same FMA chain per (token, expert), so the same bits).
+// xT holds the 6 tokens transposed, [hid][6]; 256 hid steps of a 64-expert slice (64 KB) stay in L2.
 __attribute__((target("avx512f,fma")))
-void router_logits8(size_t nt, size_t hid, size_t E, const float* x, const float* Wr, float* lg) {
-    for (size_t e0 = 0; e0 < E; e0 += 64) {
-        __m512 acc[8][4];
-        for (size_t u = 0; u < 8; ++u)
-            for (int v = 0; v < 4; ++v) acc[u][v] = _mm512_setzero_ps();
-        for (size_t i = 0; i < hid; ++i) {
-            const float* wr = Wr + i * E + e0;
-            const __m512 w0 = _mm512_loadu_ps(wr), w1 = _mm512_loadu_ps(wr + 16), w2 = _mm512_loadu_ps(wr + 32), w3 = _mm512_loadu_ps(wr + 48);
-            for (size_t u = 0; u < 8; ++u) {
-                const __m512 xi = _mm512_set1_ps(u < nt ? x[u * hid + i] : 0.f);
-                acc[u][0] = _mm512_fmadd_ps(xi, w0, acc[u][0]);
-                acc[u][1] = _mm512_fmadd_ps(xi, w1, acc[u][1]);
-                acc[u][2] = _mm512_fmadd_ps(xi, w2, acc[u][2]);
-                acc[u][3] = _mm512_fmadd_ps(xi, w3, acc[u][3]);
-            }
+void router_tile6(size_t i0, size_t i1, size_t E, size_t e0, const float* xT, const float* Wr, float* lg) {
+    __m512 acc[6][4];
+#pragma GCC unroll 6
+    for (int u = 0; u < 6; ++u)
+#pragma GCC unroll 4
+        for (int v = 0; v < 4; ++v) acc[u][v] = i0 ? _mm512_loadu_ps(lg + u * E + e0 + 16 * v) : _mm512_setzero_ps();
+    for (size_t i = i0; i < i1; ++i) {
+        const float* wr = Wr + i * E + e0;
+        const __m512 w0 = _mm512_loadu_ps(wr), w1 = _mm512_loadu_ps(wr + 16), w2 = _mm512_loadu_ps(wr + 32), w3 = _mm512_loadu_ps(wr + 48);
+        const float* xi = xT + i * 6;
+#pragma GCC unroll 6
+        for (int u = 0; u < 6; ++u) {
+            const __m512 b = _mm512_set1_ps(xi[u]);
+            acc[u][0] = _mm512_fmadd_ps(b, w0, acc[u][0]);
+            acc[u][1] = _mm512_fmadd_ps(b, w1, acc[u][1]);
+            acc[u][2] = _mm512_fmadd_ps(b, w2, acc[u][2]);
+            acc[u][3] = _mm512_fmadd_ps(b, w3, acc[u][3]);
         }
-        for (size_t u = 0; u < nt; ++u)
-            for (int v = 0; v < 4; ++v) _mm512_storeu_ps(lg + u * E + e0 + 16 * v, acc[u][v]);
     }
+#pragma GCC unroll 6
+    for (int u = 0; u < 6; ++u)
+#pragma GCC unroll 4
+        for (int v = 0; v < 4; ++v) _mm512_storeu_ps(lg + u * E + e0 + 16 * v, acc[u][v]);
+}
+
+// router logits for nt prompt rows (E % 64 == 0) into lg [nt rounded up to 6][E]
+void router_logits_rows(size_t nt, size_t hid, size_t E, const float* x, const float* Wr, float* lg) {
+    const size_t ns = (nt + 5) / 6;
+    std::vector<float> xT(ns * hid * 6, 0.f);
+    for (size_t s = 0; s < ns; ++s)
+        for (size_t u = 0; u < 6 && s * 6 + u < nt; ++u)
+            for (size_t i = 0; i < hid; ++i) xT[(s * hid + i) * 6 + u] = x[(s * 6 + u) * hid + i];
+    for (size_t e0 = 0; e0 < E; e0 += 64)
+        for (size_t i0 = 0; i0 < hid; i0 += 256)
+            for (size_t s = 0; s < ns; ++s)
+                router_tile6(i0, std::min(hid, i0 + 256), E, e0, xT.data() + s * hid * 6, Wr, lg + s * 6 * E);
 }
 }  // namespace
 
@@ -2313,13 +2333,16 @@ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, 
         return;
     }
     if (fast && E % 64 == 0) {
-        // 8 tokens a pass over Wr (2 MB for the 35B; one pass per token was most of a prompt layer's routing)
-        const long long nb = static_cast<long long>((T + 7) / 8);
+        // a block of rows a thread (a multiple of 6, ~T / threads): the tiles' 64-expert x 256-step
+        // slices of Wr stay in L2 for the block's rows (1.7x the 8-token passes over all of Wr)
+        const size_t nth = static_cast<size_t>(omp_get_max_threads());
+        const size_t tb = std::min<size_t>(192, std::max<size_t>(6, ((T + nth - 1) / nth + 5) / 6 * 6));
+        const long long nb = static_cast<long long>((T + tb - 1) / tb);
 #pragma omp parallel for schedule(dynamic, 1)
         for (long long b = 0; b < nb; ++b) {
-            const size_t t0 = static_cast<size_t>(b) * 8, nt = std::min<size_t>(8, T - t0);
-            std::vector<float> lgb(8 * E);
-            router_logits8(nt, hid, E, xm + t0 * hid, Wr, lgb.data());
+            const size_t t0 = static_cast<size_t>(b) * tb, nt = std::min(tb, T - t0);
+            std::vector<float> lgb((nt + 5) / 6 * 6 * E);
+            router_logits_rows(nt, hid, E, xm + t0 * hid, Wr, lgb.data());
             std::vector<char> taken(E);
             for (size_t u = 0; u < nt; ++u)
                 router_select(E, topk, lgb.data() + u * E, taken.data(), probs + (t0 + u) * E, idx + (t0 + u) * topk, w + (t0 + u) * topk);
@@ -2340,34 +2363,42 @@ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, 
     }
 }
 
-// one token's softmax, top-k and normalised weights from its logits `lg` (overwritten with the probabilities)
+// one token's softmax, top-k and normalised weights from its logits `lg` (overwritten with the
+// exponentials). The top-k in one pass, kept sorted by (probability down, index up): the same picks
+// as k scans for the first largest untaken one, 4.5x faster. `taken` is unused (kept for callers).
 void router_select(size_t E, size_t topk, float* lg, char* taken, float* probs, int32_t* idx, float* w) {
-    std::fill(taken, taken + E, 0);
-    {
-        float mx = -1e30f;
-        for (size_t e = 0; e < E; ++e) mx = std::max(mx, lg[e]);
-        double denom = 0;
-        for (size_t e = 0; e < E; ++e) {
-            lg[e] = std::exp(lg[e] - mx);
-            denom += lg[e];
-        }
-        const float inv = static_cast<float>(1.0 / denom);
-        for (size_t e = 0; e < E; ++e) {
-            lg[e] *= inv;
-            probs[e] = lg[e];
-        }
-        double wsum = 0;
-        for (size_t s = 0; s < topk; ++s) {
-            size_t best = E;
-            for (size_t e = 0; e < E; ++e)
-                if (!taken[e] && (best == E || lg[e] > lg[best])) best = e;
-            taken[best] = 1;
-            idx[s] = static_cast<int32_t>(best);
-            w[s] = lg[best];
-            wsum += lg[best];
-        }
-        for (size_t s = 0; s < topk; ++s) w[s] = static_cast<float>(w[s] / wsum);
+    (void)taken;
+    if (topk > 64) throw std::runtime_error("open_qwen36: router_select: topk past 64");
+    float mx = -1e30f;
+    for (size_t e = 0; e < E; ++e) mx = std::max(mx, lg[e]);
+    double denom = 0;
+    for (size_t e = 0; e < E; ++e) {
+        lg[e] = std::exp(lg[e] - mx);
+        denom += lg[e];
     }
+    const float inv = static_cast<float>(1.0 / denom);
+    float tv[64];
+    int32_t ti[64];
+    size_t n = 0;
+    for (size_t e = 0; e < E; ++e) {
+        const float v = lg[e] * inv;
+        probs[e] = v;
+        if (n == topk && !(v > tv[topk - 1])) continue;
+        size_t j = n < topk ? n++ : topk - 1;
+        for (; j > 0 && v > tv[j - 1]; --j) {
+            tv[j] = tv[j - 1];
+            ti[j] = ti[j - 1];
+        }
+        tv[j] = v;
+        ti[j] = static_cast<int32_t>(e);
+    }
+    double wsum = 0;
+    for (size_t s = 0; s < topk; ++s) {
+        idx[s] = ti[s];
+        w[s] = tv[s];
+        wsum += tv[s];
+    }
+    for (size_t s = 0; s < topk; ++s) w[s] = static_cast<float>(w[s] / wsum);
 }
 
 // ---- gemv_b4 -------------------------------------------------------------------------------
