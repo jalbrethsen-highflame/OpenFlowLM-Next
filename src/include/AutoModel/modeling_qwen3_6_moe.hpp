@@ -27,6 +27,8 @@ private:
     bool enable_tool = false;
     int think_start_id = 248068;
     int think_end_id = 248069;
+    /// the system prompt's tokens whose state the engine holds as its prefix snapshot
+    std::vector<int> prefix_his_;
     void setup_tokenizer(std::string model_path);
 
     // Image processing functionality

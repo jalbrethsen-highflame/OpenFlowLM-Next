@@ -48,6 +48,8 @@ public:
     int get_current_context_length() override;
     int checkpoint() override;
     int restore() override;
+    int checkpoint_prefix() override;
+    int restore_prefix() override;
 
     /// Where this model's open kernels are: OFLM_OPEN_KERNELS_DIR, else
     /// <model>/open_kernels, else <root>/xclbins/<model name>/open_kernels over
@@ -71,6 +73,8 @@ private:
     std::unique_ptr<Core> core_;
     Snapshot snapshot_;
     bool has_snapshot_ = false;
+    Snapshot prefix_;                 ///< checkpoint_prefix: kept across clear_context
+    bool has_prefix_ = false;
     std::vector<bf16> logits_;
     bool poisoned_ = false;
     vision::VitConfig vcfg_;

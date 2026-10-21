@@ -6,6 +6,8 @@
 /// \note This is a source file for the Qwen3_6_MOE class
 
 
+#include <algorithm>
+#include <cstdlib>
 #include "AutoModel/modeling_qwen3_6_moe.hpp"
 #include "metrices.hpp"
 
@@ -315,9 +317,52 @@ bool Qwen3_6_MOE::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input,
     size_t n = tokens.size();
     tokens.resize(n - (this->enable_think ? 2 : 4));
 
+    // A long system prompt shared by requests that differ after it (single-turn requests with one
+    // instruction prompt): the engine keeps the state at the end of the system message, and a
+    // request with the same system tokens restores it and prefills only the rest. Multi-turn
+    // requests take the restore_allowed path above. OFLM_PREFIX_CACHE_MIN (default 512 tokens; 0
+    // off) is the shortest system prompt worth a snapshot.
+    static const size_t prefix_min = [] {
+        const char* e = std::getenv("OFLM_PREFIX_CACHE_MIN");
+        return e ? static_cast<size_t>(std::strtoul(e, nullptr, 10)) : size_t{512};
+    }();
+    double pre_ns = 0;
+    int pre_tokens = 0;
+    if (!meta_info.restore_allowed && !has_images && prefix_min > 0 && !input.messages.empty() &&
+        input.messages[0].value("role", "") == "system" && tokens.size() > 2) {
+        // the system message ends where the next message's first token (the same <|im_start|>) is
+        size_t b = 0;
+        for (size_t i = 1; i < tokens.size(); ++i)
+            if (tokens[i] == tokens[0]) { b = i; break; }
+        if (b >= prefix_min) {
+            const bool same = prefix_his_.size() == b && std::equal(prefix_his_.begin(), prefix_his_.end(), tokens.begin());
+            if (same && this->lm_engine->restore_prefix() == static_cast<int>(b)) {
+                this->total_tokens = static_cast<int>(b);
+                this->token_history = prefix_his_;
+                this->checkpoint_his = prefix_his_;
+                header_print("OFLM", "System prompt cache hit: " << b << " tokens restored, " << tokens.size() - b << " to prefill");
+            } else if (this->token_history.empty()) {
+                std::vector<int> pre(tokens.begin(), tokens.begin() + b);
+                if (!this->_shared_insert(meta_info, pre, is_cancelled, nullptr)) return false;
+                pre_ns = static_cast<double>(meta_info.prefill_duration);
+                pre_tokens = meta_info.prompt_tokens;
+                if (this->lm_engine->checkpoint_prefix() == static_cast<int>(b)) {
+                    prefix_his_ = this->token_history;
+                    header_print("OFLM", "System prompt cached: " << b << " tokens");
+                } else {
+                    prefix_his_.clear();
+                }
+            }
+        }
+    }
+
     bool success = has_images
         ? this->_shared_insert(meta_info, tokens, is_cancelled, &image_payload, last_image_token_index)
         : this->_shared_insert(meta_info, tokens, is_cancelled, nullptr);
+    if (pre_tokens) {   // report the whole prompt's prefill
+        meta_info.prefill_duration += static_cast<uint64_t>(pre_ns);
+        meta_info.prompt_tokens += pre_tokens;
+    }
 
     checkpoint_his = token_history;
     int checkpoint_idx = this->lm_engine->checkpoint();

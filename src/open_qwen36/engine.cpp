@@ -353,6 +353,22 @@ int Engine::checkpoint() {
     return snapshot_.pos;
 }
 
+int Engine::checkpoint_prefix() {
+    if (poisoned_) return -1;
+    core_->spec_flush();
+    prefix_ = core_->checkpoint();
+    has_prefix_ = true;
+    return prefix_.pos;
+}
+
+int Engine::restore_prefix() {
+    ensure_alive();
+    if (!has_prefix_) return -1;
+    core_->restore(prefix_);   // the KV rows too: a request with another prompt may have overwritten them
+    has_snapshot_ = false;
+    return prefix_.pos;
+}
+
 int Engine::restore() {
     ensure_alive();
     if (!has_snapshot_) {

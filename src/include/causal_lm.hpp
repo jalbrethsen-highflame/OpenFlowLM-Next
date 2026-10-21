@@ -61,4 +61,9 @@ public:
     virtual int checkpoint() = 0;
 
     virtual int restore() = 0;
+
+    /// A second snapshot, of a shared prompt prefix (the system prompt), that clear_context keeps:
+    /// requests that differ only after it restore it and prefill the rest. -1: not supported.
+    virtual int checkpoint_prefix() { return -1; }
+    virtual int restore_prefix() { return -1; }
 };
