@@ -1135,7 +1135,10 @@ constexpr size_t kRB = 4;      // query rows per micro-kernel block
 
 __attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, size_t qt, float scale, const float* Q,
-                      const float* KT, const float* VF, size_t P, float* og, size_t g, size_t t0, size_t kend) {
+                      const float* KT, const float* VF, size_t P, float* og, size_t g, size_t t0, size_t kend,
+                      const float* sinks = nullptr, size_t window = 0, size_t kb = 0) {
+    // kb: the first key KT / VF hold (a multiple of 64; the window's start); sinks: one more logit per
+    // head in each denominator; window: row q sees keys [q + 1 - window, q]
     const size_t grp = nh / kvh, qw = nh * hd;
     const size_t nt = std::min(qt, R - t0), M = grp * nt, Mp = (M + kRB - 1) / kRB * kRB;
     const size_t first = pos0 + t0, last = kend ? kend - 1 : first + nt - 1;   // kend: every query sees [0, kend)
@@ -1158,14 +1161,14 @@ void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, s
     }
     const float* kt = KT + g * hd * P;
     const float* vf = VF + g * P * hd;
-    for (size_t c0 = 0; c0 <= last; c0 += 64) {
+    for (size_t c0 = kb; c0 <= last; c0 += 64) {
         const size_t kc = std::min<size_t>(64, last + 1 - c0);
         // S = Q K^T over the chunk's 64 keys
         for (size_t i0 = 0; i0 < Mp; i0 += kRB) {
             v16f a00{}, a01{}, a02{}, a03{}, a10{}, a11{}, a12{}, a13{}, a20{}, a21{}, a22{}, a23{}, a30{}, a31{}, a32{}, a33{};
             const float *q0 = q + i0 * hd, *q1 = q0 + hd, *q2 = q1 + hd, *q3 = q2 + hd;
             for (size_t d = 0; d < hd; ++d) {
-                const float* kd = kt + (c0 / 64 * hd + d) * 64;
+                const float* kd = kt + ((c0 - kb) / 64 * hd + d) * 64;
                 const v16f k0 = ld(kd), k1 = ld(kd + 16), k2 = ld(kd + 32), k3 = ld(kd + 48);
                 const v16f b0 = bc(q0[d]), b1 = bc(q1[d]), b2 = bc(q2[d]), b3 = bc(q3[d]);
                 a00 += b0 * k0; a01 += b0 * k1; a02 += b0 * k2; a03 += b0 * k3;
@@ -1183,12 +1186,14 @@ void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, s
         for (size_t i = 0; i < Mp; ++i) {
             float* si = s + i * 64;
             const size_t valid = qp[i] < c0 ? 0 : std::min(kc, qp[i] - c0 + 1);
-            if (!valid) {
+            const size_t lo = window && qp[i] + 1 > window ? qp[i] + 1 - window : 0;   // the row's first key
+            if (!valid || lo >= c0 + valid) {
                 for (size_t j = 0; j < 64; ++j) si[j] = 0.f;
                 cr[i] = 1.f;
                 continue;
             }
             for (size_t j = valid; j < 64; ++j) si[j] = -1e30f;
+            for (size_t j = 0; c0 + j < lo; ++j) si[j] = -1e30f;
             const v16f x0 = ld(si), x1 = ld(si + 16), x2 = ld(si + 32), x3 = ld(si + 48);
             v16f vm = x0 > x1 ? x0 : x1;
             const v16f vm2 = x2 > x3 ? x2 : x3;
@@ -1218,7 +1223,7 @@ void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, s
                 v16f a30 = ld(c3r) * r3, a31 = ld(c3r + 16) * r3, a32 = ld(c3r + 32) * r3, a33 = ld(c3r + 48) * r3;
                 const float *p0 = s + i0 * 64, *p1 = p0 + 64, *p2 = p1 + 64, *p3 = p2 + 64;
                 for (size_t j = 0; j < kc; ++j) {
-                    const float* vj = vf + (c0 + j) * hd + dg;
+                    const float* vj = vf + (c0 + j - kb) * hd + dg;
                     const v16f v0 = ld(vj), v1 = ld(vj + 16), v2 = ld(vj + 32), v3 = ld(vj + 48);
                     const v16f b0 = bc(p0[j]), b1 = bc(p1[j]), b2 = bc(p2[j]), b3 = bc(p3[j]);
                     a00 += b0 * v0; a01 += b0 * v1; a02 += b0 * v2; a03 += b0 * v3;
@@ -1235,6 +1240,7 @@ void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, s
     for (size_t i = 0; i < M; ++i) {
         const size_t gi = i / nt, ti = i % nt;
         float* out = og + (t0 + ti) * qw + (g * grp + gi) * hd;
+        if (sinks) l[i] += std::exp(sinks[g * grp + gi] - m[i]);
         const float inv = 1.f / l[i];
         for (size_t d = 0; d < hd; ++d) out[d] = acc[i * hd + d] * inv;
     }
@@ -1242,9 +1248,14 @@ void attention_tile64(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, s
 // (no pop: GCC reports -Wpsabi at the end of the file, for the clones)
 
 void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
-                     const uint16_t* kv, size_t kv_row_elems, float* og, size_t kend = 0) {
+                     const uint16_t* kv, size_t kv_row_elems, float* og, size_t kend = 0, const float* sinks = nullptr,
+                     size_t window = 0) {
+    if ((sinks || window) && (hd % 64 || kend))
+        throw std::runtime_error("open_qwen36: attention_tiles: sinks / a window need head dim % 64 and a causal block");
     if (hd % 64 == 0) {
-        const size_t rows = kend ? kend : pos0 + R, P = (rows + 63) / 64 * 64, kvw = kvh * hd, grp = nh / kvh;
+        // kb: the first key any row's window reaches (64-aligned); rows below it are never read
+        const size_t kb = window && pos0 + 1 > window ? (pos0 + 1 - window) / 64 * 64 : 0;
+        const size_t rows = kend ? kend : pos0 + R, P = (rows - kb + 63) / 64 * 64, kvw = kvh * hd, grp = nh / kvh;
         static thread_local std::vector<float> KT, VF;
         KT.resize(kvh * hd * P);
         VF.resize(kvh * P * hd);
@@ -1253,13 +1264,13 @@ void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, fl
 #pragma omp parallel for
         for (long long pb = 0; pb < static_cast<long long>(P / 64); ++pb)
             for (size_t p = static_cast<size_t>(pb) * 64; p < static_cast<size_t>(pb) * 64 + 64; ++p) {
-                const uint16_t* row = kv + p * kv_row_elems;
+                const uint16_t* row = kv + (kb + p) * kv_row_elems;
                 for (size_t gh = 0; gh < kvh; ++gh) {
                     float* kd = kt + gh * hd * P + (p / 64 * hd) * 64 + p % 64;
                     float* vd = vf + (gh * P + p) * hd;
                     for (size_t d = 0; d < hd; ++d) {
-                        kd[d * 64] = p < rows ? bf16_to_f32(row[gh * hd + d]) : 0.f;
-                        vd[d] = p < rows ? bf16_to_f32(row[kvw + gh * hd + d]) : 0.f;
+                        kd[d * 64] = kb + p < rows ? bf16_to_f32(row[gh * hd + d]) : 0.f;
+                        vd[d] = kb + p < rows ? bf16_to_f32(row[kvw + gh * hd + d]) : 0.f;
                     }
                 }
             }
@@ -1269,7 +1280,7 @@ void attention_tiles(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, fl
 #pragma omp parallel for schedule(dynamic, 1)
         for (long long it = items - 1; it >= 0; --it)
             attention_tile64(hd, nh, kvh, R, pos0, qt, scale, Q, kt, vf, P, og,
-                             static_cast<size_t>(it) % kvh, (static_cast<size_t>(it) / kvh) * qt, kend);
+                             static_cast<size_t>(it) % kvh, (static_cast<size_t>(it) / kvh) * qt, kend, sinks, window, kb);
         return;
     }
     const size_t chunks = (R + kQT - 1) / kQT;
@@ -1537,9 +1548,12 @@ namespace {
 // the instructions of the fp32 kernel; the rounding is the NPU attention's (bf16 Q / K / V / P).
 __attribute__((target("avx512f,avx512bw,avx512dq,avx512bf16,fma")))
 void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
-                                 const uint16_t* kv, size_t kvr, float* og) {
+                                 const uint16_t* kv, size_t kvr, float* og, const float* sinks = nullptr, size_t window = 0) {
     constexpr size_t CK = 512, KB = 32, MAXQ = 64;
-    const size_t grp = nh / kvh, qw = nh * hd, Kmax = pos0 + R, NC = (Kmax + CK - 1) / CK, NQ = R * grp, PS = hd + 2;
+    // window (Flint's sliding layers): row t sees keys [pos0 + t + 1 - window, pos0 + t]; the chunks start
+    // at the first one's 32-key block (kv may be a sliding buffer's logical pointer: rows below never read)
+    const size_t KB0 = window && pos0 + 1 > window ? (pos0 + 1 - window) / KB * KB : 0;
+    const size_t grp = nh / kvh, qw = nh * hd, Kmax = pos0 + R, NC = (Kmax - KB0 + CK - 1) / CK, NQ = R * grp, PS = hd + 2;
     const size_t HP = hd / 2;                   // bf16 pairs a row
     if (NQ > MAXQ || hd % 64 || hd > 512) throw std::runtime_error("open_qwen36: attention_decode_flash_bf16: geometry");
     static thread_local std::vector<float> part_tl;
@@ -1561,7 +1575,7 @@ void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, siz
 #pragma omp for schedule(dynamic, 1)
         for (long long it = 0; it < static_cast<long long>(kvh * NC); ++it) {
             const size_t kh = static_cast<size_t>(it) % kvh, c = static_cast<size_t>(it) / kvh;
-            const size_t k0 = c * CK, k1 = std::min(k0 + CK, Kmax);
+            const size_t k0 = KB0 + c * CK, k1 = std::min(k0 + CK, Kmax);
             for (size_t t = 0; t < R; ++t)
                 for (size_t g2 = 0; g2 < grp; ++g2) {
                     const size_t qi = t * grp + g2;
@@ -1629,12 +1643,15 @@ void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, siz
                 }
                 // the online softmax; p rounded to bf16 (the sums use the rounded values too)
                 for (size_t qi = 0; qi < NQ; ++qi) {
-                    const size_t t = qi / grp, lim = pos0 + t + 1;
-                    const size_t nv = b0 >= lim ? 0 : std::min(nk, lim - b0);
+                    const size_t t = qi / grp, lim = pos0 + t + 1, lo = window && lim > window ? lim - window : 0;
+                    size_t nv = b0 >= lim ? 0 : std::min(nk, lim - b0);
+                    const size_t nlo = lo > b0 ? std::min(nk, lo - b0) : 0;   // the block's keys below the row's window
+                    if (nlo >= nv) nv = 0;
                     nvq[qi] = nv;
                     if (!nv) { corr[qi] = 1.f; std::fill(pb[qi], pb[qi] + KB, uint16_t(0)); continue; }
-                    const __mmask16 v0 = nv >= 16 ? __mmask16(0xFFFF) : __mmask16((1u << nv) - 1);
-                    const __mmask16 v1 = nv >= 32 ? __mmask16(0xFFFF) : nv > 16 ? __mmask16((1u << (nv - 16)) - 1) : __mmask16(0);
+                    const uint32_t vm = static_cast<uint32_t>((nv >= 32 ? 0xFFFFFFFFull : (1ull << nv) - 1) & ~((1ull << nlo) - 1));
+                    const __mmask16 v0 = static_cast<__mmask16>(vm & 0xFFFF);
+                    const __mmask16 v1 = static_cast<__mmask16>(vm >> 16);
                     const __m512 s0 = _mm512_mask_mov_ps(_mm512_set1_ps(-INFINITY), v0, _mm512_load_ps(sc[qi]));
                     const __m512 s1 = _mm512_mask_mov_ps(_mm512_set1_ps(-INFINITY), v1, _mm512_load_ps(sc[qi] + 16));
                     const float bm = std::max(_mm512_reduce_max_ps(s0), _mm512_reduce_max_ps(s1));
@@ -1701,10 +1718,10 @@ void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, siz
             for (long long hh = 0; hh < static_cast<long long>(nh); ++hh) {
                 const size_t t = static_cast<size_t>(tt), h = static_cast<size_t>(hh);
                 const float* P0 = pp + (t * nh + h) * NC * PS;
-                const size_t nc = (pos0 + t + 1 + CK - 1) / CK;
-                float M = -INFINITY;
+                const size_t nc = (pos0 + t + 1 - KB0 + CK - 1) / CK;
+                float M = sinks ? sinks[h] : -INFINITY;
                 for (size_t c = 0; c < nc; ++c) M = std::max(M, P0[c * PS]);
-                float L = 0.f;
+                float L = sinks ? std::exp(sinks[h] - M) : 0.f;   // a sink: one more logit in the denominator, no value
                 float* o = og + t * qw + h * hd;
                 std::fill(o, o + hd, 0.f);
                 for (size_t c = 0; c < nc; ++c) {
@@ -1725,10 +1742,10 @@ void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, siz
 // fold into the probabilities the value products read (the softmax sums keep the unscaled ones).
 __attribute__((target("avx512f,avx512bw,avx512dq,avx512bf16,fma")))
 void attention_decode_flash_kv8(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
-                                const uint8_t* kv8, size_t row8, float* og) {
+                                const uint8_t* kv8, size_t row8, float* og, const float* sinks = nullptr) {
     const size_t kvw8 = kvh * hd;                // K int8 at 0, V int8 at kvw8, K scales (f32) at 2 kvw8, V scales after
-    constexpr size_t CK = 512, KB = 32, MAXQ = 64;
-    const size_t grp = nh / kvh, qw = nh * hd, Kmax = pos0 + R, NC = (Kmax + CK - 1) / CK, NQ = R * grp, PS = hd + 2;
+    constexpr size_t CK = 512, KB = 32, MAXQ = 64, KB0 = 0, window = 0;   // (no window: the full layers' copy)
+    const size_t grp = nh / kvh, qw = nh * hd, Kmax = pos0 + R, NC = (Kmax - KB0 + CK - 1) / CK, NQ = R * grp, PS = hd + 2;
     const size_t HP = hd / 2;                   // bf16 pairs a row
     if (NQ > MAXQ || hd % 64 || hd > 512) throw std::runtime_error("open_qwen36: attention_decode_flash_kv8: geometry");
     static thread_local std::vector<float> part_tl;
@@ -1750,7 +1767,7 @@ void attention_decode_flash_kv8(size_t hd, size_t nh, size_t kvh, size_t R, size
 #pragma omp for schedule(dynamic, 1)
         for (long long it = 0; it < static_cast<long long>(kvh * NC); ++it) {
             const size_t kh = static_cast<size_t>(it) % kvh, c = static_cast<size_t>(it) / kvh;
-            const size_t k0 = c * CK, k1 = std::min(k0 + CK, Kmax);
+            const size_t k0 = KB0 + c * CK, k1 = std::min(k0 + CK, Kmax);
             for (size_t t = 0; t < R; ++t)
                 for (size_t g2 = 0; g2 < grp; ++g2) {
                     const size_t qi = t * grp + g2;
@@ -1839,12 +1856,15 @@ void attention_decode_flash_kv8(size_t hd, size_t nh, size_t kvh, size_t R, size
                 }
                 // the online softmax; p rounded to bf16 (the sums use the rounded values too)
                 for (size_t qi = 0; qi < NQ; ++qi) {
-                    const size_t t = qi / grp, lim = pos0 + t + 1;
-                    const size_t nv = b0 >= lim ? 0 : std::min(nk, lim - b0);
+                    const size_t t = qi / grp, lim = pos0 + t + 1, lo = window && lim > window ? lim - window : 0;
+                    size_t nv = b0 >= lim ? 0 : std::min(nk, lim - b0);
+                    const size_t nlo = lo > b0 ? std::min(nk, lo - b0) : 0;   // the block's keys below the row's window
+                    if (nlo >= nv) nv = 0;
                     nvq[qi] = nv;
                     if (!nv) { corr[qi] = 1.f; std::fill(pb[qi], pb[qi] + KB, uint16_t(0)); continue; }
-                    const __mmask16 v0 = nv >= 16 ? __mmask16(0xFFFF) : __mmask16((1u << nv) - 1);
-                    const __mmask16 v1 = nv >= 32 ? __mmask16(0xFFFF) : nv > 16 ? __mmask16((1u << (nv - 16)) - 1) : __mmask16(0);
+                    const uint32_t vm = static_cast<uint32_t>((nv >= 32 ? 0xFFFFFFFFull : (1ull << nv) - 1) & ~((1ull << nlo) - 1));
+                    const __mmask16 v0 = static_cast<__mmask16>(vm & 0xFFFF);
+                    const __mmask16 v1 = static_cast<__mmask16>(vm >> 16);
                     const __m512 s0 = _mm512_mask_mov_ps(_mm512_set1_ps(-INFINITY), v0, _mm512_load_ps(sc[qi]));
                     const __m512 s1 = _mm512_mask_mov_ps(_mm512_set1_ps(-INFINITY), v1, _mm512_load_ps(sc[qi] + 16));
                     const float bm = std::max(_mm512_reduce_max_ps(s0), _mm512_reduce_max_ps(s1));
@@ -1912,10 +1932,10 @@ void attention_decode_flash_kv8(size_t hd, size_t nh, size_t kvh, size_t R, size
             for (long long hh = 0; hh < static_cast<long long>(nh); ++hh) {
                 const size_t t = static_cast<size_t>(tt), h = static_cast<size_t>(hh);
                 const float* P0 = pp + (t * nh + h) * NC * PS;
-                const size_t nc = (pos0 + t + 1 + CK - 1) / CK;
-                float M = -INFINITY;
+                const size_t nc = (pos0 + t + 1 - KB0 + CK - 1) / CK;
+                float M = sinks ? sinks[h] : -INFINITY;
                 for (size_t c = 0; c < nc; ++c) M = std::max(M, P0[c * PS]);
-                float L = 0.f;
+                float L = sinks ? std::exp(sinks[h] - M) : 0.f;   // a sink: one more logit in the denominator, no value
                 float* o = og + t * qw + h * hd;
                 std::fill(o, o + hd, 0.f);
                 for (size_t c = 0; c < nc; ++c) {
@@ -2123,13 +2143,18 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
     static const bool bf16_cpu = __builtin_cpu_supports("avx512bf16");
     static const bool bf16_env = [] { const char* e = std::getenv("OFLM_OPEN_ATTN_BF16"); return !(e && *e == '0'); }();
     const bool bf16 = flash && bf16_cpu && (g_attn_flash < 0 ? bf16_env : g_attn_flash == 2);
+    const bool sw = g.sinks || g.window;   // Flint: the bf16 / int8 flash kernels or the tiles carry them
     if (g.kv8) {
         // the int8 copy: this block's rows quantized, then the flash kernel over it
-        if (!(bf16 && split && R <= 8)) throw std::runtime_error("open_qwen36: attention_block: the int8 cache needs the bf16 flash path");
+        if (!(bf16 && split && R <= 8) || g.window) throw std::runtime_error("open_qwen36: attention_block: the int8 cache needs the bf16 flash path (and no window)");
         kv8_quant_rows(kv, kv_row_elems, g.kvh, g.hd, g.pos0, g.pos0 + g.t_real, g.kv8, g.kv8_row);
-        attention_decode_flash_kv8(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), g.kv8, g.kv8_row, og);
+        attention_decode_flash_kv8(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), g.kv8, g.kv8_row, og, g.sinks);
     } else if (bf16 && split && R <= 8)
-        attention_decode_flash_bf16(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og);
+        attention_decode_flash_bf16(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og, g.sinks, g.window);
+    else if (sw && split && R <= 8)
+        throw std::runtime_error("open_qwen36: attention_block: sinks / a window in decode need the AVX-512 BF16 flash kernel");
+    else if (sw)
+        attention_tiles(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og, 0, g.sinks, g.window);
     else if (flash && split && R <= 8)
         attention_decode_flash(g.hd, g.nh, g.kvh, R, g.pos0, scale, Q.data(), kv, kv_row_elems, og);
     else if (split && R <= 8 && g.hd % 8 == 0 && grp <= 8)
@@ -2317,7 +2342,7 @@ void router_logits_rows(size_t nt, size_t hid, size_t E, const float* x, const f
 }  // namespace
 
 void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, const float* Wr, float* probs,
-                  int32_t* idx, float* w) {
+                  int32_t* idx, float* w, bool sigmoid) {
     if (topk > E) throw std::runtime_error("open_qwen36: router_block: topk past the expert count");
     static const bool fast = __builtin_cpu_supports("avx512f") && !(std::getenv("OFLM_OPEN_ROUTER_FAST") &&
                                                                      *std::getenv("OFLM_OPEN_ROUTER_FAST") == '0');
@@ -2329,7 +2354,7 @@ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, 
 #pragma omp parallel for schedule(static)
         for (long long ec = 0; ec < ne; ++ec) router_cols8(T, hid, E, static_cast<size_t>(ec) * 64, xm, Wr, lgb.data());
         std::vector<char> taken(E);
-        for (size_t u = 0; u < T; ++u) router_select(E, topk, lgb.data() + u * E, taken.data(), probs + u * E, idx + u * topk, w + u * topk);
+        for (size_t u = 0; u < T; ++u) router_select(E, topk, lgb.data() + u * E, taken.data(), probs + u * E, idx + u * topk, w + u * topk, sigmoid);
         return;
     }
     if (fast && E % 64 == 0) {
@@ -2345,7 +2370,7 @@ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, 
             router_logits_rows(nt, hid, E, xm + t0 * hid, Wr, lgb.data());
             std::vector<char> taken(E);
             for (size_t u = 0; u < nt; ++u)
-                router_select(E, topk, lgb.data() + u * E, taken.data(), probs + (t0 + u) * E, idx + (t0 + u) * topk, w + (t0 + u) * topk);
+                router_select(E, topk, lgb.data() + u * E, taken.data(), probs + (t0 + u) * E, idx + (t0 + u) * topk, w + (t0 + u) * topk, sigmoid);
         }
         return;
     }
@@ -2359,16 +2384,42 @@ void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, 
             const float* wr = Wr + i * E;
             for (size_t e = 0; e < E; ++e) lg[e] += xi * wr[e];
         }
-        router_select(E, topk, lg.data(), taken.data(), probs + t * E, idx + t * topk, w + t * topk);
+        router_select(E, topk, lg.data(), taken.data(), probs + t * E, idx + t * topk, w + t * topk, sigmoid);
     }
 }
 
 // one token's softmax, top-k and normalised weights from its logits `lg` (overwritten with the
 // exponentials). The top-k in one pass, kept sorted by (probability down, index up): the same picks
 // as k scans for the first largest untaken one, 4.5x faster. `taken` is unused (kept for callers).
-void router_select(size_t E, size_t topk, float* lg, char* taken, float* probs, int32_t* idx, float* w) {
+void router_select(size_t E, size_t topk, float* lg, char* taken, float* probs, int32_t* idx, float* w, bool sigmoid) {
     (void)taken;
     if (topk > 64) throw std::runtime_error("open_qwen36: router_select: topk past 64");
+    if (sigmoid) {
+        // Flint: the top-k of sigmoid(logit) (the same order as the logits; ties to the lower index),
+        // weights renormalised to sum 1 (SGLang's sigmoid_routing: / (sum + 1e-20))
+        float tv[64];
+        int32_t ti[64];
+        size_t n = 0;
+        for (size_t e = 0; e < E; ++e) {
+            const float v = 1.f / (1.f + std::exp(-lg[e]));
+            probs[e] = v;
+            if (n == topk && !(v > tv[topk - 1])) continue;
+            size_t j = n < topk ? n++ : topk - 1;
+            for (; j > 0 && v > tv[j - 1]; --j) {
+                tv[j] = tv[j - 1];
+                ti[j] = ti[j - 1];
+            }
+            tv[j] = v;
+            ti[j] = static_cast<int32_t>(e);
+        }
+        float wsum = 0.f;
+        for (size_t s2 = 0; s2 < topk; ++s2) wsum += tv[s2];
+        for (size_t s2 = 0; s2 < topk; ++s2) {
+            idx[s2] = ti[s2];
+            w[s2] = tv[s2] / (wsum + 1e-20f);
+        }
+        return;
+    }
     float mx = -1e30f;
     for (size_t e = 0; e < E; ++e) mx = std::max(mx, lg[e]);
     double denom = 0;

@@ -151,8 +151,18 @@ struct GemmBlockProgram {
     // weight's exact q4_1 split, and the host adds them (OPEN-PREFILL-BATCH)
     bool out_split = false;
     uint64_t state_s_off = 0, s_head_bytes = 0, s_rows = 0;
-    // full: heads, kv heads, head dim, rotary dim (qw / kvw as above)
+    // full: heads, kv heads, head dim, rotary dim (qw / kvw as above); rot 0: no positions (NoPE)
     uint64_t nh = 0, kvh = 0, hd = 0, rot = 0;
+    // full (Flint): the output gate (Qwen3.6's; the fused projection is q|k|v|gate when set, q|k|v
+    // when not), learned per-head sinks (blk.N.attn_sinks: one extra logit in each softmax
+    // denominator, no value), and a sliding window (keys pos - window + 1 .. pos; 0 = all)
+    bool gate = true, sinks = false;
+    uint64_t window = 0;
+    // the shared expert's sigmoid gate (Qwen3.6's shared_expert_gate); Flint's is ungated
+    bool shared_gated = true;
+    // a dense FFN's dit kernels: gemm_dit[ffn_key] (Flint's dense layers: "ffn_dense", ff 6144,
+    // beside the shared expert's "ffn")
+    std::string ffn_key = "ffn";
     // linear and full: the per-token MoE dispatch (moeroute2-patched, its own xclbin), its
     // buffer args, and where in act it reads xm, the router record and the residual
     std::string moe_kernel;
@@ -181,6 +191,12 @@ struct LayerType {
     uint64_t consts_bytes = 0, act_bytes = 0;
     std::string state_kind;                  ///< "linear" (a fixed-size state BO) | "kv" (max_ctx x state_row)
     uint64_t state_bytes = 0, state_row = 0;
+    /// kv: a sliding-window layer's cache as a sliding buffer of this many rows: it holds positions
+    /// [base, base + ring), and before rows past its end are written the last window's rows move to
+    /// its front (Core::kv_room); 0 = one row per position up to the context capacity
+    uint64_t state_ring = 0;
+    /// this layer type's pool (0: the layout's pool_bytes)
+    uint64_t pool_bytes = 0;
     std::vector<Step> program;
     /// The prompt route's per-token mixer (Core::step_prompt_lfm2), when it is not program's
     /// first step: LFM2-MoE's merged image runs mixer + experts as ONE core pass, so a prompt

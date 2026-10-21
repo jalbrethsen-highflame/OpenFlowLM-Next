@@ -271,9 +271,14 @@ static inline void widen_scale(const bfloat16 *__restrict src, float *__restrict
 static inline int32_t fa_row0(const int32_t *rtp, int32_t pass) {
   return rtp[6] + pass * QROWS_PASS + rtp[5];
 }
-// A key chunk every one of this core's TQ rows masks entirely (causal): nothing to compute.
+// A key chunk every one of this core's TQ rows masks entirely (causal), or (a sliding window,
+// rtp[7] = W > 0) one wholly below the first row's window -- row r sees keys r - W + 1 .. r. A window
+// never masks chunk 0: with a window the keys start after a 64-key chunk of sinks (Flint), which
+// every row sees. Nothing to compute.
 static inline bool fa_skip(const int32_t *rtp, int32_t pass, int32_t chunk) {
-  return rtp[4] && chunk * LKP > fa_row0(rtp, pass) + TQ - 1;
+  if (rtp[4] && chunk * LKP > fa_row0(rtp, pass) + TQ - 1)
+    return true;
+  return rtp[7] && chunk > 0 && (chunk + 1) * LKP <= fa_row0(rtp, pass) - rtp[7] + 1;
 }
 
 // A key chunk wholly at or past valid_len (the pad up to lk): nothing to compute.
@@ -557,11 +562,14 @@ void apply_mask(bfloat16 *__restrict g, int32_t *__restrict rtp, int32_t pass,
   const int32_t causal = rtp[4];
   const int32_t row0 = fa_row0(rtp, pass);
   const int32_t col0 = chunk * LKP;
+  // a sliding window (rtp[7], fa_skip): the last row's first key; keys below it masked for some row
+  const int32_t win = chunk > 0 ? rtp[7] : 0;
+  const bool low = win && col0 < row0 + TQ - win;
   // Last column any row may keep; all rows keep everything up to it?
   int32_t keep_all = valid_len; // columns < keep_all kept by every row
   if (causal && row0 + 1 < keep_all)
     keep_all = row0 + 1;
-  if (col0 + LKP <= keep_all)
+  if (col0 + LKP <= keep_all && !low)
     return;
   int32_t keep_any = valid_len; // columns >= keep_any masked for every row
   if (causal && row0 + TQ < keep_any)
@@ -569,6 +577,17 @@ void apply_mask(bfloat16 *__restrict g, int32_t *__restrict rtp, int32_t pass,
   // bf16 lowest, not -inf: the exp argument is formed as G*c - m*c, and
   // -inf*c - m*c must stay finite (it underflows to exactly 0 in exp2).
   const bfloat16 ninf = bf16_lowest();
+  if (low) {
+    // the window's lower edge: per element (one or two chunks a row see it), then the upper side
+    for (int row = 0; row < TQ; row++) {
+      const int32_t lo = row0 + row - win + 1 - col0;   // keys [0, lo) of this chunk masked for the row
+      bfloat16 *__restrict p = g + (row / 8) * 64 + (row % 8) * 8;
+      for (int32_t j = 0; j < lo && j < LKP; j++)
+        p[(j / 8) * BLOCK_STRIDE + (j % 8)] = ninf;
+    }
+    if (col0 + LKP <= keep_all)
+      return;
+  }
   if (col0 >= keep_any) {
     aie::vector<bfloat16, 32> v = aie::broadcast<bfloat16, 32>(ninf);
     for (int i = 0; i < G_ELEMS; i += 32)
@@ -644,6 +663,17 @@ void sm_exp(bfloat16 *__restrict g, uint8_t *__restrict p, int32_t *__restrict r
 // first chunk (m is 0 until then), or a chunk whose row sum reached 2^TAU (only possible when
 // some score is past m + TAU - 6). m moves up to the row max, O and l are rescaled, G shifted,
 // and P and the row sums redone.
+// A row sum that is inf or NaN: a score past the running max by more than 128 (log2 units) overflows
+// exp2 on the lazy path (Flint's last layers), and max() / >= miss a NaN. The sum of every lane carries
+// either one; its finite total stays far below the threshold here (256 lanes under 2^TAU each).
+static __attribute__((noinline)) bool fa_sums_bad(const float *__restrict rs) {
+  unsigned ok = 0;
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < TQ * 8; i += 16)                // lt is false for NaN and inf
+    ok += aie::lt(aie::load_v<16>(rs + i), aie::broadcast<float, 16>(3.0e38f)).count();
+  return ok != TQ * 8;
+}
+
 static __attribute__((noinline)) void softmax_rescale(bfloat16 *__restrict g, float *__restrict sp,
                                                       bfloat16 *__restrict gp, uint8_t *__restrict p,
                                                       int32_t chunk) {
@@ -705,7 +735,8 @@ void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
   m0 = aie::max(m0, m1);
   aie::vector<float, 16> mx = aie::max(aie::max(m0.extract<16>(0), m0.extract<16>(1)),
                                        aie::max(m0.extract<16>(2), m0.extract<16>(3)));
-  const bool redo = chunk == 0 || !aie::ge(mx, aie::broadcast<float, 16>(float(1ull << FA_TAU))).empty();
+  const bool redo = chunk == 0 || !aie::ge(mx, aie::broadcast<float, 16>(float(1ull << FA_TAU))).empty() ||
+                    fa_sums_bad(s_rs);
   if (redo)
     softmax_rescale(g, sp, gp, p, chunk);
 #pragma clang loop unroll(full)
@@ -740,7 +771,7 @@ void sm_all(bfloat16 *__restrict g, bfloat16 *__restrict up, float *__restrict s
   m0 = aie::max(m0, m1);
   aie::vector<float, 16> mx = aie::max(aie::max(m0.extract<16>(0), m0.extract<16>(1)),
                                        aie::max(m0.extract<16>(2), m0.extract<16>(3)));
-  if (chunk == 0 || !aie::ge(mx, aie::broadcast<float, 16>(float(1ull << FA_TAU))).empty())
+  if (chunk == 0 || !aie::ge(mx, aie::broadcast<float, 16>(float(1ull << FA_TAU))).empty() || fa_sums_bad(s_rs))
     softmax_rescale(g, sp, gp, p, chunk);
 #pragma clang loop unroll(full)
   for (int i = 0; i < TQ * 8; i += 64)                          // l += this chunk's row sums

@@ -27,6 +27,7 @@ typedef enum {
     qwen3_5,
     qwen3_5_omni,
     qwen3_6_moe,
+    flint,
     gemma3,
     gemma3_text,
     gemma4e,
@@ -57,6 +58,7 @@ inline const std::map<std::string, SupportedModelFamily>& model_family_map() {
         {"qwen3.5", SupportedModelFamily::qwen3_5},
         {"qwen3.5-omni", SupportedModelFamily::qwen3_5_omni},
         {"qwen3.6-moe", SupportedModelFamily::qwen3_6_moe},
+        {"flint", SupportedModelFamily::flint},
         // Qwen's own name for the 27B, whose architecture is still Qwen3.5 (the open
         // recipe keys off config.json's model_type, not this tag). Alias, not a new
         // engine: the tag is the user-facing name, and both must resolve.

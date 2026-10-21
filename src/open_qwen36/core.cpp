@@ -110,7 +110,10 @@ void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out, 
 // MAC pops them. Rows at or past t_real are zero. Q: one head, rows of x (ld apart, from column
 // col) times s, per 32-row block [row pair 2][d step 32][tile 2][8 rows][8 d] = 9216 bytes.
 constexpr size_t kFabQBlock = 9216, kFabChunk = 18432;
-void fab_pack_q(const float* x, size_t ld, size_t col, size_t T, size_t t_real, float s, uint8_t* out) {
+// hd: the head's real dims (Flint 128: the kernel's 256 zero-padded past them); sink_dim >= 0: that
+// padded dim reads 1 (times s) on every real row -- the column a sink key's logit sits in (fab_sink_k)
+void fab_pack_q(const float* x, size_t ld, size_t col, size_t T, size_t t_real, float s, uint8_t* out, size_t hd = 256,
+                long sink_dim = -1) {
     float v[8];
     for (size_t rb = 0; rb < T / 32; ++rb)
         for (size_t zp = 0; zp < 2; ++zp)
@@ -118,7 +121,11 @@ void fab_pack_q(const float* x, size_t ld, size_t col, size_t T, size_t t_real, 
                 for (size_t r2 = 0; r2 < 2; ++r2)
                     for (size_t r8 = 0; r8 < 8; ++r8) {
                         const size_t row = rb * 32 + zp * 16 + r2 * 8 + r8;
-                        for (size_t k = 0; k < 8; ++k) v[k] = row < t_real ? x[row * ld + col + i * 8 + k] * s : 0.f;
+                        for (size_t k = 0; k < 8; ++k) {
+                            const size_t d = i * 8 + k;
+                            v[k] = row >= t_real ? 0.f : d < hd ? x[row * ld + col + d] * s
+                                 : static_cast<long>(d) == sink_dim ? s : 0.f;
+                        }
                         bfp_encode8_avx2(v, out);
                         out += 9;
                     }
@@ -127,7 +134,7 @@ void fab_pack_q(const float* x, size_t ld, size_t col, size_t T, size_t t_real, 
 // [piece 4][d step 32][tile 2][8 keys][8 d] = 18432 bytes.
 // cstep: bytes from one 64-key chunk to the next (kFabChunk; kvh * kFabChunk for [chunk][kv head]).
 void fab_pack_k(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t t_real, uint8_t* base,
-                size_t cstep = kFabChunk) {
+                size_t cstep = kFabChunk, size_t hd = 256) {
     float v[8];
     for (size_t c = 0; c < T / 64; ++c) {
         uint8_t* out = base + c * cstep;
@@ -137,7 +144,7 @@ void fab_pack_k(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t 
                     for (size_t k8 = 0; k8 < 8; ++k8) {
                         const size_t key = c * 64 + j * 16 + n2 * 8 + k8;
                         for (size_t k = 0; k < 8; ++k)
-                            v[k] = key < t_real ? bf16_to_f32(kv[key * stride + col + i * 8 + k]) : 0.f;
+                            v[k] = key < t_real && i * 8 + k < hd ? bf16_to_f32(kv[key * stride + col + i * 8 + k]) : 0.f;
                         bfp_encode8_avx2(v, out);
                         out += 9;
                     }
@@ -145,7 +152,7 @@ void fab_pack_k(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t 
 }
 // V^T: per 64-key chunk [element 4][column pair 4][key step 8][tile 2][8 d columns][8 keys].
 void fab_pack_v(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t t_real, uint8_t* base,
-                size_t cstep = kFabChunk) {
+                size_t cstep = kFabChunk, size_t hd = 256) {
     float v[8];
     for (size_t c = 0; c < T / 64; ++c) {
         uint8_t* out = base + c * cstep;
@@ -157,12 +164,33 @@ void fab_pack_v(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t 
                             const size_t d = (e * 4 + jl) * 16 + n2 * 8 + dc;
                             for (size_t k = 0; k < 8; ++k) {
                                 const size_t key = c * 64 + i * 8 + k;
-                                v[k] = key < t_real ? bf16_to_f32(kv[key * stride + col + d]) : 0.f;
+                                v[k] = key < t_real && d < hd ? bf16_to_f32(kv[key * stride + col + d]) : 0.f;
                             }
                             bfp_encode8_avx2(v, out);
                             out += 9;
                         }
     }
+}
+
+// Learned sinks on the NPU attention (Flint): one 64-key chunk in front of a kv head's keys. Its key 0
+// carries query head g's sink (natural log units) in padded dim hd + 8 g (one bfp16 block each, so no
+// sink shares an exponent); the packed Q holds log2(e) there (fab_pack_q sink_dim), so the score is the
+// sink in the kernel's log2 units. Keys 1..63 carry -1e4 in those dims (exp2 of it is 0). Its V is zeros.
+void fab_sink_k(const float* sinks, size_t grp, size_t hd, uint8_t* out) {
+    float v[8];
+    for (size_t j = 0; j < 4; ++j)
+        for (size_t i = 0; i < 32; ++i)
+            for (size_t n2 = 0; n2 < 2; ++n2)
+                for (size_t k8 = 0; k8 < 8; ++k8) {
+                    const size_t key = j * 16 + n2 * 8 + k8;
+                    for (size_t k = 0; k < 8; ++k) {
+                        const size_t d = i * 8 + k;
+                        const bool sd = d >= hd && (d - hd) % 8 == 0 && (d - hd) / 8 < grp;
+                        v[k] = !sd ? 0.f : key == 0 ? sinks[(d - hd) / 8] : -1e4f;
+                    }
+                    bfp_encode8_avx2(v, out);
+                    out += 9;
+                }
 }
 
 // n bf16 -> f32 (exact: the bits shifted up), 16 a step
@@ -803,9 +831,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     for (const auto& s : w_->tail) wanted[s.kernel] = true;
     if (!man_.gemm_dit.is_null())   // dit_on_ is decided later; loading an unused kernel is harmless
         for (const auto& [shape, k] : man_.gemm_dit["kernels"].items()) wanted[k.get<std::string>()] = true;
-    if (man_.gemm_dit.contains("ffn"))
-        for (const auto& [f, v] : man_.gemm_dit["ffn"].items())
-            if (v.is_string()) wanted[v.get<std::string>()] = true;
+    for (const char* fk : {"ffn", "ffn_dense"})
+        if (man_.gemm_dit.contains(fk))
+            for (const auto& [f, v] : man_.gemm_dit[fk].items())
+                if (v.is_string()) wanted[v.get<std::string>()] = true;
     if (man_.gemm_dit.contains("kernels2"))
         for (const auto& [shape, k] : man_.gemm_dit["kernels2"].items()) wanted[k.get<std::string>()] = true;
     if (man_.gemm_dit.contains("decode2"))
@@ -819,12 +848,15 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
         }
     for (const char* tier : {"small", "tiny"})
         if (man_.gemm_dit.contains(tier))
-            for (const char* key : {"kernels2", "ffn"})
-                for (const auto& [shape, k] : man_.gemm_dit[tier][key].items()) wanted[k.get<std::string>()] = true;
+            for (const char* key : {"kernels2", "ffn", "ffn_dense"})
+                if (man_.gemm_dit[tier].contains(key))
+                    for (const auto& [shape, k] : man_.gemm_dit[tier][key].items())
+                        if (k.is_string()) wanted[k.get<std::string>()] = true;
     if (man_.gemm_dit.contains("fa"))
-        for (const char* key : {"lk", "nc", "ncb", "cb", "cbs"})
+        for (const char* key : {"lk", "nc", "ncb", "cb", "cbs", "win"})
             if (man_.gemm_dit["fa"].contains(key))
-                for (const auto& [lk, k] : man_.gemm_dit["fa"][key].items()) wanted[k.get<std::string>()] = true;
+                for (const auto& [lk, k] : man_.gemm_dit["fa"][key].items())
+                    wanted[k.is_object() ? k["kernel"].get<std::string>() : k.get<std::string>()] = true;   // win: {kernel, lk}
     for (const auto& [slots, k] : w_->expert_batch.kernels) wanted[k] = true;
     // the prompt pipe's NPU delta rule (OFLM_OPEN_DNC=1), when the set carries it
     if (man_.kernels.count("dnc") && std::getenv("OFLM_OPEN_DNC") && *std::getenv("OFLM_OPEN_DNC") == '1') wanted["dnc"] = true;
@@ -891,7 +923,12 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (const char* env = std::getenv("OFLM_OPEN_HOST_ATTN_DECODE")) host_attn_decode_on_ = std::string(env) != "0";
     // OFLM_OPEN_CPU_DECODE unset: on when the model ships its MTP weights (mtp_path)
     if (const char* env = std::getenv("OFLM_OPEN_CPU_DECODE")) cpu_decode_on_ = std::string(env) == "1";
-    else cpu_decode_on_ = !mtp_path().empty();
+    else {
+        // also on for a kernel set without NPU decode programs (Flint's: the prompt kernels only)
+        bool npu_decode = false;
+        for (int l = 0; l < nl_; ++l) npu_decode = npu_decode || !types_[l]->program.empty();
+        cpu_decode_on_ = !mtp_path().empty() || !npu_decode;
+    }
     if (host_attn_decode_on_)
         log("decode route: HOST (OFLM_OPEN_HOST_ATTN_DECODE=1; the 2.5 gemm-block chain at T=1 "
             "with host attention; the NPU GEMMs run padded at the kernel set's compiled T)");
@@ -1228,7 +1265,8 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                 // (a MoE layer's shared expert runs on the same fused FFN: its up|gate too)
                 const auto& fprog = lt.gemm_block.has_dense_ffn() ? lt.gemm_block.ffn_program : lt.gemm_block.shared_program;
                 if (man_.gemm_dit.contains("ffn") && dit_ffn_on() && !fprog.empty() && fprog[0].args[0] == name) {
-                    const size_t ff = man_.gemm_dit["ffn"]["ff"].get<size_t>();
+                    // the FFN's own width (Flint: the shared expert 1024, the dense layers 6144)
+                    const size_t ff = lt.gemm_block.has_dense_ffn() ? lt.gemm_block.ff : lt.gemm_block.shared_ff;
                     if (n != 2 * ff || npad != n) throw std::runtime_error("open_qwen36: dit FFN: up|gate is not [2 ff]");
                     cm.resize(npad);
                     for (size_t c = 0; c < npad; ++c) {
@@ -1377,6 +1415,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     }
     if (dec_npu_) log("CPU decode: up to " + std::to_string(dec_npu_) + " routed experts a layer on the NPU (mbi), beside the CPU's");
     std::vector<uint8_t> pool_tmp;
+    kv_base_.assign(static_cast<size_t>(nl_), 0);
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];
         if (skip_pools) {
@@ -1388,7 +1427,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
             build_weights(lt, l, "pool", pool_tmp.data());
             pools_.emplace_back();
         } else {
-            xrt::bo pool = xrt::ext::bo(*dev_, w_->pool_bytes);
+            xrt::bo pool = xrt::ext::bo(*dev_, lt.pool_bytes ? lt.pool_bytes : w_->pool_bytes);
             uint8_t* pool_host = pool.map<uint8_t*>();
             pools::pack_pool(*w_, lt, *file_, l, pool_host);
             build_weights(lt, l, "pool", pool_host);
@@ -1510,9 +1549,15 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                 want(h.postln, w_->hidden, "post_attention_layernorm");
                 if (!gb.has_dense_ffn()) {
                     h.router = bf("moe_router.weight");
-                    h.sgw = bf("shared_expert_gate.weight");
                     want(h.router, w_->hidden * w_->moe.experts, "moe_router");
-                    want(h.sgw, w_->hidden, "shared_expert_gate");
+                    if (gb.shared_gated) {
+                        h.sgw = bf("shared_expert_gate.weight");
+                        want(h.sgw, w_->hidden, "shared_expert_gate");
+                    }
+                }
+                if (gb.kind == "full" && gb.sinks) {
+                    h.sinks = bf("attn_sinks.weight");
+                    want(h.sinks, gb.nh, "attn_sinks");
                 }
                 if (gb.kind == "linear") {
                     // The host reads alpha / beta as [hidden, lanes]. The 35B's container stores
@@ -1576,7 +1621,9 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
         uint64_t kv_slack = 0;
         for (const auto& [kn, kd] : w_->kernels)
             if (kd.patch == "attnpos" && kd.rb > 2) kv_slack = std::max<uint64_t>(kv_slack, kd.rb - 2);
-        state_.push_back(alloc(lt.state_kind == "kv" ? (cfg_.max_ctx + kv_slack) * lt.state_row : lt.state_bytes));
+        // a sliding-window layer's cache: state_ring rows, slid (kv_room), not one per position
+        const uint64_t kv_rows = lt.state_ring ? std::min<uint64_t>(lt.state_ring, cfg_.max_ctx + kv_slack) : cfg_.max_ctx + kv_slack;
+        state_.push_back(alloc(lt.state_kind == "kv" ? kv_rows * lt.state_row : lt.state_bytes));
         if (progress) progress(l + 1, nl_ + 1);
         // This layer's source pages are packed and uploaded: let them go now rather than after
         // the last layer, so the peak is one layer of mapped file, not the whole file (a GGUF
@@ -1591,6 +1638,13 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     for (const auto& [name, bytes] : w_->globals) {
         if (name == "lmpool" && skip_pools) {
             continue;
+        } else if (name == "lmpool" && q41_cpu_ && !w_->lmhead_ops.empty() && w_->lmhead_ops[0].op == "std_perm") {
+            // a q4_1 head (Flint): the band-order chunks on the host, read by gemv_q41_rows
+            lm_q41_.assign(bytes, 0);
+            pools::pack_lmhead(*w_, *file_, lm_q41_.data());
+            head_q41_ = true;
+            cpu_head_ = true;
+            log("CPU decode: the q4_1 lm_head on the CPU (" + std::to_string(bytes >> 20) + " MB)");
         } else if (name == "lmpool" && (drop_pools_ || q41_cpu_) && !(std::getenv("OFLM_OPEN_CPU_HEAD") && *std::getenv("OFLM_OPEN_CPU_HEAD") == '0')) {
             // CPU decode: the head on the CPU, repacked once; the NPU copy only to check it
             cpu_head_check_ = std::getenv("OFLM_OPEN_CPU_HEAD_CHECK") && *std::getenv("OFLM_OPEN_CPU_HEAD_CHECK") == '1';
@@ -1701,8 +1755,31 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     mem_report("after load");
 }
 
+uint16_t* Core::kv_ptr(int l) {
+    // position p's row at the result + p * row; below kv_base_[l] nothing is read (see core.hpp)
+    const size_t row = types_[l]->state_row / 2;
+    return state_[l].map<uint16_t*>() - static_cast<ptrdiff_t>(kv_base_[static_cast<size_t>(l)] * row);
+}
+
+void Core::kv_room(int l, size_t p_end, size_t keep_from) {
+    const LayerType& lt = *types_[l];
+    if (!lt.state_ring) return;
+    size_t& base = kv_base_[static_cast<size_t>(l)];
+    const size_t cap = state_[l].size() / lt.state_row;
+    if (p_end <= base + cap) return;
+    const size_t nb = keep_from / 64 * 64;
+    if (nb < base || p_end > nb + cap)
+        throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": a sliding cache of " + std::to_string(cap) +
+                                 " rows cannot hold positions " + std::to_string(nb) + " to " + std::to_string(p_end));
+    uint8_t* b = state_[l].map<uint8_t*>();
+    const size_t sh = nb - base;
+    std::memmove(b, b + sh * lt.state_row, (cap - sh) * lt.state_row);
+    base = nb;
+}
+
 void Core::reset() {
     kv8_valid_.assign(kv8_valid_.size(), 0);
+    kv_base_.assign(kv_base_.size(), 0);
     spec_flush();
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: reset before load_weights");
     hist_ids_.clear();
@@ -3346,9 +3423,12 @@ bool Core::cpu_decode_ok() const {
         if (!cpu_head_ || static_cast<int>(hc_.size()) != nl_) return false;
         for (int l = 0; l < nl_; ++l) {
             const GemmBlockProgram& gb = types_[l]->gemm_block;
-            if ((gb.kind != "linear" && gb.kind != "full") || gb.program.size() < 2 || gb.has_dense_ffn() ||
-                gb.shared_program.size() < 2 || hc_[l].router.empty() || hc_[l].sgw.empty())
-                return false;
+            if ((gb.kind != "linear" && gb.kind != "full") || gb.program.size() < 2) return false;
+            if (gb.has_dense_ffn()) {   // Flint's first two layers: a dense FFN on the pool (up | gate, down)
+                if (gb.ffn_program.size() < 2) return false;
+                continue;
+            }
+            if (gb.shared_program.size() < 2 || hc_[l].router.empty() || (gb.shared_gated && hc_[l].sgw.empty())) return false;
         }
         return true;
     }
@@ -3534,19 +3614,22 @@ void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
     const size_t ff = gb.shared_ff, stripe = w_->moe.stripe;
     const uint8_t* pool = pools_[l].map<const uint8_t*>();
     MoeCpuW W;
-    W.Wr = hc.router.data(); W.sgw = hc.sgw.data();
-    W.E = w_->moe.experts; W.topk = w_->moe.topk; W.ff = ff;
+    W.Wr = hc.router.data(); W.sgw = gb.shared_gated ? hc.sgw.data() : nullptr;
+    W.E = w_->moe.experts; W.topk = w_->moe.topk;
+    // the routed experts' width from the pool layout (an expert's down: hidden x ff); the shared one's own
+    W.ff = w_->moe.up_bytes * 8 / 5 / w_->hidden; W.sff = ff;
+    W.sigmoid = w_->router.present && w_->router.gating == "sigmoid";
     W.sh_ug = q41_weight(l, gb.shared_program[0].args[0]);
     W.sh_dn = q41_weight(l, gb.shared_program[1].args[0]);
     // the pool's experts: [up | gate] 128-row stripes interleaved, then the downs (stripes of K = ff)
-    W.up0 = pool + w_->moe.base; W.up_stride = 2 * (ff / 128) * stripe; W.gate_off = stripe; W.up_lay = host::q41_stripe(2 * stripe);
-    W.dn0 = pool + w_->moe.pool_down; W.dn_stride = w_->moe.up_bytes; W.dn_lay = host::q41_stripe(128 * ff * 5 / 8);
+    W.up0 = pool + w_->moe.base; W.up_stride = 2 * (W.ff / 128) * stripe; W.gate_off = stripe; W.up_lay = host::q41_stripe(2 * stripe);
+    W.dn0 = pool + w_->moe.pool_down; W.dn_stride = w_->moe.up_bytes; W.dn_lay = host::q41_stripe(128 * W.ff * 5 / 8);
     if (mbi_on_) { W.mbi_s = mbi_s_.at(static_cast<size_t>(l)).data(); W.npu_layer = l; }
     moe_cpu(W, xn, R, x);
 }
 
 void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
-    const size_t hid = w_->hidden, E = W.E, topk = W.topk, ff = W.ff;
+    const size_t hid = w_->hidden, E = W.E, topk = W.topk, ff = W.ff, sff = W.sff ? W.sff : W.ff;
     // OFLM_OPEN_DEC_NPU_AB=a,b (debug): even layers take share a, odd layers b, and the two parities'
     // MoE times are summed apart -- an A/B under the same DDR load (the GPU job's comes in phases)
     static const std::array<long, 2> ab = [] {
@@ -3570,7 +3653,7 @@ void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
     static thread_local std::vector<float> probs, wt, hsh, ysh, hu, hd, ye;
     static thread_local std::vector<int32_t> idx;
     probs.resize(R * E); idx.resize(R * topk); wt.resize(R * topk);
-    host::router_block(R, hid, E, topk, xn, W.Wr, probs.data(), idx.data(), wt.data());
+    host::router_block(R, hid, E, topk, xn, W.Wr, probs.data(), idx.data(), wt.data(), W.sigmoid);
     // the experts to run, ascending, each with the rows that chose it
     ExRows ex;   // (expert, [(row, weight)])
     {
@@ -3614,14 +3697,14 @@ void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
     // (stripes) -- work items of one 64-row band
     const uint8_t* sh_up = W.sh_ug;
     const uint8_t* sh_dn = W.sh_dn;
-    hsh.resize(R * 2 * ff);
+    hsh.resize(R * 2 * sff);
     hu.resize(NE * R * 2 * ff);
     struct Item { const uint8_t* base; host::Q41Lay lay; size_t K, b; const host::Q41X* x[8]; float* y[8]; size_t R; };
     std::vector<Item> items;
-    items.reserve((NE * 2 + 2) * (2 * ff / 64) + 64);
-    for (size_t b = 0; b < 2 * ff / 64; ++b) {
+    items.reserve((NE * 2 + 2) * (2 * ff / 64) + 2 * sff / 64 + 64);
+    for (size_t b = 0; b < 2 * sff / 64; ++b) {
         Item it{sh_up, host::q41_std(hid), hid, b, {}, {}, R};
-        for (size_t r = 0; r < R; ++r) { it.x[r] = &xq[r]; it.y[r] = hsh.data() + r * 2 * ff; }
+        for (size_t r = 0; r < R; ++r) { it.x[r] = &xq[r]; it.y[r] = hsh.data() + r * 2 * sff; }
         items.push_back(it);
     }
     for (size_t i = 0; i < NE; ++i) {
@@ -3649,24 +3732,26 @@ void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
     static double ph1 = 0, ph2 = 0, tot = 0; static size_t calls = 0, nex = 0;
     ph1 += ms_since(tp1);
     // h = silu(gate) * up for the shared expert and each (expert, row)
-    hd.resize((NE * R + R) * ff);
-    auto silu_mul = [&](const float* u, const float* g, float* o) {
-        for (size_t j = 0; j < ff; ++j) o[j] = g[j] / (1.f + std::exp(-g[j])) * u[j];
+    // (the shared rows after the experts' NE R rows of ff, sff wide each)
+    hd.resize(NE * R * ff + R * sff);
+    auto silu_mul = [&](const float* u, const float* g, float* o, size_t n) {
+        for (size_t j = 0; j < n; ++j) o[j] = g[j] / (1.f + std::exp(-g[j])) * u[j];
     };
-    for (size_t r = 0; r < R; ++r) silu_mul(hsh.data() + r * 2 * ff, hsh.data() + r * 2 * ff + ff, hd.data() + (NE * R + r) * ff);
+    float* hds = hd.data() + NE * R * ff;
+    for (size_t r = 0; r < R; ++r) silu_mul(hsh.data() + r * 2 * sff, hsh.data() + r * 2 * sff + sff, hds + r * sff, sff);
     for (size_t i = 0; i < NE; ++i)
         for (size_t j = 0; j < ex[i].second.size(); ++j)
-            silu_mul(hu.data() + (i * R + j) * 2 * ff, hu.data() + (i * R + j) * 2 * ff + ff, hd.data() + (i * R + j) * ff);
+            silu_mul(hu.data() + (i * R + j) * 2 * ff, hu.data() + (i * R + j) * 2 * ff + ff, hd.data() + (i * R + j) * ff, ff);
     // phase 2: the downs, each (expert, row) its own input
     std::vector<host::Q41X> hq((NE + 1) * R);
     for (size_t i = 0; i < NE; ++i)
         for (size_t j = 0; j < ex[i].second.size(); ++j) host::q41_prep_x(hd.data() + (i * R + j) * ff, ff, hq[i * R + j]);
-    for (size_t r = 0; r < R; ++r) host::q41_prep_x(hd.data() + (NE * R + r) * ff, ff, hq[NE * R + r]);
+    for (size_t r = 0; r < R; ++r) host::q41_prep_x(hds + r * sff, sff, hq[NE * R + r]);
     ysh.resize(R * hid);
     ye.resize(NE * R * hid);
     items.clear();
     for (size_t b = 0; b < hid / 64; ++b) {
-        Item it{sh_dn, host::q41_std(ff), ff, b, {}, {}, R};
+        Item it{sh_dn, host::q41_std(sff), sff, b, {}, {}, R};
         for (size_t r = 0; r < R; ++r) { it.x[r] = &hq[NE * R + r]; it.y[r] = ysh.data() + r * hid; }
         items.push_back(it);
         for (size_t i = 0; i < NE; ++i) {
@@ -3682,8 +3767,11 @@ void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
     ph2 += ms_since(tp2);
     // x += gate * shared, then the experts ascending
     for (size_t r = 0; r < R; ++r) {
-        const double d = host::bf16x_dot(xn + r * hid, W.sgw, hid);
-        const float gate = 1.f / (1.f + std::exp(-static_cast<float>(d)));
+        float gate = 1.f;
+        if (W.sgw) {
+            const double d = host::bf16x_dot(xn + r * hid, W.sgw, hid);
+            gate = 1.f / (1.f + std::exp(-static_cast<float>(d)));
+        }
         for (size_t i = 0; i < hid; ++i) x[r * hid + i] += gate * ysh[r * hid + i];
     }
     for (size_t i = 0; i < NE; ++i)
@@ -4093,13 +4181,17 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
                 std::copy(yr, yr + qw, ya.begin() + r * qw);
                 std::copy(yr + qw, yr + qw + kvw, yb.begin() + r * kvw);
                 std::copy(yr + qw + kvw, yr + qw + 2 * kvw, yc.begin() + r * kvw);
-                std::copy(yr + qw + 2 * kvw, yr + 2 * qw + 2 * kvw, yd.begin() + r * qw);
+                if (gb.gate) std::copy(yr + qw + 2 * kvw, yr + 2 * qw + 2 * kvw, yd.begin() + r * qw);
             }
             host::AttnGeom g;
             g.T = R; g.t_real = R; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
             g.pos0 = pos; g.eps = gb.eps;
+            g.sinks = hc.sinks.empty() ? nullptr : hc.sinks.data();
+            g.window = gb.window;
+            // a sliding-window layer: room for the rows, keeping the first row's window
+            if (lt.state_ring) kv_room(l, pos + R, pos + 1 > gb.window ? pos + 1 - gb.window : 0);
             static const bool kv8_on = [] { const char* e = std::getenv("OFLM_OPEN_KV8"); return !(e && *e == '0'); }();
-            if (q41_cpu_ && kv8_on && __builtin_cpu_supports("avx512bf16")) {
+            if (q41_cpu_ && kv8_on && !gb.window && __builtin_cpu_supports("avx512bf16")) {
                 // the int8 copy: rows the bf16 cache got from elsewhere (a prompt, an NPU step) first
                 if (kv8_.size() != static_cast<size_t>(nl_)) { kv8_.assign(nl_, {}); kv8_valid_.assign(nl_, 0); }
                 kv8_row_ = 2 * gb.kvh * gb.hd + 8 * gb.kvh;
@@ -4110,8 +4202,8 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
                 g.kv8_row = kv8_row_;
                 kv8_valid_[l] = pos + R;
             }
-            host::attention_block(g, ya.data(), yb.data(), yc.data(), yd.data(), hc.qn.data(), hc.kn.data(),
-                                  man_.rope_inv_freq.data(), state_[l].map<uint16_t*>(), row / 2, og.data());
+            host::attention_block(g, ya.data(), yb.data(), yc.data(), gb.gate ? yd.data() : nullptr, hc.qn.data(), hc.kn.data(),
+                                  man_.rope_inv_freq.data(), kv_ptr(l), row / 2, og.data());
         }
         timing_.part1_ms += ms_since(th);
         mid = og;
@@ -4119,27 +4211,63 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
         const size_t no = y.size() / R;
         for (size_t r = 0; r < R; ++r)
             for (size_t i = 0; i < hid; ++i) x[r * hid + i] += y[r * no + i];
+        // OFLM_OPEN_DUMP_LAYERS=<dir> with OFLM_OPEN_DUMP_POS=<p> (debug): the last row at position p, after
+        // the attention (ffn_inp-<l>) and after the layer (l_out-<l>), f32 -- llama.cpp's tensor names
+        static const char* dump_dir = std::getenv("OFLM_OPEN_DUMP_LAYERS");
+        static const long dump_pos = std::getenv("OFLM_OPEN_DUMP_POS") ? std::atol(std::getenv("OFLM_OPEN_DUMP_POS")) : -1;
+        const bool dump_now = dump_dir && static_cast<long>(pos + R - 1) == dump_pos;
+        auto dump_row = [&](const char* what, const float* v) {
+            if (!dump_now) return;
+            const std::string fn = std::string(dump_dir) + "/" + what + "-" + std::to_string(l) + ".bin";
+            if (FILE* f = std::fopen(fn.c_str(), "wb")) { std::fwrite(v + (R - 1) * hid, 4, hid, f); std::fclose(f); }
+        };
+        dump_row("ffn_inp", x.data());
+        if (dump_now) {   // og-<l>: the attention output, [qw]
+            const std::string fn = std::string(dump_dir) + "/og-" + std::to_string(l) + ".bin";
+            if (FILE* f = std::fopen(fn.c_str(), "wb")) { std::fwrite(mid.data() + (R - 1) * gb.qw, 4, gb.qw, f); std::fclose(f); }
+        }
         host::rmsnorm_rows(x.data(), R, hid, hc.postln.data(), gb.eps, xn.data());
         if (!gb.has_dense_ffn()) {
             moe_cpu_rows(l, xn.data(), R, x.data());
+            dump_row("l_out", x.data());
             continue;
         }
         gemv(gb.ffn_program[0], l, xn.data(), h);
-        // up|gate C: every 128-column tile is [gate 64 | up 64]; h = silu(gate) * up
         const size_t ug = h.size() / R, ff = ug / 2;
         og.resize(R * ff);
-        for (size_t r = 0; r < R; ++r) host::swiglu_tiles(h.data() + r * ug, ff, og.data() + r * ff);
+        if (q41_cpu_) {
+            // the pool's rows: [up ff | gate ff]
+            for (size_t r = 0; r < R; ++r)
+                for (size_t j = 0; j < ff; ++j) {
+                    const float gt = h[r * ug + ff + j];
+                    og[r * ff + j] = gt / (1.f + std::exp(-gt)) * h[r * ug + j];
+                }
+        } else {
+            // up|gate C: every 128-column tile is [gate 64 | up 64]; h = silu(gate) * up
+            for (size_t r = 0; r < R; ++r) host::swiglu_tiles(h.data() + r * ug, ff, og.data() + r * ff);
+        }
         gemv(gb.ffn_program[1], l, og.data(), y);
         const size_t nd = y.size() / R;
         for (size_t r = 0; r < R; ++r)
             for (size_t i = 0; i < hid; ++i) x[r * hid + i] += y[r * nd + i];
+        dump_row("l_out", x.data());
     }
     state_owner_ = 1;
     pos_ += static_cast<int>(R);
     dump_hidden(x.data(), R, hid, toks);
     last_x_.assign(x.end() - static_cast<long>(hid), x.end());
     rows_x_.assign(x.begin(), x.end());
-    if (want_logits && R > 1 && cpu_head_ && !head_b4_main_ && !cpu_head_check_) {
+    if (want_logits && R > 1 && head_q41_) {
+        auto tl = std::chrono::steady_clock::now();
+        if (normw_f_.empty()) tail_logits(x.data());      // fills normw_f_
+        static thread_local std::vector<float> hn;
+        hn.resize(R * hid);
+        host::rmsnorm_rows(x.data(), R, hid, normw_f_.data(), types_[0]->gemm_block.eps, hn.data());
+        rows_logits_.resize(R * w_->vocab);
+        host::gemv_q41_rows(lm_q41_.data(), host::q41_std(hid), w_->vocab, hid, hn.data(), R, rows_logits_.data(), w_->vocab);
+        std::copy(rows_logits_.end() - static_cast<long>(w_->vocab), rows_logits_.end(), logits_host_.begin());
+        timing_.lmhead_ms = ms_since(tl);
+    } else if (want_logits && R > 1 && cpu_head_ && !head_b4_main_ && !cpu_head_check_) {
         // the rows' final norms, then the q8 head read once for all of them
         auto tl = std::chrono::steady_clock::now();
         if (normw_f_.empty()) tail_logits(x.data());      // fills normw_f_
@@ -4760,7 +4888,9 @@ void Core::tail_logits(const float* row) {
     auto t1 = std::chrono::steady_clock::now();
     if (cpu_head_) {
         const size_t hid = w_->hidden;
-        if (normw_f_.empty()) {
+        if (normw_f_.empty() && head_q41_) {
+            normw_f_ = file_->bf16(w_->norm_tensor);    // f32 in Flint's container, exact
+        } else if (normw_f_.empty()) {
             const uint16_t* nw = buffer("normw", 0).map<const uint16_t*>();
             normw_f_.resize(hid);
             for (size_t i = 0; i < hid; ++i) normw_f_[i] = bf16_to_f32(nw[i]);
@@ -4768,6 +4898,11 @@ void Core::tail_logits(const float* row) {
         static thread_local std::vector<float> xn;
         xn.resize(hid);
         host::rmsnorm_rows(row, 1, hid, normw_f_.data(), types_[0]->gemm_block.eps, xn.data());
+        if (head_q41_) {
+            host::gemv_q41_rows(lm_q41_.data(), host::q41_std(hid), w_->vocab, hid, xn.data(), 1, logits_host_.data(), w_->vocab);
+            timing_.lmhead_ms = ms_since(t1);
+            return;
+        }
         if (head_b4_main_) host::gemv_b4(lm_b4_.data(), w_->vocab, hid, xn.data(), logits_host_.data());
         else if (head2_on()) host::lmhead_two_stage_rows(lm_cpu_.data(), lm_b4_.data(), w_->vocab, hid, xn.data(), 1, logits_host_.data(),
                                                          w_->real_vocab ? w_->real_vocab : w_->vocab, head2_k(), head2_check());
@@ -5667,7 +5802,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         Dsmall["m"] = S["m"];
         Dsmall["mt"] = S.value("mt", 128);
         Dsmall["kernels2"] = S["kernels2"];
-        for (const auto& [k, v] : S["ffn"].items()) Dsmall["ffn"][k] = v;
+        for (const char* fk : {"ffn", "ffn_dense"})
+            if (S.contains(fk))
+                for (const auto& [k, v] : S[fk].items()) Dsmall[fk][k] = v;
         Dp = &Dsmall;
     }
     const nlohmann::json& D = *Dp;
@@ -5701,11 +5838,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             for (size_t t = a; t < b; ++t) rpos[t] = t - a;
         }
     }
-    const size_t ff = D["ffn"]["ff"].get<size_t>();
+    // the widest FFN the layers run (Flint: the dense layers' 6144 beside the shared expert's 1024)
+    size_t ff = D["ffn"]["ff"].get<size_t>();
+    if (D.contains("ffn_dense")) ff = std::max(ff, D["ffn_dense"]["ff"].get<size_t>());
     size_t wq = 0, wmid = 0;
     for (int l = 0; l < nl_; ++l) {
         const GemmBlockProgram& gb = types_[l]->gemm_block;
-        const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
+        const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : (gb.gate ? 2 : 1) * gb.qw + 2 * gb.kvw;
         wq = std::max(wq, nq);
         wmid = std::max(wmid, gb.kind == "linear" ? gb.vw : gb.qw);
     }
@@ -5768,13 +5907,16 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // fa.ncb: K / V packed per full-attention layer into a pair of buffers that alternate by
     // full layer (a layer's attention is done before the next-but-one full layer's MID starts)
     std::vector<int> full_ord(nl_, 0);
-    size_t fab_nh = 0, fab_kvh = 0;
+    size_t fab_nh = 0, fab_kvh = 0, fa_skc = 0;
     for (int l = 0, n = 0; l < nl_; ++l)
-        if (types_[l]->gemm_block.kind == "full") {
+        if (types_[l]->gemm_block.kind == "full" && !types_[l]->gemm_block.window) {   // (window layers: the host's)
             full_ord[l] = n++;
             fab_nh = types_[l]->gemm_block.nh;
             fab_kvh = types_[l]->gemm_block.kvh;
+            if (types_[l]->gemm_block.sinks) fa_skc = 64;
         }
+    // the NPU attention kernel's head dim (dit_fa256b: 256; Flint's 128 runs zero-padded in it)
+    const size_t fa_hd = D.contains("fa") ? D["fa"].value("hd", size_t{0}) : 0;
     // fa.cb (designs/dit_fa256b causal, ~3x dit_fa256): the causal prompt's NPU attention when the
     // prompt starts at position 0 (the packs hold this prompt's K / V rows only), from
     // OFLM_OPEN_FA_CB_MIN keys (default 1024; dit_fa256 keeps OFLM_OPEN_FA_MIN_LK); Q / K / V
@@ -5793,12 +5935,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     const size_t fcb_min = full_m ? cb_min : cbs_min;
     const size_t MQ = cbs_m ? cbs_mm : M;                    // the causal stream's query rows (M, or padded)
     const size_t KSTEP = cbs_m ? cbs_mm : M;                 // its key counts' step
-    const size_t lkc = (pos0 + C * M + KSTEP - 1) / KSTEP * KSTEP;   // the causal packs' key capacity
+    const size_t lkc = (pos0 + C * M + fa_skc + KSTEP - 1) / KSTEP * KSTEP;   // the causal packs' key capacity
     // a prompt after earlier turns (pos0 > 0): chunk c's queries are positions pos0 + c M ..; its
     // fa.cb stream the one for the key count rounded up to M, its query offset patched in (the
     // q_off sentinel, fa.cb_qoff)
+    // (Flint: its sinks ride as a 64-key chunk in front of the keys, fa_skc)
     auto fa_kernel = [&](size_t c) -> std::string {
-        const size_t lk = pos0 + (c + 1) * M, lkr = (lk + KSTEP - 1) / KSTEP * KSTEP;
+        const size_t lk = pos0 + (c + 1) * M + fa_skc, lkr = (lk + KSTEP - 1) / KSTEP * KSTEP;
         if (!fa_on) return {};
         const bool patchable = pos0 == 0 || D["fa"].contains("cb_qoff");
         if (patchable && FCB.contains(std::to_string(lkr)) && lkr >= fcb_min) return FCB[std::to_string(lkr)].get<std::string>();
@@ -5806,6 +5949,18 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         return FA[std::to_string(lk)].get<std::string>();
     };
     auto is_cb = [](const std::string& k) { return k.rfind("fa256bc", 0) == 0; };
+    // fa.win (Flint's sliding layers): a chunk's MQ queries over the sink chunk and its keys from window - 1
+    // before it, one stream for every chunk (lk = MQ + 1024 keys), the query offset patched per call; from
+    // OFLM_OPEN_FA_W_MIN prompt tokens (default 512), else the host's
+    static const size_t faw_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_W_MIN"); return e ? std::strtoul(e, nullptr, 10) : 512ul; }();
+    std::string faw_kernel;
+    size_t faw_lk = 0;
+    if (cb_ok && fa_on && N >= faw_min && D["fa"].contains("win") && D["fa"]["win"].contains(std::to_string(MQ)) && (full_m || cbs_m)) {
+        faw_kernel = D["fa"]["win"][std::to_string(MQ)]["kernel"].get<std::string>();
+        faw_lk = D["fa"]["win"][std::to_string(MQ)]["lk"].get<size_t>();
+    }
+    // a window layer's first packed key for the chunk at query position p (64-aligned), and its q_off
+    auto faw_kst = [&](size_t p, size_t W) { return p + 1 > W ? (p + 1 - W) / 64 * 64 : size_t{0}; };
     bool any_cb = false;
     for (size_t c = 0; c < C && fab_nh; ++c) any_cb = any_cb || is_cb(fa_kernel(c));   // (no full layer: none)
     // a causal stream's query offset, patched in right before its dispatch (two chunks of the tiny
@@ -5846,15 +6001,19 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             need("fa_q_" + cs, M * wmid * 2);
             need("fa_o_" + cs, M * wmid * 2);
         }
-        if (nc_b || any_cb) need("fab_q_" + cs, fab_nh * (MQ / 32) * kFabQBlock);
-        if (any_cb) { need("fa_o_" + cs, MQ * wmid * 2); }
+        if (nc_b || any_cb || !faw_kernel.empty()) need("fab_q_" + cs, fab_nh * (MQ / 32) * kFabQBlock);
+        if (any_cb || !faw_kernel.empty()) { need("fa_o_" + cs, MQ * std::max(wmid, fab_nh * fa_hd) * 2); }
+        if (!faw_kernel.empty()) {
+            need("faw_k_" + cs, (faw_lk / 64) * fab_kvh * kFabChunk);
+            need("faw_v_" + cs, (faw_lk / 64) * fab_kvh * kFabChunk);
+        }
     }
     if (nc_b)
         for (const char* nm : {"fab_k0", "fab_k1", "fab_v0", "fab_v1"})
             need(nm, fab_kvh * (lkn / 64) * kFabChunk);
     if (any_cb)
         for (int l = 0; l < nl_; ++l)
-            if (types_[l]->gemm_block.kind == "full") {
+            if (types_[l]->gemm_block.kind == "full" && !types_[l]->gemm_block.window) {
                 need("fabc_k" + std::to_string(full_ord[l]), fab_kvh * (lkc / 64) * kFabChunk);
                 need("fabc_v" + std::to_string(full_ord[l]), fab_kvh * (lkc / 64) * kFabChunk);
             }
@@ -5876,7 +6035,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         auto& o = ops[l];
         o = {PRE, QKV, MID};
         if (dnc_on && types_[l]->gemm_block.kind == "linear") o.insert(o.end(), {DNC, MIDB});
-        if (types_[l]->gemm_block.kind == "full" && (!FA.empty() || !FCB.empty() || noncausal_)) o.insert(o.end(), {FAT, GATE});
+        if (types_[l]->gemm_block.kind == "full" &&
+            (!FA.empty() || !FCB.empty() || noncausal_ || (types_[l]->gemm_block.window && !faw_kernel.empty())))
+            o.insert(o.end(), {FAT, GATE});
         o.insert(o.end(), {OUT, TAIL, UP});
         if (down2 && !ffn_dev) {
             if (is_moe(l)) throw std::runtime_error("open_qwen36: the MoE prompt pipeline runs the shared expert on the device FFN (dit2 pack_h / a_units)");
@@ -6095,7 +6256,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     wait_run(f);
                     pevent('K', l, c, op, tk, k);
                 };
-                const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
+                const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : (gb.gate ? 2 : 1) * gb.qw + 2 * gb.kvw;
                 const size_t km = gb.kind == "linear" ? gb.vw : gb.qw;
                 if (op == DNC) {
                     const std::string ks = std::to_string(dset_of[cell(l, c)]);
@@ -6118,10 +6279,15 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     // noncausal on the host: the barrier only; GATE runs the attention
                 } else if (op == FAT) {
                     auto tf = std::chrono::steady_clock::now();
-                    const std::string fk = fa_kernel(c);
-                    if (is_cb(fk)) {
+                    const std::string fk = gb.window ? faw_kernel : fa_kernel(c);
+                    if (gb.window) {
+                        // fa.win: the chunk's queries at packed key p - kst + 64 (after the sink chunk)
+                        const size_t p = pos0 + c * M;
+                        cb_qoff(fk, static_cast<uint32_t>(p - faw_kst(p, gb.window) + 64));
+                        run(fk, {"fab_q_" + cs, "faw_k_" + cs, "faw_v_" + cs, "fa_o_" + cs});
+                    } else if (is_cb(fk)) {
                         const std::string fo = std::to_string(full_ord[l]);
-                        cb_qoff(fk, static_cast<uint32_t>(pos0 + c * M));
+                        cb_qoff(fk, static_cast<uint32_t>(pos0 + c * M + fa_skc));
                         run(fk, {"fab_q_" + cs, "fabc_k" + fo, "fabc_v" + fo, "fa_o_" + cs});
                     } else {
                         run(fk, {"fa_q_" + cs, "state", "state", "fa_o_" + cs});
@@ -6135,9 +6301,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 } else if (op == UP && ffn_dev) {
                     // a MoE layer: the shared expert here, then the chunk's routed-expert passes
                     const std::vector<Step>& fp = is_moe(l) ? gb.shared_program : gb.ffn_program;
+                    const nlohmann::json& FS = D[is_moe(l) ? std::string("ffn") : gb.ffn_key];   // Flint's dense layers: ffn_dense
                     if (!(shared_mbi_ && is_moe(l))) {   // OFLM_OPEN_SHARED_MBI: in the mbi passes instead
-                        run(D["ffn"]["up2p"].get<std::string>(), {"pp_a2_" + cs, fp[0].args[0], "pp_hu"});
-                        run(D["ffn"]["down2u"].get<std::string>(), {"pp_hu", fp[1].args[0], "pp_y_" + cs});
+                        run(FS["up2p"].get<std::string>(), {"pp_a2_" + cs, fp[0].args[0], "pp_hu"});
+                        run(FS["down2u"].get<std::string>(), {"pp_hu", fp[1].args[0], "pp_y_" + cs});
                     }
                     if (is_moe(l) && c == glast(c)) {
                         const size_t set = (c / G) % 2;
@@ -6290,13 +6457,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             auto th = std::chrono::steady_clock::now();
             if (op == PRE) {
                 host::rmsnorm_rows(xr, t_real, hid, hc.ln.data(), gb.eps, xc);
-                const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
+                const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : (gb.gate ? 2 : 1) * gb.qw + 2 * gb.kvw;
                 if (has2(nq, hid)) to_bfp2(xc, hid, "pp_a2_" + cs, t_real);
                 else to_bf16(xc, M, hid, "pp_a_" + cs);
             } else if (op == MID) {
                 xrt::bo& qb = buffer("pp_q_" + cs, 0);
                 const bool lin = gb.kind == "linear";
-                const size_t nq = lin ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
+                const size_t nq = lin ? gb.qkv_dim + gb.vw : (gb.gate ? 2 : 1) * gb.qw + 2 * gb.kvw;
                 read_back(qb, t_real * nq * 2, 0);
                 const uint16_t* q16 = qb.map<const uint16_t*>();
                 xrt::bo& st = state_[l];
@@ -6387,8 +6554,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     }
                 } else {
                     const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
-                    const std::string fk = fa_kernel(c);
-                    if (c == 0 && pos0 > 0) read_back(st, pos0 * row, 0);
+                    const std::string fk = gb.window ? faw_kernel : fa_kernel(c);   // a window layer: fa.win's stream
+                    // a sliding-window layer (Flint): its cache is host-side only and slides (kv_room)
+                    if (c == 0 && pos0 > 0 && !lt.state_ring) read_back(st, pos0 * row, 0);
+                    if (lt.state_ring) kv_room(static_cast<int>(l), pos0 + r0 + t_real, pos0 + r0 + 1 > gb.window ? pos0 + r0 + 1 - gb.window : 0);
+                    uint16_t* const kvl = kv_ptr(static_cast<int>(l));   // position p's row at kvl + p * row / 2
                     ya.resize(M * qw); yb.resize(M * kvw); yc.resize(M * kvw); yd.resize(M * qw); og.resize(M * qw);
 #pragma omp parallel for
                     for (long long t = 0; t < static_cast<long long>(t_real); ++t) {
@@ -6396,13 +6566,15 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         for (size_t i = 0; i < qw; ++i) ya[t * qw + i] = bf16_to_f32(r[i]);
                         for (size_t i = 0; i < kvw; ++i) yb[t * kvw + i] = bf16_to_f32(r[qw + i]);
                         for (size_t i = 0; i < kvw; ++i) yc[t * kvw + i] = bf16_to_f32(r[qw + kvw + i]);
-                        if (fk.empty())
+                        if (fk.empty() && gb.gate)
                             for (size_t i = 0; i < qw; ++i) yd[t * qw + i] = bf16_to_f32(r[qw + 2 * kvw + i]);
                     }
                     host::AttnGeom g;
                     g.T = M; g.t_real = t_real; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
                     g.pos0 = pos0 + r0; g.eps = gb.eps;
                     g.rpos = packed ? rpos.data() + r0 : nullptr;
+                    g.sinks = hc.sinks.empty() ? nullptr : hc.sinks.data();
+                    g.window = gb.window;
                     auto ta = std::chrono::steady_clock::now();
                     const bool cbk = !noncausal_ && is_cb(fk);
                     if ((noncausal_ && nc_npu && nc_b) || cbk) {
@@ -6413,16 +6585,19 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             std::vector<float> gt(M * qw), ref(M * qw);
 #pragma omp parallel for
                             for (long long t = 0; t < static_cast<long long>(M); ++t)
-                                for (size_t i = 0; i < qw; ++i) gt[t * qw + i] = bf16_to_f32(q16[t * nq + qw + 2 * kvw + i]);
-                            host::attention_block(g, ya.data(), yb.data(), yc.data(), gt.data(), hc.qn.data(), hc.kn.data(),
-                                                  man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, ref.data());
+                                for (size_t i = 0; i < qw && gb.gate; ++i) gt[t * qw + i] = bf16_to_f32(q16[t * nq + qw + 2 * kvw + i]);
+                            host::attention_block(g, ya.data(), yb.data(), yc.data(), gb.gate ? gt.data() : nullptr, hc.qn.data(), hc.kn.data(),
+                                                  man_.rope_inv_freq.data(), kvl, row / 2, ref.data());
                             fa_ref[cell(l, c)] = std::move(ref);
                         }
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
-                                             man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
+                                             man_.rope_inv_freq.data(), kvl, row / 2, og.data());
                         sadd(timing_.attn_ms, ms_since(ta));
                         const size_t MQr = cbk ? MQ : M;            // the stream's query rows (padded past M)
                         const size_t nh = gb.nh, kvh = gb.kvh, hd = gb.hd, qb_head = (MQr / 32) * kFabQBlock;
+                        // Flint (head dim 128 on the 256 kernel, learned sinks): the real dims, the rest zero; the
+                        // sinks as a 64-key chunk in front (fab_sink_k), every real key one chunk later
+                        const size_t grp = nh / kvh, skc = gb.sinks ? 64 : 0;
                         xrt::bo& qbuf = buffer("fab_q_" + cs, 0);
                         uint8_t* qm = qbuf.map<uint8_t*>();
                         const std::string par = std::to_string(full_ord[l] % 2), fo = std::to_string(full_ord[l]);
@@ -6433,20 +6608,29 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         // earlier rows from the cache), from key 0 on a later turn's first chunk
                         const size_t k0 = cbk ? (c == 0 ? 0 : (pos0 + r0) / 64 * 64) : pos0 + r0;
                         const size_t kn_rows = cbk ? pos0 + r0 + t_real - k0 : t_real, kT = cbk ? (kn_rows + 63) / 64 * 64 : M;
-                        const uint16_t* kvr = st.map<const uint16_t*>() + k0 * (row / 2);
+                        const uint16_t* kvr = kvl + k0 * (row / 2);
                         const size_t kv_head = cbk ? kFabChunk : (lkn / 64) * kFabChunk;
                         const size_t cstep = cbk ? kvh * kFabChunk : kFabChunk;
-                        const size_t at = cbk ? (k0 / 64) * cstep : (r0 / 64) * cstep, span = (M / 64) * kFabChunk;
+                        const size_t at = cbk ? ((k0 + skc) / 64) * cstep : (r0 / 64) * cstep, span = (M / 64) * kFabChunk;
 #pragma omp parallel for schedule(dynamic, 1)
                         for (long long w = 0; w < static_cast<long long>(nh + 2 * kvh); ++w) {
                             const size_t u = static_cast<size_t>(w);
                             if (u < nh)
-                                fab_pack_q(og.data(), qw, u * hd, MQr, t_real, 1.4426950408889634f, qm + u * qb_head);
+                                fab_pack_q(og.data(), qw, u * hd, MQr, t_real, 1.4426950408889634f, qm + u * qb_head, hd,
+                                           skc ? static_cast<long>(hd + 8 * (u % grp)) : -1);
                             else if (u < nh + kvh)
-                                fab_pack_k(kvr, row / 2, (u - nh) * hd, kT, kn_rows, kbuf.map<uint8_t*>() + (u - nh) * kv_head + at, cstep);
+                                fab_pack_k(kvr, row / 2, (u - nh) * hd, kT, kn_rows, kbuf.map<uint8_t*>() + (u - nh) * kv_head + at, cstep, hd);
                             else
                                 fab_pack_v(kvr, row / 2, kvh * hd + (u - nh - kvh) * hd, kT, kn_rows,
-                                           vbuf.map<uint8_t*>() + (u - nh - kvh) * kv_head + at, cstep);
+                                           vbuf.map<uint8_t*>() + (u - nh - kvh) * kv_head + at, cstep, hd);
+                        }
+                        if (cbk && skc && c == 0) {   // the sink chunk (chunk 0), every kv head's
+                            for (size_t g2 = 0; g2 < kvh; ++g2) {
+                                fab_sink_k(hc.sinks.data() + g2 * grp, grp, hd, kbuf.map<uint8_t*>() + g2 * kFabChunk);
+                                std::memset(vbuf.map<uint8_t*>() + g2 * kFabChunk, 0, kFabChunk);
+                            }
+                            kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, cstep, 0);
+                            vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, cstep, 0);
                         }
                         qbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, nh * qb_head, 0);
                         if (cbk) {   // the packed keys: one contiguous span over all kv heads
@@ -6461,23 +6645,62 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     } else if (noncausal_ && nc_npu) {
                         // Q for the noncausal stream (unscaled, as the causal one), K / V into the cache
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
-                                             man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
+                                             man_.rope_inv_freq.data(), kvl, row / 2, og.data());
                         sadd(timing_.attn_ms, ms_since(ta));
                         to_bf16(og.data(), M, qw, "fa_q_" + cs, std::sqrt(static_cast<float>(gb.hd)));
                     } else if (noncausal_) {
                         // Q prepped for GATE (after every chunk's K / V rows are in the cache)
                         qprep[c].resize(M * qw);
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
-                                             man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, qprep[c].data());
+                                             man_.rope_inv_freq.data(), kvl, row / 2, qprep[c].data());
                         sadd(timing_.attn_ms, ms_since(ta));
                     } else if (fk.empty()) {
-                        host::attention_block(g, ya.data(), yb.data(), yc.data(), yd.data(), hc.qn.data(), hc.kn.data(),
-                                              man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
+                        host::attention_block(g, ya.data(), yb.data(), yc.data(), gb.gate ? yd.data() : nullptr, hc.qn.data(), hc.kn.data(),
+                                              man_.rope_inv_freq.data(), kvl, row / 2, og.data());
                         sadd(timing_.attn_ms, ms_since(ta));
                         if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs, t_real);
                         else to_bf16(og.data(), M, qw, "pp_m_" + cs);
                         // no NPU attention for this chunk: past FAT and GATE (when the layer has them)
                         if (static_cast<size_t>(stage[cell(l, c)]) + 1 < ops[l].size() && ops[l][stage[cell(l, c)] + 1] == FAT) advance = 3;
+                    } else if (gb.window) {
+                        // fa.win (Flint's sliding layers): Q as for fa.cb; the sink chunk, then keys [kst, p + t_real)
+                        // from the sliding cache, into this chunk's own pair (the stream's query offset: FAT)
+                        if (fa_check) {
+                            std::vector<float> ref(M * qw);
+                            host::attention_block(g, ya.data(), yb.data(), yc.data(), nullptr, hc.qn.data(), hc.kn.data(),
+                                                  man_.rope_inv_freq.data(), kvl, row / 2, ref.data());
+                            fa_ref[cell(l, c)] = std::move(ref);
+                        }
+                        host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
+                                             man_.rope_inv_freq.data(), kvl, row / 2, og.data());
+                        sadd(timing_.attn_ms, ms_since(ta));
+                        const size_t nh = gb.nh, kvh = gb.kvh, hd = gb.hd, grp = nh / kvh, qb_head = (MQ / 32) * kFabQBlock;
+                        const size_t p = pos0 + r0, kst = faw_kst(p, gb.window), nk = p + t_real - kst, kT = (nk + 63) / 64 * 64;
+                        const size_t cstep = kvh * kFabChunk;
+                        if (kT + 64 > faw_lk) throw std::runtime_error("open_qwen36: fa.win: " + std::to_string(nk) + " keys past the stream's " + std::to_string(faw_lk));
+                        uint8_t* qm = buffer("fab_q_" + cs, 0).map<uint8_t*>();
+                        xrt::bo& kbuf = buffer("faw_k_" + cs, 0);
+                        xrt::bo& vbuf = buffer("faw_v_" + cs, 0);
+                        const uint16_t* kvr = kvl + kst * (row / 2);
+#pragma omp parallel for schedule(dynamic, 1)
+                        for (long long w = 0; w < static_cast<long long>(nh + 2 * kvh); ++w) {
+                            const size_t u = static_cast<size_t>(w);
+                            if (u < nh)
+                                fab_pack_q(og.data(), qw, u * hd, MQ, t_real, 1.4426950408889634f, qm + u * qb_head, hd,
+                                           static_cast<long>(hd + 8 * (u % grp)));
+                            else if (u < nh + kvh)
+                                fab_pack_k(kvr, row / 2, (u - nh) * hd, kT, nk, kbuf.map<uint8_t*>() + (u - nh) * kFabChunk + cstep, cstep, hd);
+                            else
+                                fab_pack_v(kvr, row / 2, kvh * hd + (u - nh - kvh) * hd, kT, nk,
+                                           vbuf.map<uint8_t*>() + (u - nh - kvh) * kFabChunk + cstep, cstep, hd);
+                        }
+                        for (size_t g2 = 0; g2 < kvh; ++g2) {
+                            fab_sink_k(hc.sinks.data() + g2 * grp, grp, hd, kbuf.map<uint8_t*>() + g2 * kFabChunk);
+                            std::memset(vbuf.map<uint8_t*>() + g2 * kFabChunk, 0, kFabChunk);
+                        }
+                        buffer("fab_q_" + cs, 0).sync(XCL_BO_SYNC_BO_TO_DEVICE, nh * qb_head, 0);
+                        kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (kT / 64 + 1) * cstep, 0);
+                        vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (kT / 64 + 1) * cstep, 0);
                     } else {
                         // NPU attention: q / k normed and roped here, K / V rows into the cache (synced),
                         // Q to the kernel unscaled (it applies 1 / sqrt(hd) itself; prep scaled by it)
@@ -6485,39 +6708,47 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             std::vector<float> gt(M * qw), ref(M * qw);
 #pragma omp parallel for
                             for (long long t = 0; t < static_cast<long long>(M); ++t)
-                                for (size_t i = 0; i < qw; ++i) gt[t * qw + i] = bf16_to_f32(q16[t * nq + qw + 2 * kvw + i]);
-                            host::attention_block(g, ya.data(), yb.data(), yc.data(), gt.data(), hc.qn.data(), hc.kn.data(),
-                                                  man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, ref.data());
+                                for (size_t i = 0; i < qw && gb.gate; ++i) gt[t * qw + i] = bf16_to_f32(q16[t * nq + qw + 2 * kvw + i]);
+                            host::attention_block(g, ya.data(), yb.data(), yc.data(), gb.gate ? gt.data() : nullptr, hc.qn.data(), hc.kn.data(),
+                                                  man_.rope_inv_freq.data(), kvl, row / 2, ref.data());
                             fa_ref[cell(l, c)] = std::move(ref);
                         }
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
-                                             man_.rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, og.data());
+                                             man_.rope_inv_freq.data(), kvl, row / 2, og.data());
                         sadd(timing_.attn_ms, ms_since(ta));
                         to_bf16(og.data(), M, qw, "fa_q_" + cs, std::sqrt(static_cast<float>(gb.hd)));
                     }
-                    if (!noncausal_ && any_cb && !cbk) {
+                    if (!noncausal_ && any_cb && !cbk && !gb.window) {
                         // a chunk under OFLM_OPEN_FA_CB_MIN: its K / V rows into the fa.cb packs too,
                         // for the later chunks' kernels
-                        const size_t kvh = gb.kvh, hd = gb.hd, cstep = kvh * kFabChunk;
+                        const size_t kvh = gb.kvh, hd = gb.hd, cstep = kvh * kFabChunk, skc = gb.sinks ? 64 : 0;
                         const size_t k0 = c == 0 ? 0 : (pos0 + r0) / 64 * 64, kn_rows = pos0 + r0 + t_real - k0;
-                        const size_t kT = (kn_rows + 63) / 64 * 64, at = (k0 / 64) * cstep;
+                        const size_t kT = (kn_rows + 63) / 64 * 64, at = ((k0 + skc) / 64) * cstep;
                         const std::string fo = std::to_string(full_ord[l]);
                         xrt::bo& kbuf = buffer("fabc_k" + fo, 0);
                         xrt::bo& vbuf = buffer("fabc_v" + fo, 0);
-                        const uint16_t* kvr = st.map<const uint16_t*>() + k0 * (row / 2);
+                        const uint16_t* kvr = kvl + k0 * (row / 2);
 #pragma omp parallel for schedule(dynamic, 1)
                         for (long long w = 0; w < static_cast<long long>(2 * kvh); ++w) {
                             const size_t u = static_cast<size_t>(w);
                             if (u < kvh)
-                                fab_pack_k(kvr, row / 2, u * hd, kT, kn_rows, kbuf.map<uint8_t*>() + u * kFabChunk + at, cstep);
+                                fab_pack_k(kvr, row / 2, u * hd, kT, kn_rows, kbuf.map<uint8_t*>() + u * kFabChunk + at, cstep, hd);
                             else
                                 fab_pack_v(kvr, row / 2, kvh * hd + (u - kvh) * hd, kT, kn_rows,
-                                           vbuf.map<uint8_t*>() + (u - kvh) * kFabChunk + at, cstep);
+                                           vbuf.map<uint8_t*>() + (u - kvh) * kFabChunk + at, cstep, hd);
+                        }
+                        if (skc && c == 0) {
+                            for (size_t g2 = 0; g2 < kvh; ++g2) {
+                                fab_sink_k(hc.sinks.data() + g2 * (gb.nh / kvh), gb.nh / kvh, hd, kbuf.map<uint8_t*>() + g2 * kFabChunk);
+                                std::memset(vbuf.map<uint8_t*>() + g2 * kFabChunk, 0, kFabChunk);
+                            }
+                            kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, cstep, 0);
+                            vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, cstep, 0);
                         }
                         kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (kT / 64) * cstep, at);
                         vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (kT / 64) * cstep, at);
                     }
-                    st.sync(XCL_BO_SYNC_BO_TO_DEVICE, t_real * row, (pos0 + r0) * row);
+                    if (!lt.state_ring) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, t_real * row, (pos0 + r0) * row);
                 }
             } else if (op == GATE && noncausal_ && !nc_npu) {
                 // d3's noncausal full attention: this chunk's queries over the whole prompt's K / V
@@ -6554,21 +6785,32 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs, t_real);
                 else to_bf16(og.data(), M, qw, "pp_m_" + cs);
             } else if (op == GATE) {
-                // og = O * sigmoid(gate), gate from the qkv GEMM's C (still this chunk's)
-                const size_t qw = gb.qw, kvw = gb.kvw, nq = 2 * qw + 2 * kvw;
+                // og = O * sigmoid(gate), gate from the qkv GEMM's C (still this chunk's); Flint: O, ungated,
+                // each head's first hd of the kernel's fa_hd columns
+                const size_t qw = gb.qw, kvw = gb.kvw, nq = (gb.gate ? 2 : 1) * qw + 2 * kvw;
+                const size_t ohd = fa_hd && fa_hd != gb.hd ? fa_hd : gb.hd, ow = gb.nh * ohd;
                 xrt::bo& ob = buffer("fa_o_" + cs, 0);
-                read_back(ob, t_real * qw * 2, 0);
+                read_back(ob, t_real * ow * 2, 0);
                 const uint16_t* o16 = ob.map<const uint16_t*>();
                 const uint16_t* q16 = buffer("pp_q_" + cs, 0).map<const uint16_t*>();
                 og.resize(M * qw);
 #pragma omp parallel for
                 for (long long t = 0; t < static_cast<long long>(t_real); ++t)
                     for (size_t i = 0; i < qw; ++i) {
+                        const float o = bf16_to_f32(o16[t * ow + (i / gb.hd) * ohd + i % gb.hd]);
+                        if (!gb.gate) { og[t * qw + i] = o; continue; }
                         const float gt = bf16_to_f32(q16[t * nq + qw + 2 * kvw + i]);
-                        og[t * qw + i] = static_cast<size_t>(t) < t_real ? bf16_to_f32(o16[t * qw + i]) / (1.f + std::exp(-gt)) : 0.f;
+                        og[t * qw + i] = o / (1.f + std::exp(-gt));
                     }
                 if (fa_check && fa_ref.count(cell(l, c))) {
                     const std::vector<float>& ref = fa_ref[cell(l, c)];
+                    for (size_t t = 0, shown = 0; t < t_real && shown < 3; ++t)
+                        for (size_t i = 0; i < qw && shown < 3; ++i)
+                            if (!std::isfinite(og[t * qw + i]) || !std::isfinite(ref[t * qw + i])) {
+                                std::fprintf(stderr, "fa_check layer %zu chunk %zu: non-finite at row %zu col %zu (head %zu): npu %g host %g\n",
+                                             l, c, t, i, i / gb.hd, og[t * qw + i], ref[t * qw + i]);
+                                ++shown;
+                            }
                     double num = 0, den = 0, worst = 0; size_t wr = 0;
                     for (size_t t = 0; t < t_real; ++t) {
                         double n2 = 0, d2 = 0;
@@ -6662,7 +6904,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     rprobs.resize(M * E);
                     ridx_c[c].resize(M * topk);
                     rwt_c[c].resize(M * topk);
-                    host::router_block(t_real, hid, E, topk, xc, hc.router.data(), rprobs.data(), ridx_c[c].data(), rwt_c[c].data());
+                    host::router_block(t_real, hid, E, topk, xc, hc.router.data(), rprobs.data(), ridx_c[c].data(), rwt_c[c].data(),
+                                       w_->router.present && w_->router.gating == "sigmoid");
                     sadd(moe_ms[0], ms_since(tm));
                     auto tg = std::chrono::steady_clock::now();
                     gate_c[c].resize(t_real);
@@ -6678,6 +6921,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     }
 #pragma omp parallel for
                     for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
+                        if (!gb.shared_gated) { gate_c[c][static_cast<size_t>(tk)] = 1.f; continue; }   // Flint's: ungated
                         const float* x = xc + static_cast<size_t>(tk) * hid;
                         const double d = host::bf16x_dot(x, hc.sgw.data(), hid);
                         gate_c[c][static_cast<size_t>(tk)] = 1.f / (1.f + std::exp(-static_cast<float>(d)));
@@ -8526,6 +8770,14 @@ void Core::step_prompt_lfm2(const std::vector<int>& ids, bool want_logits) {
 
 void Core::seek(int pos) {
     if (pos < 0 || static_cast<size_t>(pos) >= cfg_.max_ctx) throw std::runtime_error("open_qwen36: seek out of range");
+    // a sliding cache keeps the window before its rows only: back to a position whose window moved out is refused
+    for (int l = 0; l < nl_ && !kv_base_.empty(); ++l) {
+        const GemmBlockProgram& gb = types_[l]->gemm_block;
+        const size_t need = static_cast<size_t>(pos) + 1 > gb.window ? static_cast<size_t>(pos) + 1 - gb.window : 0;
+        if (types_[l]->state_ring && kv_base_[static_cast<size_t>(l)] > need)
+            throw std::runtime_error("open_qwen36: seek to " + std::to_string(pos) + ": layer " + std::to_string(l) +
+                                     "'s sliding cache starts at " + std::to_string(kv_base_[static_cast<size_t>(l)]));
+    }
     pos_ = pos;
 }
 
@@ -8538,13 +8790,16 @@ Snapshot Core::checkpoint() const {
         const LayerType& lt = *types_[l];
         xrt::bo& bo = const_cast<xrt::bo&>(state_[l]);
         if (lt.state_kind == "kv") {
-            size_t n = static_cast<size_t>(pos_) * lt.state_row;
+            // a sliding cache (Flint's window layers) holds positions [base, pos) from its row 0
+            const size_t base = kv_base_.empty() ? 0 : kv_base_[static_cast<size_t>(l)];
+            size_t n = (static_cast<size_t>(pos_) - std::min(base, static_cast<size_t>(pos_))) * lt.state_row;
             std::vector<uint8_t> rows(n);
             if (n) {
-                read_back(bo, n, 0);
+                if (!lt.state_ring) read_back(bo, n, 0);
                 std::memcpy(rows.data(), bo.map<uint8_t*>(), n);
             }
             s.kv.push_back(std::move(rows));
+            s.kv_base.push_back(base);
         } else {
             std::vector<uint8_t> st(lt.state_bytes);
             read_back(bo, lt.state_bytes, 0);
@@ -8561,10 +8816,11 @@ void Core::restore(const Snapshot& s) {
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];
         if (lt.state_kind == "kv") {
+            if (!kv_base_.empty()) kv_base_[static_cast<size_t>(l)] = ia < s.kv_base.size() ? s.kv_base[ia] : 0;
             const auto& rows = s.kv.at(ia++);
             if (!rows.empty()) {
                 std::memcpy(state_[l].map<uint8_t*>(), rows.data(), rows.size());
-                state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE, rows.size(), 0);
+                if (!lt.state_ring) state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE, rows.size(), 0);
             }
         } else {
             const auto& st = s.states.at(il++);

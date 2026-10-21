@@ -110,6 +110,7 @@ const uint8_t* Q4nxFile::raw(const std::string& name, size_t* nbytes) const {
 
 std::vector<float> Q4nxFile::bf16(const std::string& name) const {
     const TensorMeta& t = meta(name);
+    if (t.dtype == "F32") return f32(name);   // a converter that keeps the GGUF's f32 small weights (Flint)
     if (t.dtype != "BF16") throw std::runtime_error("q4nx: " + name + " is " + t.dtype + ", not BF16");
     size_t n = (t.end - t.start) / 2;
     const uint8_t* p = map_ + data_base_ + t.start;
@@ -132,7 +133,8 @@ std::vector<float> Q4nxFile::f32(const std::string& name) const {
 
 void Q4nxFile::bf16_row(const std::string& name, size_t row, size_t dim, float* out) const {
     const TensorMeta& t = meta(name);
-    if (t.dtype != "BF16") throw std::runtime_error("q4nx: " + name + " is " + t.dtype + ", not BF16");
+    const size_t esz = t.dtype == "F32" ? 4 : 2;   // an f32 embedding (Flint's) is read as is
+    if (t.dtype != "BF16" && t.dtype != "F32") throw std::runtime_error("q4nx: " + name + " is " + t.dtype + ", not BF16");
     // The SOURCE stride is the container's own row, from the tensor's trailing shape
     // dimension -- never `dim`, which is the width of the buffer the caller wants the row
     // in. A recipe may pad that above the model's own (OPEN-WIDTH-PAD puts GPT-OSS's 2880
@@ -146,9 +148,14 @@ void Q4nxFile::bf16_row(const std::string& name, size_t row, size_t dim, float* 
         throw std::runtime_error("q4nx: " + name + " stores " + std::to_string(src) +
                                  " values per row and only " + std::to_string(dim) +
                                  " were asked for; that would drop the rest of the row");
-    if ((row + 1) * src * 2 > t.end - t.start)
+    if ((row + 1) * src * esz > t.end - t.start)
         throw std::runtime_error("q4nx: row " + std::to_string(row) + " past " + name);
-    const uint8_t* p = map_ + data_base_ + t.start + row * src * 2;
+    const uint8_t* p = map_ + data_base_ + t.start + row * src * esz;
+    if (esz == 4) {
+        std::memcpy(out, p, src * 4);
+        for (size_t i = src; i < dim; ++i) out[i] = 0.0f;
+        return;
+    }
     for (size_t i = 0; i < src; ++i) {
         uint16_t u;
         std::memcpy(&u, p + 2 * i, 2);

@@ -46,7 +46,7 @@ Q_CORE = 2 * PIECE                     # one core's 32 rows of Q
 MAX_INFLIGHT = 2                       # passes queued ahead
 STACK = 0x800                          # frames <= 0x280 + 0x80 (softmax_rescale -> scale_o)
 
-RTP_HEADS, RTP_PASSES, RTP_CHUNKS, RTP_VALID, RTP_CAUSAL, RTP_ROW0, RTP_QOFF = range(7)
+RTP_HEADS, RTP_PASSES, RTP_CHUNKS, RTP_VALID, RTP_CAUSAL, RTP_ROW0, RTP_QOFF, RTP_WINDOW = range(8)
 RTP_LEN = 8
 EXP_FIX = int(os.environ.get("DF_EXP_FIX", 0))   # fa_dit.cc FA_EXP_FIX (a build-wide choice)
 TAU = int(os.environ.get("DF_TAU", 32))          # fa_dit.cc FA_TAU, the lazy-rescale threshold
@@ -69,6 +69,7 @@ def dit_fa256b(
     lk: CompileTime[int] = 0, o_ld: CompileTime[int] = 0, o_col: CompileTime[int] = 0,
     valid_len: CompileTime[int] = 0,
     causal: CompileTime[int] = 0, q_off: CompileTime[int] = 0, kv_inter: CompileTime[int] = 0,
+    window: CompileTime[int] = 0,
 ):
     kv_heads = kv_heads or heads
     lk = lk or L
@@ -271,6 +272,7 @@ def dit_fa256b(
             buf[RTP_CAUSAL] = causal       # the queries are positions q_off .. q_off + L - 1 of the keys
             buf[RTP_ROW0] = i * TQ
             buf[RTP_QOFF] = q_off
+            buf[RTP_WINDOW] = window      # a sliding window (Flint): keys from 64 on, row r sees r - window + 1 .. r
         for b in barriers.values():
             b.set(1)
 
@@ -333,4 +335,5 @@ SPECIALIZE = dict(
     q_off=int(os.environ.get("DF_QOFF", 0)),
     kv_inter=int(os.environ.get("DF_KV_INTER", 0)),
     o_ld=int(os.environ.get("DF_O_LD", 0)),
+    window=int(os.environ.get("DF_WINDOW", 0)),
 )

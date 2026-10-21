@@ -126,6 +126,11 @@ struct AttnGeom {
     /// attention_block quantizes the block's rows into it and reads it instead of kv. nullptr: none.
     uint8_t* kv8 = nullptr;
     size_t kv8_row = 0;
+    /// Flint: learned sinks ([nh] logits, one more term in each softmax denominator, no value) and a
+    /// sliding window (row p sees keys p - window + 1 .. p; 0 = all). kv may then be a sliding
+    /// buffer's logical pointer (row of position p at kv + p * row): rows below the window are never read.
+    const float* sinks = nullptr;
+    size_t window = 0;
 };
 /// kv rows [r0, r1) (bf16 [K | V], kvh x hd each) as int8 rows of row8 bytes: K int8 [kvh hd], V int8
 /// [kvh hd], then the K scales and the V scales (f32 [kvh] each): one symmetric scale per position
@@ -172,11 +177,12 @@ void softmax_chunk(size_t M, size_t L, size_t hd, size_t c0, const float* s, con
 /// The MoE router over a block: softmax of xm [T, hid] @ Wr [hid, E] into probs [T, E], the
 /// top-k by probability (lowest index on a tie, as the kernel's router_fin picks) into
 /// idx [T, topk], renormalised into w [T, topk].
+/// sigmoid (Flint): sigmoid scores, the top-k by score, weights renormalised to sum 1.
 void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, const float* Wr, float* probs,
-                  int32_t* idx, float* w);
+                  int32_t* idx, float* w, bool sigmoid = false);
 /// One token's softmax over its E logits `lg` (overwritten with the probabilities, copied to probs),
 /// the top-k (idx) and their weights normalised to sum 1 (w); taken: E bytes of scratch.
-void router_select(size_t E, size_t topk, float* lg, char* taken, float* probs, int32_t* idx, float* w);
+void router_select(size_t E, size_t topk, float* lg, char* taken, float* probs, int32_t* idx, float* w, bool sigmoid = false);
 
 /// y [npad] = x [K] times a dit2 int4-mantissa weight (designs/dit_gemm/pack.py pack_b4: per
 /// [128-column tile][64-K tile] 4096 bytes of nibbles in blocks [pair 8][k-block 8][2] of 8 columns

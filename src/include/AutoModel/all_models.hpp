@@ -21,6 +21,7 @@
 #include "modeling_qwen3_5vl.hpp"
 #include "modeling_qwen3_5_omni.hpp"
 #include "modeling_qwen3_6_moe.hpp"
+#include "modeling_flint.hpp"
 #include "modeling_nanbeige.hpp"
 #include "modeling_gemma4e.hpp"
 #include "modeling_gemma4_12b.hpp"
@@ -107,6 +108,9 @@ inline std::pair<std::string, std::unique_ptr<AutoModel>> get_auto_model(const s
             break;
         case SupportedModelFamily::qwen3_6_moe:
             auto_chat_engine = std::make_unique<Qwen3_6_MOE>(npu_device_inst);
+            break;
+        case SupportedModelFamily::flint:
+            auto_chat_engine = std::make_unique<Flint>(npu_device_inst);
             break;
         case SupportedModelFamily::lfm2:
             auto_chat_engine = std::make_unique<LFM2>(npu_device_inst);

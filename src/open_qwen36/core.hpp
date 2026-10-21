@@ -70,7 +70,8 @@ struct Snapshot {
     int64_t mrope_pos = 0;                     ///< the (t, h, w) counter (M-RoPE, once a request has an image)
     bool mrope_on = false;
     std::vector<std::vector<uint8_t>> states;  ///< per linear layer: the state BO
-    std::vector<std::vector<uint8_t>> kv;      ///< per attention layer: rows [0, pos)
+    std::vector<std::vector<uint8_t>> kv;      ///< per attention layer: rows [0, pos) (a sliding cache: [base, pos))
+    std::vector<size_t> kv_base;               ///< per attention layer: the position its first saved row holds
 };
 
 /// One kernel's dispatches over a block: what it cost where it actually runs.
@@ -450,6 +451,7 @@ private:
         size_t lanes = 0;
         std::vector<float> qn, kn;                      ///< full: [hd] x2
         std::vector<float> sgw;                         ///< the shared expert's sigmoid gate, [hid]
+        std::vector<float> sinks;                       ///< full (Flint): the learned sinks, [nh]
     };
     std::vector<HostConsts> hc_;                       ///< per layer, filled for a linear / full route
     /// What a MoE layer's attention half leaves for its expert block: the residual, its
@@ -804,14 +806,23 @@ private:
     std::vector<size_t> kv8_valid_;
     size_t kv8_row_ = 0;
     void kv8_clamp() { for (size_t& v : kv8_valid_) v = std::min(v, static_cast<size_t>(pos_ < 0 ? 0 : pos_)); }
+    /// A sliding-window layer's cache (LayerType::state_ring rows): the position its row 0 holds.
+    /// kv_ptr gives the LOGICAL pointer (position p's row at kv_ptr + p * row elements; rows below
+    /// kv_base_ are never read), kv_room makes room for positions up to p_end by moving the last
+    /// window's rows to the front first. A full layer's base stays 0.
+    std::vector<size_t> kv_base_;
+    uint16_t* kv_ptr(int l);
+    void kv_room(int l, size_t p_end, size_t keep_from);
     /// a GEMM step's weight as q4_1 bytes on the host: its pool or consts region (layer l)
     const uint8_t* q41_weight(int l, const std::string& name) const;
     /// A MoE block's q4_1 weights for moe_cpu: the router [hid][E] f32, the shared expert's gate
     /// weight, its [up | gate] and down (std order), and each routed expert's up / gate / down at
     /// base + e stride (+ gate_off for the gate), in the layouts given
     struct MoeCpuW {
-        const float* Wr = nullptr; const float* sgw = nullptr;
+        const float* Wr = nullptr; const float* sgw = nullptr;   ///< sgw nullptr: an ungated shared expert (Flint)
         size_t E = 0, topk = 0, ff = 0;
+        size_t sff = 0;                  ///< the shared expert's width (0: ff)
+        bool sigmoid = false;            ///< the router's gating: sigmoid scores (Flint), else softmax
         const uint8_t* sh_ug = nullptr; const uint8_t* sh_dn = nullptr;
         const uint8_t* up0 = nullptr; size_t up_stride = 0, gate_off = 0; host::Q41Lay up_lay;
         const uint8_t* dn0 = nullptr; size_t dn_stride = 0; host::Q41Lay dn_lay;
@@ -828,6 +839,10 @@ private:
     /// the head repacked from the pool order (host::lmhead_q8_repack), the norm weight as f32
     bool cpu_head_ = false, cpu_head_check_ = false, head_b4_main_ = false;
     std::vector<uint8_t> lm_cpu_;
+    /// a q4_1 head (Flint's, pack.lm_head a std_perm op): its chunks in the band order, read by
+    /// host::gemv_q41_rows (head_q41_); the final norm then comes from the file as f32
+    std::vector<uint8_t> lm_q41_;
+    bool head_q41_ = false;
     std::vector<uint8_t> lm_b4_;   ///< OFLM_OPEN_CPU_HEAD=int4: the head as dit2 int4 blocks (host::gemv_b4)
     std::vector<float> normw_f_;
     /// which side holds the newest per-layer state (DeltaNet S / conv rows, KV rows): 0 both,

@@ -870,8 +870,9 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
 }
 
 void pack_pool(const Manifest& m, const LayerType& lt, const WeightFile& f, int layer, uint8_t* dst) {
-    std::memset(dst, 0, m.pool_bytes);
-    for (const auto& op : lt.pool) apply(op, f, layer, dst, m.pool_bytes, m.chunk_bytes);
+    const size_t bytes = lt.pool_bytes ? lt.pool_bytes : m.pool_bytes;   // a layer type's own (Flint's dense layers)
+    std::memset(dst, 0, bytes);
+    for (const auto& op : lt.pool) apply(op, f, layer, dst, bytes, m.chunk_bytes);
 }
 
 void pack_consts(const Manifest& m, const LayerType& lt, const WeightFile& f, int layer, uint8_t* dst) {

@@ -257,8 +257,12 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         const json& st = need(b, "state", tw);
         t.state_kind = get<std::string>(st, "kind", tw);
         if (t.state_kind == "linear") t.state_bytes = get<uint64_t>(st, "bytes", tw);
-        else if (t.state_kind == "kv") t.state_row = get<uint64_t>(st, "row", tw);
+        else if (t.state_kind == "kv") {
+            t.state_row = get<uint64_t>(st, "row", tw);
+            t.state_ring = st.value("ring", 0ull);   // a sliding-window layer's cache: this many rows, reused
+        }
         else fail(tw, "unknown state kind " + t.state_kind);
+        t.pool_bytes = v.value("pool_bytes", 0ull);   // 0: the layout's (a dense layer type of a MoE model: its own)
         t.program = parse_program(need(v, "program", tw), tw);
         if (v.contains("prompt")) t.prompt = parse_program(v["prompt"], tw + ".prompt");
         for (const auto& s : t.program) check_step(m, s, tw, "program");
@@ -380,6 +384,7 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                     if (gj.contains("moe_kernel") || gj.contains("shared_program"))
                         fail(gw, "carries both a dense ffn_program and the MoE tail (moe_kernel / shared_program)");
                     g.ff = get<uint64_t>(gj, "ff", gw);
+                    g.ffn_key = gj.value("ffn_key", std::string("ffn"));
                     g.ffn_program = parse_program(gj["ffn_program"], gw + ".ffn_program");
                     if (g.ffn_program.size() != 2)
                         fail(gw, "ffn_program has exactly 2 steps (up|gate, down), has " + std::to_string(g.ffn_program.size()));
@@ -393,15 +398,20 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                 } else {
                     if (!m.has_moe)
                         fail(gw, "a " + g.kind + " route needs an ffn_program or layout.moe (the per-token MoE tail)");
-                    g.a_xm = get<uint64_t>(gj, "a_xm", gw);
-                    g.a_rout = get<uint64_t>(gj, "a_rout", gw);
-                    g.a_res = get<uint64_t>(gj, "a_res", gw);
-                    g.moe_kernel = get<std::string>(gj, "moe_kernel", gw);
-                    g.moe_args = get<std::vector<std::string>>(gj, "moe_args", gw);
-                    auto mk = m.kernels.find(g.moe_kernel);
-                    if (mk == m.kernels.end()) fail(gw, "moe_kernel names unknown kernel " + g.moe_kernel);
-                    if (mk->second.patch != "moeroute2") fail(gw, "moe_kernel " + g.moe_kernel + " is not built with the moeroute2 patch table");
-                    if (g.moe_args.empty()) fail(gw, "moe_args is empty");
+                    // the per-token MoE kernel (NPU decode): absent on a family that decodes on the CPU
+                    // and batches its experts (Flint), required otherwise (checked below)
+                    if (gj.contains("moe_kernel")) {
+                        g.a_xm = get<uint64_t>(gj, "a_xm", gw);
+                        g.a_rout = get<uint64_t>(gj, "a_rout", gw);
+                        g.a_res = get<uint64_t>(gj, "a_res", gw);
+                        g.moe_kernel = get<std::string>(gj, "moe_kernel", gw);
+                        g.moe_args = get<std::vector<std::string>>(gj, "moe_args", gw);
+                        auto mk = m.kernels.find(g.moe_kernel);
+                        if (mk == m.kernels.end()) fail(gw, "moe_kernel names unknown kernel " + g.moe_kernel);
+                        if (mk->second.patch != "moeroute2") fail(gw, "moe_kernel " + g.moe_kernel + " is not built with the moeroute2 patch table");
+                        if (g.moe_args.empty()) fail(gw, "moe_args is empty");
+                    }
+                    g.shared_gated = gj.value("shared_gated", true);
                     // the shared expert over the whole block: up|gate then down. mx is built
                     // routed-only, so a MoE route without these two steps has no shared expert
                     // at all -- required, not optional.
@@ -443,6 +453,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                         }
                         if (b.kernels.empty()) fail(bw, "names no streams");
                     }
+                    if (g.moe_kernel.empty() && g.moe_batch.kind != "mbi")
+                        fail(gw, "a MoE route without moe_kernel needs the mbi expert batch");
                 }
                 if (g.kind == "linear") {
                     g.qkv_dim = get<uint64_t>(gj, "qkv_dim", gw);
@@ -467,9 +479,15 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                     g.kvh = get<uint64_t>(gj, "kvh", gw);
                     g.hd = get<uint64_t>(gj, "hd", gw);
                     g.rot = get<uint64_t>(gj, "rot", gw);
+                    // Flint: no output gate, learned sinks, a sliding window; rot 0 = no positions
+                    g.gate = gj.value("gate", true);
+                    g.sinks = gj.value("sinks", false);
+                    g.window = gj.value("window", 0ull);
                     if (t.state_kind != "kv") fail(gw, "a full route on a layer type whose state is not kv");
-                    if (g.qw != g.nh * g.hd || g.kvw != g.kvh * g.hd || g.rot > g.hd || g.rot != m.rotary_dim)
+                    if (g.qw != g.nh * g.hd || g.kvw != g.kvh * g.hd || g.rot > g.hd || (g.rot != m.rotary_dim && g.rot != 0))
                         fail(gw, "qw / kvw / rot disagree with the heads and the layout rotary dim");
+                    if (t.state_ring && (!g.window || t.state_ring < g.window + 1024 || t.state_ring % 64))
+                        fail(gw, "a KV ring of " + std::to_string(t.state_ring) + " rows: it needs the window plus a 1024-row chunk, in 64-row blocks");
                 }
             } else {
                 fail(gw, "unknown kind " + g.kind + " (dense | linear | full)");

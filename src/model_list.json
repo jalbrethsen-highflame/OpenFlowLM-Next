@@ -1667,6 +1667,36 @@
                 ],
                 "footprint": 12.7
             }
+        },
+        "flint": {
+            "40b-a2.5b": {
+                "name": "Flint-40B-A2.5B-NPU2",
+                "url": "https://huggingface.co/RecursiveSI/flint-int4-gguf/resolve/main",
+                "file_url": "https://huggingface.co/api/models/RecursiveSI/flint-int4-gguf/tree/main",
+                "size": 26000000000,
+                "oflm_min_version": "0.1.0",
+                "files": [
+                    "config.json",
+                    "model.q4nx",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "chat_template.jinja"
+                ],
+                "default_context_length": 32768,
+                "max_prefill_len": 4096,
+                "details": {
+                    "format": "NPU2",
+                    "family": "flint",
+                    "think": true,
+                    "parameter_size": "40B",
+                    "quantization_level": "Q4_1"
+                },
+                "label": [
+                    "reasoning",
+                    "tool-calling"
+                ],
+                "footprint": 26.0
+            }
         }
     }
 }
