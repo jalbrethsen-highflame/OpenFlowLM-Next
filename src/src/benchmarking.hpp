@@ -316,7 +316,12 @@ inline BenchmarkResults_t run_benchmarks(std::string model_tag, std::string benc
     decoding_speed.resize(stages);
     
     for (int it = 0; it < bench_config["iterations"]; it++) {
-        for (int bench_len = stages - 1; bench_len >= 0; bench_len--)
+        // optional "min_length": stop after the stage of that length (one length a process keeps the
+        // memory peak at that length's; a 128k stage's buffers stay allocated for the stages after it)
+        const int min_stage = bench_config.contains("min_length")
+                                  ? std::max(0, (int)std::floor(std::log2((float)bench_config["min_length"] / 1024)))
+                                  : 0;
+        for (int bench_len = stages - 1; bench_len >= min_stage; bench_len--)
         {
             header_print("OFLM", "Starting benchmark for " + std::to_string((1 << (bench_len))) << "k and iteration " << (it + 1) << "...");
             std::string long_text;

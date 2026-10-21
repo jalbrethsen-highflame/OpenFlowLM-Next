@@ -1076,8 +1076,8 @@ std::vector<uint32_t> cfg_prefix(const std::vector<const CdoOps*>& all, size_t& 
 
 xrt::hw_context& Core::context(const std::string& name) {
     if (one_ctx_ < 0) {
-        const char* e = std::getenv("OFLM_OPEN_ONE_CTX");
-        one_ctx_ = e ? std::atoi(e) : 0;
+        const char* e = std::getenv("OFLM_OPEN_ONE_CTX");   // default on; 0 = one context per xclbin
+        one_ctx_ = e ? std::atoi(e) : 1;
     }
     if (one_ctx_ > 0) {
         if (!one_) {
