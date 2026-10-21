@@ -724,7 +724,8 @@ private:
         double t_draft = 0, t_verify = 0, t_roll = 0;
         std::chrono::steady_clock::time_point t0;
     } spec_;
-    int spec_k_ = 3;            ///< drafts a pass: OFLM_OPEN_MTP_K, else 3 (a MoE model: 2, set by load_mtp)
+    int spec_k_ = 3;            ///< drafts a pass: OFLM_OPEN_MTP_K, else 3 (a MoE model: 4, set by load_mtp)
+    double spec_pcum_ = 0;      ///< OFLM_OPEN_MTP_PCUM, else 0 (a MoE model: 0.4, set by load_mtp)
     void spec_begin();
     void spec_settle(size_t keep);
     void spec_norm(const float* x, float* out);

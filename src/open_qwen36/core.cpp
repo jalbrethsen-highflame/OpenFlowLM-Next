@@ -1209,8 +1209,15 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
         throw std::runtime_error("open_qwen36: the mbi expert kernels transform the pools' routed experts, so decode "
                                  "must read them on the CPU (OFLM_OPEN_CPU_DECODE=1, the pools kept)");
     if (mbi_on_) mbi_s_.assign(static_cast<size_t>(nl_), {});
-    if (const char* e = std::getenv("OFLM_OPEN_DEC_NPU"); e && mbi_on_ && q41_cpu_)
-        dec_npu_ = std::min<size_t>(16, std::strtoul(e, nullptr, 10));
+    // OFLM_OPEN_DEC_NPU (default 16; 0 off): routed experts a decode layer on the NPU beside the CPU's,
+    // half of a pass's by default (OFLM_OPEN_DEC_NPU_SHARE). With the GPU busy the layer's MoE took
+    // 15 % less time (A/B by layer parity, OFLM_OPEN_DEC_NPU_AB)
+    if (mbi_on_ && q41_cpu_) {
+        bool p1 = true;
+        for (const auto& t : types_) p1 = p1 && t->gemm_block.moe_batch.p == 1;
+        const char* e = std::getenv("OFLM_OPEN_DEC_NPU");
+        dec_npu_ = e ? std::min<size_t>(32, std::strtoul(e, nullptr, 10)) : p1 ? 16 : 0;
+    }
     if (dec_npu_) log("CPU decode: up to " + std::to_string(dec_npu_) + " routed experts a layer on the NPU (mbi), beside the CPU's");
     std::vector<uint8_t> pool_tmp;
     for (int l = 0; l < nl_; ++l) {
@@ -3308,6 +3315,25 @@ void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
 
 void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
     const size_t hid = w_->hidden, E = W.E, topk = W.topk, ff = W.ff;
+    // OFLM_OPEN_DEC_NPU_AB=a,b (debug): even layers take share a, odd layers b, and the two parities'
+    // MoE times are summed apart -- an A/B under the same DDR load (the GPU job's comes in phases)
+    static const std::array<long, 2> ab = [] {
+        std::array<long, 2> v{-1, -1};
+        if (const char* e = std::getenv("OFLM_OPEN_DEC_NPU_AB")) std::sscanf(e, "%ld,%ld", &v[0], &v[1]);
+        return v;
+    }();
+    struct AbTime {
+        int par; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~AbTime() {
+            if (par < 0) return;
+            static double tot[2] = {0, 0};
+            static size_t n[2] = {0, 0};
+            tot[par] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (++n[par] % 800 == 0 && par == 1)
+                std::fprintf(stderr, "open_qwen36: dec_npu A/B: even layers %.3f, odd layers %.3f ms a layer (%zu calls each)\n",
+                             tot[0] / n[0], tot[1] / n[1], n[1]);
+        }
+    } abt{ab[0] >= 0 && W.npu_layer >= 0 ? W.npu_layer % 2 : -1};
     auto tr = std::chrono::steady_clock::now();
     static thread_local std::vector<float> probs, wt, hsh, ysh, hu, hd, ye;
     static thread_local std::vector<int32_t> idx;
@@ -3336,8 +3362,12 @@ void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
     // work and collected after it, so the two read their experts' weights at once
     ExRows exn;
     Inflight fl;
-    if (W.npu_layer >= 0 && dec_npu_ > 0 && ex.size() >= 2) {
-        const size_t nn = std::min(dec_npu_, ex.size() / 2);
+    if (W.npu_layer >= 0 && dec_npu_ > 0 && ex.size() >= 2 && (abt.par < 0 || ab[static_cast<size_t>(abt.par)] > 0)) {
+        // OFLM_OPEN_DEC_NPU_SHARE (percent of the pass's experts, default 50): with the GPU busy the
+        // NPU's DMA read ~34 GB/s while the CPU cores got ~12, so the NPU can take more than half
+        static const size_t share = [] { const char* e = std::getenv("OFLM_OPEN_DEC_NPU_SHARE"); return e ? std::min(100ul, std::strtoul(e, nullptr, 10)) : 50ul; }();
+        const size_t sh = abt.par >= 0 ? static_cast<size_t>(ab[static_cast<size_t>(abt.par)]) : share;
+        const size_t nn = std::min(dec_npu_, ex.size() * sh / 100);
         exn.assign(ex.end() - static_cast<long>(nn), ex.end());
         ex.resize(ex.size() - nn);
         auto tp = std::chrono::steady_clock::now();
@@ -3461,12 +3491,12 @@ Core::Inflight Core::dec_npu_start(int l, const float* xn, size_t R, const ExRow
     size_t slots = 0;
     for (const auto& [sl, k] : mb.kernels)
         if (sl >= exn.size()) { slots = sl; kn = &k; break; }
-    if (!kn || slots > 16) throw std::runtime_error("open_qwen36: dec_npu: no mbi stream of at most 16 slots holds the experts");
+    if (!kn || slots > 32) throw std::runtime_error("open_qwen36: dec_npu: no mbi stream of at most 32 slots holds the experts");
     if (mb.p != 1) throw std::runtime_error("open_qwen36: dec_npu: wants mbi streams with one column a visit (p 1)");
     if (!globals_.count("dmb_x")) {
         // rows 1..3 of every slot stay empty (headers 0 from alloc): decode rows land in row 0
-        globals_.emplace("dmb_x", alloc(16 * kMbiXslot));
-        globals_.emplace("dmb_y", alloc(16 * kMbiYslot));
+        globals_.emplace("dmb_x", alloc(32 * kMbiXslot));
+        globals_.emplace("dmb_y", alloc(32 * kMbiYslot));
     }
     static thread_local std::vector<int8_t> q;
     static thread_local std::vector<uint16_t> sx;
@@ -3952,7 +3982,11 @@ void Core::load_mtp(const std::string& shard) {
         m.on = true;
         // 2 drafts a pass by default: a verify row past them adds more distinct experts than its
         // token is worth (two chat prompts, GPU busy: k = 1 / 2 / 3 at 19.2-19.7 / 20.8-22.0 / 18.7-22.0 tok/s)
-        spec_k_ = std::getenv("OFLM_OPEN_MTP_K") ? std::atoi(std::getenv("OFLM_OPEN_MTP_K")) : 2;
+        // a MoE model: up to 4 drafts, stopped once their probability product falls under 0.4 (with the
+        // GPU busy, two chat prompts: 16.5 / 19.8 tok/s at a fixed 2, 16.9 / 22.2 at this; a verify
+        // row costs ~18 ms, mostly the experts it adds)
+        spec_k_ = std::getenv("OFLM_OPEN_MTP_K") ? std::atoi(std::getenv("OFLM_OPEN_MTP_K")) : 4;
+        spec_pcum_ = std::getenv("OFLM_OPEN_MTP_PCUM") ? std::atof(std::getenv("OFLM_OPEN_MTP_PCUM")) : 0.4;
         log("MTP: a MoE layer, " + std::to_string((m.fc41.size() + m.qkvg41.size() + m.o41.size() + m.sh_ug41.size() + m.sh_dn41.size() +
                                                     m.ex_ug41.size() + m.ex_dn41.size()) >> 20) + " MB q4_1 from " + shard);
         return;
@@ -4169,7 +4203,8 @@ void Core::spec_step(int tok) {
     static const double tau = [] { const char* e = std::getenv("OFLM_OPEN_MTP_TAU"); return e ? std::atof(e) : 0.0; }();
     // OFLM_OPEN_MTP_PCUM: adaptive k -- stop drafting once the product of the drafts' probabilities
     // (softmax over the draft vocabulary) falls under it; k is then the most drafts a pass
-    static const double pcum_min = [] { const char* e = std::getenv("OFLM_OPEN_MTP_PCUM"); return e ? std::atof(e) : 0.0; }();
+    static const char* pcum_env = std::getenv("OFLM_OPEN_MTP_PCUM");
+    const double pcum_min = pcum_env ? std::atof(pcum_env) : spec_pcum_;
     static const bool pld_on = [] { const char* e = std::getenv("OFLM_OPEN_PLD"); return !(e && *e == '0'); }();
     // a lookup draft needs at least OFLM_OPEN_PLD_MIN tokens (default: k + 1 at a fixed k; 4 with
     // OFLM_OPEN_MTP_PCUM, where k is only the most): a short one saves nothing over the MTP chain
