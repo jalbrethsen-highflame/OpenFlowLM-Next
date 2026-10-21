@@ -12,6 +12,48 @@ default spec).
 Model: hidden 2048, 40 layers (30 DeltaNet, 10 gated attention: 16 q heads / 2 kv heads, hd 256),
 256 experts of ff 512 + a shared expert, top 8, vocab 248K. ~3B active weights a token.
 
+## Constraint tracker (keep current: update a row after every change)
+
+The constraint for each target with the GPU job running (2026-10-21):
+
+| Target | Constraint now | Evidence |
+|---|---|---|
+| Decode, all contexts | DDR bandwidth left by the GPU (CPU ~12 GB/s median, NPU DMA ~34 GB/s) | bw probe; decode trace: a pass reads ~3 GB |
+| Prefill 1K-4K | DDR for the expert weights (all 256 experts a layer, ~20 GB at 1K) | pipe trace 1K: experts 27 ms a layer |
+| Prefill 16K-64K | host and NPU together (each ~29 s at 30K, wall 36 s) | pipe trace 30K |
+| Prefill 128K | NPU: attention at the MAC peak + experts | 120K trace: NPU 142 s of ~160 |
+| Tests at 32K+ beside the trainer | memory (engine 24 GB after load; gpu-oomd kills the trainer under 14 GB available) | OFLM_OPEN_MEM_LOG |
+
+Items (gain: expected, until measured; measure inside one run where possible):
+
+| ID | Area | Item | Kind | Measured now | How to measure | Expected gain | Status |
+|---|---|---|---|---|---|---|---|
+| P1 | prefill | RES waits for every pass of a group (host idle UP -> RES 10.4 s at 30K) | flow | 10.4 s host wait | pipe trace "host idle by" | up to -5 s at 30K | open |
+| P2 | prefill | x repeats each token's block sums 16x (4.4 KB a pair, 2.3 needed); ~42 GB host writes at 30K | waste | gather 5 thread-s | MID_PROF / moe_ms gather, x sync | -2 to -3 host thread-s, less NPU DMA | open |
+| P3 | prefill | shared expert as its own NPU GEMM (4.3 s at 30K) | waste | 4.3 s NPU | pipe trace kernels | -1.5 to -2.7 s NPU | open |
+| P4 | prefill | dnc kernel 6 ms a call against ~1.7 ms of math (dnc saves 13 host thread-s but makes the NPU the limit) | slow kernel | 5.4 s NPU at 30K | pipe trace DNC | 5-10 % at 16K+ | open |
+| P5 | prefill | router on the host | placement | ~7 host thread-s | moe_ms router | -5 host thread-s | open |
+| P6 | prefill | mixer out f32 -> memory -> bfp16 pack (to_bfp2), 16.8 MB a chunk round trip | waste | 0.17-0.26 s at 4K | MID_PROF out pack, MIDB out pack | -1 to -2 host thread-s at 30K | open |
+| P7 | prefill | expert slots 77 % full; each core receives every visit's full weights | hardware layout | per-core stream floor | null-kernel timing | large, uncertain (new tiling) | open |
+| P8 | prefill | empty expert slots from rounding the last pass up | waste | 14 % of slots | slot count in the trace | -2.2 s NPU at 30K | done (ec27d29) |
+| D1 | decode | dense GEMVs (0.93 GB a pass) only on the CPU, the slower reader | placement | gemv 15-35 ms a pass | CPU_DECODE_TRACE gemv | +20-25 % decode | open |
+| D2 | decode | half of a pass's experts on the NPU | placement | -15 % MoE a layer | DEC_NPU_AB parity A/B | done | done (5b10a84) |
+| D3 | decode | MTP draft length | tuning | k<=4, PCUM 0.4 | acceptance counts (load-independent) | done | done (5b10a84) |
+| D4 | decode | MTP layer at q4_1 (first draft 81.5 %, second 66.7 %) | accuracy | - | MTP_LOG per-position acceptance | unknown, a few % | open |
+| D5 | decode | MTP sees only the last 256 prompt rows (OFLM_OPEN_MTP_CTX) | accuracy | - | acceptance on a long prompt, 256 vs all | unknown | open |
+| D6 | decode | attention at 64K ~5 ms a row, ~30 % of the CPU bf16 peak | slow code | 5 ms a row | CPU_DECODE_TRACE mixer by rows | up to -3 ms a row at 64K | open |
+| D7 | decode | each verify row costs 18-20 ms (the experts it adds) | inherent | 18-20 ms | verify ms by rows | only better drafts | noted |
+| M1 | memory | dense weights twice (q4_1 pool + bfp16 GEMM copy, 1.6 GB) | waste | 1.58 GB | OFLM_OPEN_MEM_LOG | -1.6 GB (with D1's kernel) | open |
+| M2 | memory | expert pass buffers at full size for every pass | waste | 2.4 GB at 600 tokens | OFLM_OPEN_MEM_LOG | -1.9 GB | done (31d5e42) |
+| M3 | memory | per-chunk prefill buffers grow with the prompt (0.77 GB at 16K) | waste | 0.77 GB at 16K | OFLM_OPEN_MEM_LOG | ~-1.3 GB at 30K (ring) | open |
+| T1 | testing | each CLI test reloads the weights (27 s) | waste | 27 s a test | wall | most of a short test | open |
+| T2 | testing | heavy tests heat the CPU to 94 C; the trainer's guard pauses the GPU job | validity | pauses logged | guard log HOT count, GPU busy samples | valid numbers | done (safe_run / safe_bench record both) |
+
+Test rules beside the GPU job: cap every run (systemd-run MemoryMax), start only with MemAvailable
+>= cap + 20 GB, stop the run's own PID if MemAvailable < 20 GB, record GPU busy samples and the
+trainer guard's pauses; compare inside one run (A/B by layer parity, kernel ratios, slot counts,
+acceptance counts), not whole runs.
+
 ## Baseline (2026-10-20, a GPU training job running beside it, CPU boost off)
 
 `oflm bench`, 32 output tokens a stage, tok/s:
