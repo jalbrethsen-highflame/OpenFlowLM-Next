@@ -283,6 +283,13 @@ static inline bool fa_skip(const int32_t *rtp, int32_t pass, int32_t chunk) {
 
 // A key chunk wholly at or past valid_len (the pad up to lk): nothing to compute.
 static inline bool fa_dead(const int32_t *rtp, int32_t chunk) { return chunk * LKP >= rtp[3]; }
+// Either of the two, out of line: every kernel tests it, and inlined it took ~0.5 KB of the 16 KB.
+static __attribute__((noinline)) bool fa_off(const int32_t *rtp, int32_t pass, int32_t chunk) {
+  return fa_skip(rtp, pass, chunk) || fa_dead(rtp, chunk);
+}
+#if FA_WIN
+static bool s_live = true;   // fa_qkpv_w: the next four fused calls have a live chunk (sm_all sets it)
+#endif
 
 using BV = aie::block_vector<bfp16ebs8, 64>;
 using BIn = aie::block_vector_input_buffer_stream<bfp16ebs8, 64>;
@@ -336,6 +343,9 @@ static inline void exp_p_rowsum(const bfloat16 *__restrict g, uint8_t *__restric
   }
 }
 
+#ifndef FA_WIN
+#define FA_WIN 0
+#endif
 #ifndef FA_HS
 #define FA_HS 0
 #endif
@@ -449,7 +459,7 @@ void pass_init(bfloat16 *__restrict gp, bfloat16 *__restrict up, float *__restri
 // G[:, keys 16j .. 16j + 15] = Q K_piece^T over the whole head dim, written once (bf16).
 void qk(uint8_t *__restrict q, uint8_t *__restrict kp, bfloat16 *__restrict g, int32_t j,
         int32_t *__restrict rtp, int32_t pass, int32_t chunk) {
-  if (fa_skip(rtp, pass, chunk) || fa_dead(rtp, chunk))
+  if (fa_off(rtp, pass, chunk))
     return;
   SET_ROUNDING();
 #if FA_HS
@@ -488,6 +498,7 @@ void qk(uint8_t *__restrict q, uint8_t *__restrict kp, bfloat16 *__restrict g, i
         int32_t *__restrict rtp, int32_t pass, int32_t chunk);
 void pv(uint8_t *__restrict p, uint8_t *__restrict ve, bfloat16 *__restrict o, int32_t e,
         int32_t *__restrict rtp, int32_t pass, int32_t chunk);
+#if !FA_WIN   // (not in the window streams: their image is at the 16 KB program memory)
 void qkpv(uint8_t *__restrict q, uint8_t *__restrict kp, bfloat16 *__restrict g, uint8_t *__restrict p,
           uint8_t *__restrict ve, bfloat16 *__restrict o, int32_t j, int32_t *__restrict rtp,
           int32_t pass, int32_t chunk) {
@@ -511,11 +522,12 @@ void qkpv(uint8_t *__restrict q, uint8_t *__restrict kp, bfloat16 *__restrict g,
   pv(p, ve, o, j, rtp, pass, chunk - 1);
 #endif
 }
+#endif
 
 // O[:, d columns 64e .. 64e + 63] += P V for one 4608-byte V element (4 column pairs).
 void pv(uint8_t *__restrict p, uint8_t *__restrict ve, bfloat16 *__restrict o, int32_t e,
         int32_t *__restrict rtp, int32_t pass, int32_t chunk) {
-  if (fa_skip(rtp, pass, chunk) || fa_dead(rtp, chunk))
+  if (fa_off(rtp, pass, chunk))
     return;
   SET_ROUNDING();
 #if FA_HS
@@ -555,7 +567,7 @@ void pv(uint8_t *__restrict p, uint8_t *__restrict ve, bfloat16 *__restrict o, i
 // core's first row within a pass @5].
 void apply_mask(bfloat16 *__restrict g, int32_t *__restrict rtp, int32_t pass,
                 int32_t chunk) {
-  if (fa_skip(rtp, pass, chunk) || fa_dead(rtp, chunk))
+  if (fa_off(rtp, pass, chunk))
     return;
   SET_ROUNDING();
   const int32_t valid_len = rtp[3];
@@ -635,9 +647,10 @@ void apply_mask(bfloat16 *__restrict g, int32_t *__restrict rtp, int32_t pass,
 // The softmax's common path, its own kernel call (fa_exp_call clobbers vector registers the
 // compiler may keep across a call; the core loop between kernel calls holds none): P and this
 // chunk's row sums (s_rs) from G.
+#if !FA_WIN   // (not in the window streams: their image is at the 16 KB program memory)
 void sm_exp(bfloat16 *__restrict g, uint8_t *__restrict p, int32_t *__restrict rtp, int32_t pass,
             int32_t chunk) {
-  if (fa_skip(rtp, pass, chunk) || fa_dead(rtp, chunk))
+  if (fa_off(rtp, pass, chunk))
     return;
   apply_mask(g, rtp, pass, chunk);       // (returns at once on a chunk with no masked key)
   SET_ROUNDING();
@@ -656,6 +669,7 @@ void sm_exp(bfloat16 *__restrict g, uint8_t *__restrict p, int32_t *__restrict r
 #endif
 #endif
 }
+#endif
 
 } // extern "C"
 
@@ -717,6 +731,7 @@ static __attribute__((noinline)) void softmax_rescale(bfloat16 *__restrict g, fl
 extern "C" {
 
 // The rest of the softmax step: the rare path when needed, then l += this chunk's row sums.
+#if !FA_WIN   // (not in the window streams: their image is at the 16 KB program memory)
 void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
                   float *__restrict sp, bfloat16 *__restrict gp, uint8_t *__restrict p,
                   int32_t *__restrict rtp, int32_t pass, int32_t chunk) {
@@ -724,7 +739,7 @@ void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
 #ifdef FA_X_NOSTEP
   return;
 #endif
-  if (fa_skip(rtp, pass, chunk) || fa_dead(rtp, chunk))
+  if (fa_off(rtp, pass, chunk))
     return;
   SET_ROUNDING();
   PROF_BEGIN
@@ -744,14 +759,18 @@ void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
     aie::store_v(sp + i, aie::add(aie::load_v<64>(sp + i), aie::load_v<64>(s_rs + i)));
   PROF_END(3)
 }
+#endif
 
 // The whole softmax step in one call: sm_exp then softmax_step.
 void sm_all(bfloat16 *__restrict g, bfloat16 *__restrict up, float *__restrict sp,
             bfloat16 *__restrict gp, uint8_t *__restrict p, int32_t *__restrict rtp, int32_t pass,
             int32_t chunk) {
+#if FA_WIN
+  s_live = !(fa_off(rtp, pass, chunk)) || !(fa_off(rtp, pass, chunk + 1));
+#endif
   // past valid_len, or (causal) past every one of this core's rows: fa_qkpv runs pv on it
   // unchecked, so P zero adds nothing
-  if (fa_dead(rtp, chunk) || fa_skip(rtp, pass, chunk)) {
+  if (fa_off(rtp, pass, chunk)) {
     for (int i = 0; i < TQ * LKP * 9 / 8; i += 64)
       aie::store_v(p + i, aie::zeros<uint8_t, 64>());
     return;
@@ -781,6 +800,18 @@ void sm_all(bfloat16 *__restrict g, bfloat16 *__restrict up, float *__restrict s
   softmax_step(g, up, sp, gp, p, rtp, pass, chunk);
 #endif
 }
+
+#if FA_HS && FA_WIN
+// The window streams' step (dit_fa256b.py with DF_WINDOW): fa_qkpv only when chunk c + 1 (its K piece) or
+// chunk c (its V element) is live for this core -- s_live, set by sm_all(c), which runs right before those
+// four calls. A sliding window leaves ~10 of a call's 26 chunks to a core's 32 rows. Its own image: the
+// check would cost the full layers' long streams more than it saves them.
+void fa_qkpv_w(const uint8_t *q, const uint8_t *kp, bfloat16 *g, const uint8_t *p, const uint8_t *ve, bfloat16 *o,
+               int32_t j) {
+  if (s_live)
+    fa_qkpv(q, kp, g, p, ve, o, j);
+}
+#endif
 
 // End of a pass: O /= l (l replicated, so its bf16 inverse is scale_rows' table).
 void finalize(float *__restrict sp, bfloat16 *__restrict gp) {

@@ -1872,7 +1872,7 @@ Core::Inflight Core::start_run(Kern& k, const std::vector<std::string>& args, in
     }();
     // (its buffers made at load: globals_ is read by the host threads while this runs on the NPU's)
     if (one_ctx_ > 0 && !flush.empty() && kerns_.count(flush) && globals_.count("flush_c") &&
-        ((cfg_cur_ == "mb" && k.ctx == "fab") || (cfg_cur_ == "fab" && k.ctx == "mb"))) {
+        ((cfg_cur_ == "mb" && (k.ctx == "fab" || k.ctx == "faw")) || ((cfg_cur_ == "fab" || cfg_cur_ == "faw") && k.ctx == "mb"))) {
         Kern& fk = kerns_.at(flush);
         if (fk.ctx != cfg_cur_) {
             const CfgStream& c = cfgs_.at(fk.ctx);
@@ -3745,17 +3745,19 @@ void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
     // work and collected after it, so the two read their experts' weights at once
     ExRows exn;
     Inflight fl;
-    if (W.npu_layer >= 0 && dec_npu_ > 0 && ex.size() >= 2 && (abt.par < 0 || ab[static_cast<size_t>(abt.par)] > 0)) {
+    if (W.npu_layer >= 0 && dec_npu_ > 0 && dec_npu_now_ && ex.size() >= 2 && (abt.par < 0 || ab[static_cast<size_t>(abt.par)] > 0)) {
         // OFLM_OPEN_DEC_NPU_SHARE (percent of the pass's experts, default 50): with the GPU busy the
         // NPU's DMA read ~34 GB/s while the CPU cores got ~12, so the NPU can take more than half
         static const size_t share = [] { const char* e = std::getenv("OFLM_OPEN_DEC_NPU_SHARE"); return e ? std::min(100ul, std::strtoul(e, nullptr, 10)) : 50ul; }();
         const size_t sh = abt.par >= 0 ? static_cast<size_t>(ab[static_cast<size_t>(abt.par)]) : share;
         const size_t nn = std::min(dec_npu_, ex.size() * sh / 100);
-        exn.assign(ex.end() - static_cast<long>(nn), ex.end());
-        ex.resize(ex.size() - nn);
-        auto tp = std::chrono::steady_clock::now();
-        fl = dec_npu_start(W.npu_layer, xn, R, exn);
-        dec_npu_prep_ms_ += ms_since(tp);
+        if (nn) {   // (none: no NPU pass at all -- an empty one still streams a whole stream's weights)
+            exn.assign(ex.end() - static_cast<long>(nn), ex.end());
+            ex.resize(ex.size() - nn);
+            auto tp = std::chrono::steady_clock::now();
+            fl = dec_npu_start(W.npu_layer, xn, R, exn);
+            dec_npu_prep_ms_ += ms_since(tp);
+        }
     }
     const size_t NE = ex.size();
     // the inputs: every row once (the shared expert and the experts' up / gate read the same xn)
@@ -3973,6 +3975,21 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
     auto t0 = std::chrono::steady_clock::now();
     timing_ = StepTiming{};
     if (state_owner_ == 2) states_to_host();
+    // OFLM_OPEN_DEC_NPU_AUTO (default on, with OFLM_OPEN_DEC_NPU): whether this token's experts split onto
+    // the NPU, from the measured MoE time a token of both ways -- the faster one, the other probed on 2 of
+    // every 32 tokens (an exponential average each). With the GPU idle the CPU alone was faster (Flint 4K:
+    // 27 against 42 ms a token: mb_s8 streams 8 experts' weights for 3); beside a GPU job the CPU reads
+    // DDR 2-4x slower and the split paid (A3B: -15 % MoE). 0: always split, as before.
+    static const bool dec_auto = [] { const char* e = std::getenv("OFLM_OPEN_DEC_NPU_AUTO"); return !(e && *e == '0'); }();
+    const bool dec_probe = dec_auto && dec_npu_ && R == 1;
+    if (dec_probe) {
+        const int best = dec_ewma_[0] <= dec_ewma_[1] ? 0 : 1;
+        const int mode = dec_ewma_[0] < 0 ? 0 : dec_ewma_[1] < 0 ? 1 : (dec_tok_ % 32 < 2 ? 1 - best : best);
+        dec_npu_now_ = mode == 1;
+        ++dec_tok_;
+    } else {
+        dec_npu_now_ = true;
+    }
     const size_t hid = w_->hidden, pos = static_cast<size_t>(pos_);
     const auto& D = man_.gemm_dit;
     // a GEMM step's [N, K] (its route kernel gemm_n<N>_k<K>) and its padded N
@@ -4319,6 +4336,14 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
         for (size_t r = 0; r < R; ++r)
             for (size_t i = 0; i < hid; ++i) x[r * hid + i] += y[r * nd + i];
         dump_row("l_out", x.data());
+    }
+    if (dec_probe) {
+        double& e = dec_ewma_[dec_npu_now_ ? 1 : 0];
+        const double t = timing_.moe_run_ms + timing_.route_ms;
+        e = e < 0 ? t : 0.7 * e + 0.3 * t;
+        static const bool dlog = std::getenv("OFLM_OPEN_DEC_NPU_LOG") != nullptr;
+        if (dlog && dec_tok_ % 64 == 0)
+            std::fprintf(stderr, "open_qwen36: dec_npu auto: MoE a token CPU %.1f ms, CPU + NPU %.1f ms\n", dec_ewma_[0], dec_ewma_[1]);
     }
     state_owner_ = 1;
     pos_ += static_cast<int>(R);
@@ -6142,7 +6167,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     const MoeBatch* mbp = nullptr;
     for (size_t l = 0; l < L && !mbp; ++l)
         if (is_moe(l)) mbp = &types_[l]->gemm_block.moe_batch;
-    static const size_t moe_group_tok = [] { const char* e = std::getenv("OFLM_OPEN_MOE_GROUP"); return e ? std::strtoul(e, nullptr, 10) : 4096ul; }();
+    // (the kernel set's gemm_dit.moe_group when the env does not say: Flint's 8192)
+    static const char* moe_group_env = std::getenv("OFLM_OPEN_MOE_GROUP");
+    const size_t moe_group_tok = moe_group_env ? std::strtoul(moe_group_env, nullptr, 10) : D.value("moe_group", size_t{4096});
     const size_t G = std::max<size_t>(1, moe_group_tok / M), ngroups = (C + G - 1) / G;
     auto gfirst = [&](size_t c) { return c / G * G; };
     auto glast = [&](size_t c) { return std::min(C, (c / G + 1) * G) - 1; };

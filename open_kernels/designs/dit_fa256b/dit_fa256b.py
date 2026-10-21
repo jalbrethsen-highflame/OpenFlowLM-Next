@@ -91,7 +91,7 @@ def dit_fa256b(
 
     flags = [f"-DFA_TQ={TQ}", f"-DFA_LKP={LKP}", f"-DFA_DC={DC}", f"-DFA_DFULL={DFULL}",
              f"-DFA_QROWS_PASS={QROWS_PASS}", f"-DFA_HS={HS}", *[f"-DFA_X_{x.upper()}" for x in _EXPT if x], f"-DFA_EXP_FIX={EXP_FIX}", f"-DFA_TAU={TAU}",
-             "-Wno-deprecated-declarations"]
+             "-Wno-deprecated-declarations", f"-DFA_WIN={1 if window else 0}"]
     # One ExternalFunction compiles the file; every call goes through a plain Kernel
     # sibling (whisper_fa's note: ExternalFunction's arg check rejects acquired bf16
     # elements).
@@ -108,7 +108,9 @@ def dit_fa256b(
     k_step = Kernel("softmax_step", obj, [g_ty, up_ty, sp_ty, o_l1_ty, p_ty, rtp_ty, np.int32, np.int32])
     k_exp = Kernel("sm_exp", obj, [g_ty, p_ty, rtp_ty, np.int32, np.int32])
     k_all = Kernel("sm_all", obj, [g_ty, up_ty, sp_ty, o_l1_ty, p_ty, rtp_ty, np.int32, np.int32])
-    if HS:   # the asm entry (fa256b.cc fa_qkpv): no rtp, no checks
+    if HS and window:   # the window streams: the asm entry behind a live-chunk flag (fa_qkpv_w)
+        k_qkpv = Kernel("fa_qkpv_w", obj, [q_ty, elem_ty, g_ty, p_ty, elem_ty, o_l1_ty, np.int32])
+    elif HS:   # the asm entry (fa256b.cc fa_qkpv): no rtp, no checks
         k_qkpv = Kernel("fa_qkpv", obj, [q_ty, elem_ty, g_ty, p_ty, elem_ty, o_l1_ty, np.int32])
     else:
         k_qkpv = Kernel("qkpv", obj, [q_ty, elem_ty, g_ty, p_ty, elem_ty, o_l1_ty, np.int32, rtp_ty,

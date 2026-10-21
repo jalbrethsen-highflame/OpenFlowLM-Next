@@ -59,6 +59,33 @@ without positions (NoPE). Vocab 150144, untied head. No MTP head; no drafter exi
   designs (OFLM_OPEN_ONE_CTX_FLUSH; 0 off). Root cause still open (stream / DMA state of a run, not
   of the configuration; the shim DMA has no reset bit).
 
-## Results
+## Results (oflm bench, one length a process, GPU idle: the trainer was not running)
 
-See the sweep table below (one length a process, `oflm bench`, GPU state per row).
+| Context | Prefill tok/s | Decode tok/s |
+|---|---|---|
+| 1K | 436 | 21.9 |
+| 2K | 564 | 21.9 |
+| 4K | 653 | 21.8 |
+| 8K | 954 | 22.2 |
+| 16K | 981 | 19.4 |
+| 32K | 925 | 16.7 |
+| 64K | 771 | 13.3 |
+| 128K | 570 | 9.8 |
+
+## Constraint tracker (2026-10-21, GPU idle unless noted)
+
+| Target | Constraint now | Evidence |
+|---|---|---|
+| Decode, short context | the NPU half of the experts: mb_s8 streams 8 experts' weights for 3, ~0.5 ms a layer, longer than the CPU's whole MoE (0.24 ms) | CPU trace: experts 25 ms of 42; OFLM_OPEN_DEC_NPU=0: 27 ms a token |
+| Decode, 32K-128K | CPU attention over the full layers' KV (14 layers, ~1 KB a key in int8: 1.9 GB a token at 128K) | mixer 12.6 ms at 32K |
+| Prefill 1K-4K | NPU experts streaming every expert's weights (DDR) + host attention / tails | 4K: NPU 69 %, host 80 % |
+| Prefill 16K-128K | NPU: experts (14.2 s at 32K) and attention (15.1 s: window 5.8, full ~9.3, both at head dim 256 padded) | pipe trace 32K: NPU 100 %, host threads ~50 % |
+
+| ID | Area | Item | Kind | Measured now | How to measure | Expected gain | Status |
+|---|---|---|---|---|---|---|---|
+| D1 | decode | NPU expert split slower than the CPU with the GPU idle; it also runs (empty) at share 0 | placement | 42 -> 27 ms a token at 4K with OFLM_OPEN_DEC_NPU=0 | CPU decode trace; per-token A/B | -15 ms a token (GPU idle); load-dependent | open |
+| D2 | decode | full-attention KV read per token | bytes | 12.6 ms at 32K | mixer ms by position | int8 is on; int4 KV would halve (accuracy risk: Flint is KV-sensitive) | open |
+| P1 | prefill | expert slots part-filled: top-6 over groups of 4096 tokens leaves ~96 tokens an expert, 2 slots of 64 | waste | 14.2 s at 32K | OFLM_OPEN_MOE_GROUP 8192 / 16384, slot counts | NPU -10..25 % at 16K+ | open |
+| P2 | prefill | window attention streams 2048 keys for ~576 needed, and the fused qk/pv runs every chunk | waste | 5.8 s at 32K | pipe trace FAT fa256bw | -3..4 s at 32K | open |
+| P3 | prefill | head dim 128 padded to 256 in dit_fa256b | waste | ~2x attention work | NPU attention s | -4..5 s at 32K, ~-70 s at 128K | open (new hd-128 kernel) |
+| M1 | memory | 128K peak ~45 GB (per-chunk buffers ~9 GB, padded key packs 3.9 GB) | memory | fits 46 GB cap | OFLM_OPEN_MEM_LOG | ring buffers: -6 GB | open |

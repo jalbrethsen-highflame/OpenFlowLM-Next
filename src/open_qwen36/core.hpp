@@ -799,6 +799,9 @@ private:
     /// OFLM_OPEN_DEC_NPU=n (mbi, CPU decode): up to n of a step's routed experts per layer on the
     /// NPU's mbi stream, at the same time as the CPU's; dec_npu_start packs and starts it
     size_t dec_npu_ = 0;
+    bool dec_npu_now_ = true;                ///< this step's choice (OFLM_OPEN_DEC_NPU_AUTO)
+    double dec_ewma_[2] = {-1, -1};          ///< MoE ms a token: CPU only, CPU + NPU (-1: not measured yet)
+    size_t dec_tok_ = 0;
     double dec_npu_wait_ms_ = 0, dec_npu_prep_ms_ = 0;
     size_t dec_npu_runs_ = 0;
     /// OFLM_OPEN_KV8 (default on with q41_cpu_): the CPU decode's attention reads an int8 copy of
