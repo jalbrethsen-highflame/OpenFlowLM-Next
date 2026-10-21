@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "open_qwen36/q4nx_file.hpp"   // bf16_to_f32 / f32_to_bf16
+#include "open_qwen36/bfp_pack.hpp"
 
 namespace open_qwen36 {
 namespace host {
@@ -304,10 +305,14 @@ void delta_rule_chunk4(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt,
                     dn_st(o + j, x * dn_bc(inv_sqrt));
                 }
                 rms_vec(o, D, nw, g.eps, on);
-                float* out = og + (t0 + t) * vw + h * D;
+                alignas(64) float ga[D];
+                float* out = g.a2 ? ga : og + (t0 + t) * vw + h * D;
                 alignas(64) float zb[D];
                 const float* zz = dn_zrow(g, z, vw, t0 + t, h, zb);
                 for (size_t j = 0; j < D; j += 16) dn_st(out + j, dn_ld(on + j) * dn_silu(dn_ld(zz + j)));
+                if (g.a2)
+                    for (size_t kb = 0; kb < D / 8; ++kb)
+                        bfp_encode8_avx2(ga + kb * 8, g.a2 + dit2_a_block_off(g.a2_row0 + t0 + t, h * D + kb * 8, vw, g.a2_mt, g.a2_hs));
             }
             // S <- G_last S + sum_s r[last][s] k_s d_s^T, fused with the next chunk's S^T k, S^T q
             const size_t last = nt - 1;
@@ -447,6 +452,7 @@ void delta_rule_heads(const DeltaGeom& g, size_t R, size_t grp, float inv_sqrt, 
                       float* og) {
     const size_t dim = g.head_dim, key_w = g.key_heads * dim, vw = g.value_heads * dim;
     if (g.s_in && dim != 128) throw std::runtime_error("open_qwen36: DeltaGeom.s_in needs head_dim 128");
+    if (g.a2 && (dim != 128 || std::getenv("OFLM_OPEN_DN_RECURRENT"))) throw std::runtime_error("open_qwen36: DeltaGeom.a2 needs the chunk4 rule");
     if (dim != 128) {
 #pragma omp parallel for
         for (long long h = 0; h < static_cast<long long>(g.value_heads); ++h) {
@@ -1006,6 +1012,7 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
         if (g.reset && g.reset[a]) std::fill(S, S + g.value_heads * g.s_rows * dim, 0.f);
         DeltaGeom ga = g;
         if (g.z16) ga.z16 = g.z16 + a * g.ldz;
+        ga.a2_row0 = a;
         delta_rule_heads(ga, b - a, grp, inv_sqrt, Q.data() + a * key_w, Kk.data() + a * key_w, V.data() + a * vw,
                          decay.data() + a * g.value_heads, beta.data() + a * g.value_heads, g.z16 ? nullptr : z + a * vw, nw, S,
                          og + a * vw);

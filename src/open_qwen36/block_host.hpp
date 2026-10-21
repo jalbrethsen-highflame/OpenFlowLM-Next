@@ -69,6 +69,12 @@ struct DeltaGeom {
     /// optional: phase 1 only (the conv state updated, S untouched), its outputs pointed here -- the
     /// rule then runs on the NPU (designs/deltanet/dnc.py: dnc_pack, then dnc_finish)
     DeltaP1* p1 = nullptr;
+    /// optional (the chunk4 rule): the gated rows straight into the OUT GEMM's A as dit2's bfp16
+    /// blocks (a2_mt-row tiles, hs order or not; bfp_pack.hpp) instead of og -- the caller zeroes
+    /// the padding rows and syncs
+    uint8_t* a2 = nullptr;
+    size_t a2_mt = 0, a2_row0 = 0;   // a2_row0: the segment's first row (packed prompts)
+    bool a2_hs = false;
     /// optional, with p1: phase 1 writes the real tokens' K / Q tiles and v pieces as bf16 straight
     /// into dnc's buffers (dnc_pack's layout, dnc_steps steps) instead of p1's f32 Q / K / V
     uint8_t* dnc_rec = nullptr;

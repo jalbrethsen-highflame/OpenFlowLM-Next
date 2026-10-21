@@ -1,6 +1,7 @@
 /// \file core.cpp
 /// \brief The resident open-kernel decode engine: a manifest interpreter (see core.hpp).
 #include "open_qwen36/core.hpp"
+#include "open_qwen36/bfp_pack.hpp"
 
 #include <algorithm>
 #include <array>
@@ -53,39 +54,6 @@ namespace {
 bool dit_ffn_on() {
     static const bool on = [] { const char* e = std::getenv("OFLM_OPEN_DIT_FFN"); return !(e && *e == '0'); }();
     return on;
-}
-
-// The same block with AVX2 (bit-identical: every shift past 24 yields 0 for a 24-bit mantissa,
-// so the int32 lanes never overflow, and the arithmetic shift is the same floor).
-__attribute__((target("avx2"))) inline void bfp_encode8_avx2(const float* v, uint8_t* blk) {
-    const __m256i bits = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(v));
-    const __m256i e = _mm256_and_si256(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(0xFF));
-    __m256i mx = _mm256_max_epi32(e, _mm256_permute2x128_si256(e, e, 1));
-    mx = _mm256_max_epi32(mx, _mm256_shuffle_epi32(mx, 0x4E));
-    mx = _mm256_max_epi32(mx, _mm256_shuffle_epi32(mx, 0xB1));
-    const __m256i implicit = _mm256_andnot_si256(_mm256_cmpeq_epi32(e, _mm256_setzero_si256()), _mm256_set1_epi32(1 << 23));
-    __m256i mant = _mm256_or_si256(_mm256_and_si256(bits, _mm256_set1_epi32(0x7FFFFF)), implicit);
-    const __m256i neg = _mm256_srai_epi32(bits, 31);                      // -1 where negative
-    mant = _mm256_sub_epi32(_mm256_xor_si256(mant, neg), neg);           // two's complement negate
-    const __m256i shift = _mm256_add_epi32(_mm256_sub_epi32(mx, e), _mm256_set1_epi32(17));
-    const __m256i big = _mm256_cmpgt_epi32(shift, _mm256_set1_epi32(24));
-    const __m256i sh = _mm256_min_epi32(shift, _mm256_set1_epi32(24));
-    const __m256i half = _mm256_sllv_epi32(_mm256_set1_epi32(1), _mm256_sub_epi32(sh, _mm256_set1_epi32(1)));
-    // nearest, ties to even (ties up biased bf16 inputs: they tie often, +0.0022 mean on V)
-    const __m256i q0 = _mm256_srav_epi32(mant, sh);                                  // floor
-    const __m256i r = _mm256_sub_epi32(mant, _mm256_sllv_epi32(q0, sh));
-    const __m256i up = _mm256_or_si256(_mm256_cmpgt_epi32(r, half),
-                                       _mm256_and_si256(_mm256_cmpeq_epi32(r, half),
-                                                        _mm256_cmpeq_epi32(_mm256_and_si256(q0, _mm256_set1_epi32(1)),
-                                                                           _mm256_set1_epi32(1))));
-    __m256i q = _mm256_sub_epi32(q0, up);                                             // up is -1 where set
-    q = _mm256_andnot_si256(big, q);
-    q = _mm256_max_epi32(_mm256_min_epi32(q, _mm256_set1_epi32(127)), _mm256_set1_epi32(-128));
-    const __m128i lo = _mm256_castsi256_si128(q), hi = _mm256_extracti128_si256(q, 1);
-    const __m128i w16 = _mm_packs_epi32(lo, hi);
-    const __m128i b8 = _mm_packs_epi16(w16, w16);
-    blk[0] = static_cast<uint8_t>(_mm256_cvtsi256_si32(mx));
-    _mm_storel_epi64(reinterpret_cast<__m128i*>(blk + 1), b8);
 }
 
 inline void bfp_encode8(const float* v, uint8_t* blk) {
@@ -6180,6 +6148,15 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     g.z16 = q16 + nch; g.ldz = nq;
                     double ph[2] = {0, 0};
                     host::DeltaP1 p1;
+                    // OFLM_OPEN_A2_DIRECT (default on): the rule writes the OUT GEMM's bfp16 A rows itself
+                    // (bit-identical to to_bfp2 of its f32 rows, without the 16.8 MB round trip a chunk)
+                    static const bool a2_direct = [] { const char* e = std::getenv("OFLM_OPEN_A2_DIRECT"); return !(e && *e == '0'); }();
+                    const bool a2d = a2_direct && !dnc_on && has2(hid, vw);
+                    if (a2d) {
+                        g.a2 = buffer("pp_m2_" + cs, 0).map<uint8_t*>();
+                        g.a2_mt = MT;
+                        g.a2_hs = dit_hs_;
+                    }
                     if (dnc_on) {
                         const std::string ks = std::to_string(dset_of[cell(l, c)]);
                         g.p1 = &p1;
@@ -6223,8 +6200,17 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         tm = std::chrono::steady_clock::now();
                         if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
                         sadd(mid_prof[3], ms_since(tm)); tm = std::chrono::steady_clock::now();
-                        if (has2(hid, vw)) to_bfp2(og.data(), vw, "pp_m2_" + cs, t_real);
-                        else to_bf16(og.data(), M, vw, "pp_m_" + cs);
+                        if (a2d) {
+                            // the padding rows' blocks zero, as dit2_pack_a writes them
+                            uint8_t* a2 = buffer("pp_m2_" + cs, 0).map<uint8_t*>();
+                            for (size_t r = t_real; r < M; ++r)
+                                for (size_t k0 = 0; k0 < vw; k0 += 8) std::memset(a2 + dit2_a_block_off(r, k0, vw, MT, dit_hs_), 0, 9);
+                            buffer("pp_m2_" + cs, 0).sync(XCL_BO_SYNC_BO_TO_DEVICE, M * vw * 9 / 8, 0);
+                        } else if (has2(hid, vw)) {
+                            to_bfp2(og.data(), vw, "pp_m2_" + cs, t_real);
+                        } else {
+                            to_bf16(og.data(), M, vw, "pp_m_" + cs);
+                        }
                         sadd(mid_prof[4], ms_since(tm));
                     }
                 } else {
