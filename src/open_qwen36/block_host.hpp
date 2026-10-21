@@ -39,6 +39,9 @@ void split_cols(const float* y, size_t T, size_t N, const TransposePart* parts, 
 /// tiles of 8 x 8 MAC sub-tiles, gemm_q4_prefill.py); out holds K * T bf16 bits.
 void tile_x(const float* x, size_t T, size_t K, uint16_t* out);
 
+/// deltanet_block's phase 1 outputs (DeltaGeom.p1): q, k normalised [t][key_w], v [t][vw], the decay
+/// a and beta [t][value_heads]; valid until the thread's next deltanet_block
+struct DeltaP1 { const float *Q = nullptr, *K = nullptr, *V = nullptr, *a = nullptr, *b = nullptr; };
 struct DeltaGeom {
     size_t T = 0, t_real = 0, hid = 0;
     size_t key_heads = 0, value_heads = 0, head_dim = 0, taps = 0;
@@ -63,6 +66,9 @@ struct DeltaGeom {
     /// the f32 z argument, read where the output gate needs it
     const uint16_t* z16 = nullptr;
     size_t ldz = 0;
+    /// optional: phase 1 only (the conv state updated, S untouched), its outputs pointed here -- the
+    /// rule then runs on the NPU (designs/deltanet/dnc.py: dnc_pack, then dnc_finish)
+    DeltaP1* p1 = nullptr;
     /// optional (an MTP verify pass, the chunk4 path): each row's normalised k [t_real, key_heads *
     /// head_dim], delta d [t_real, value_heads * head_dim] and decay [t_real, value_heads] saved
     /// here, so delta_rollback can rebuild the state after a prefix of the rows in one pass over S
@@ -84,6 +90,16 @@ void delta_rollback(const DeltaGeom& g, size_t m, const float* S0, const float* 
 /// layer's state, updated in place through the first t_real tokens. og [T, vw] out
 /// (zero past t_real). phase_ms, if given, gets the two halves' wall time: the
 /// per-token one then the delta rule.
+/// dnc.py's inputs for one chunk of `steps` 16-token steps: records [value_heads][steps][9216] and v
+/// pieces into vo [value_heads][steps][4][16][32] bf16 (rows past t_real: no-ops, a = 1, beta = 0)
+void dnc_pack(const DeltaGeom& g, const DeltaP1& p, size_t steps, uint8_t* rec, uint16_t* vo);
+/// dnc's o (in vo) -> og [T][vw]: / sqrt(head_dim), the gated norm (nw) times silu(z) (g.z16 rows), as
+/// the CPU rule's output; rows past t_real zero
+void dnc_finish(const DeltaGeom& g, const uint16_t* vo, size_t steps, const float* nw, float* og);
+/// the state between the engine's layout (S [value_heads][s_rows][128] f32) and dnc's
+/// [value_heads][16 pieces][4 rows][256] f32 (a row's slice: S^T tiles [db 4][kb 16][8 dv][8 dk])
+void dnc_state_to_tiles(const DeltaGeom& g, const float* S, float* tiles);
+void dnc_state_from_tiles(const DeltaGeom& g, const float* tiles, float* S);
 void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const float* xn, const float* convw,
                     const float* Wa, const float* Wb, const float* A, const float* dtb, const float* nw,
                     uint16_t* conv_state, float* S, float* og, double* phase_ms = nullptr);

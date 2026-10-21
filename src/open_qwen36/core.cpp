@@ -824,6 +824,8 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
             if (man_.gemm_dit["fa"].contains(key))
                 for (const auto& [lk, k] : man_.gemm_dit["fa"][key].items()) wanted[k.get<std::string>()] = true;
     for (const auto& [slots, k] : w_->expert_batch.kernels) wanted[k] = true;
+    // the prompt pipe's NPU delta rule (OFLM_OPEN_DNC=1), when the set carries it
+    if (man_.kernels.count("dnc") && std::getenv("OFLM_OPEN_DNC") && *std::getenv("OFLM_OPEN_DNC") == '1') wanted["dnc"] = true;
     if (!w_->prompt_gemm.is_null())
         for (const auto& [shape, k] : w_->prompt_gemm["kernels"].items()) wanted[k.get<std::string>()] = true;
     for (const auto& [name, d] : w_->kernels)
@@ -5529,12 +5531,21 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     need("pp_h", M * 2 * ff * 2);
     if (ffn_dev) need("pp_hu", M / MT * (ff / 64) * 36864);   // h unit slots, one NPU step uses and frees them
     // Each layer's cells walk a list of operations, host (even index) and NPU (odd) alternating.
-    enum Op { PRE, QKV, MID, FAT, GATE, OUT, TAIL, UP, HPACK, DOWN, RES };
+    enum Op { PRE, QKV, MID, FAT, GATE, OUT, TAIL, UP, HPACK, DOWN, RES, DNC, MIDB };
     std::vector<std::vector<int>> ops(L);
     auto is_moe = [&](size_t l) { return !types_[l]->gemm_block.has_dense_ffn(); };
+    // OFLM_OPEN_DNC=1 (designs/deltanet/dnc.py in the kernel set): a linear layer's delta rule on
+    // the NPU -- MID runs phase 1 and packs the chunk (dnc_pack), DNC the rule, MIDB the gated
+    // norm (dnc_finish) and the OUT GEMM's input. Buffer sets (records, v / o) come from a pool of
+    // kDncSets, taken by MID and freed by MIDB; each layer's state stays on the device in dnc's
+    // tile layout through the prompt.
+    static const bool dnc_env = [] { const char* e = std::getenv("OFLM_OPEN_DNC"); return e && *e == '1'; }();
+    const bool dnc_on = dnc_env && kerns_.count("dnc") && !packed && M <= 1024;
+    constexpr size_t kDncSets = 3, kDncSteps = 64;
     for (size_t l = 0; l < L; ++l) {
         auto& o = ops[l];
         o = {PRE, QKV, MID};
+        if (dnc_on && types_[l]->gemm_block.kind == "linear") o.insert(o.end(), {DNC, MIDB});
         if (types_[l]->gemm_block.kind == "full" && (!FA.empty() || !FCB.empty() || noncausal_)) o.insert(o.end(), {FAT, GATE});
         o.insert(o.end(), {OUT, TAIL, UP});
         if (down2 && !ffn_dev) {
@@ -5597,6 +5608,16 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 }
             }
     }
+    std::vector<long> dset_cell(kDncSets, -1);          // dnc: a set's holder (cell), -1 free
+    std::vector<int> dset_of(L * C, -1);
+    if (dnc_on) {
+        for (size_t k = 0; k < kDncSets; ++k) {
+            need("dnc_rec" + std::to_string(k), 32 * kDncSteps * 9216);
+            need("dnc_vo" + std::to_string(k), 32 * kDncSteps * 4096);
+        }
+        for (size_t l = 0; l < L; ++l)
+            if (types_[l]->gemm_block.kind == "linear") need("dnc_s" + std::to_string(l), 32 * 16 * 4096);
+    }
     // host rows
     std::vector<float> xres(TOT * hid), res(TOT * hid), xn(TOT * hid);
     for (size_t t = 0; t < TOT; ++t)
@@ -5619,7 +5640,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         const int s = stage[cell(l, c)];
         if (busy[cell(l, c)] || s >= nst(l) || ((s & 1) != 0) != npu) return false;
         if (s == 0) return l == 0 || stage[cell(l - 1, c)] >= nst(l - 1);
-        if (ops[l][s] == MID) return c == 0 || stage[cell(l, c - 1)] > s;     // S / the KV rows chain
+        if (ops[l][s] == MID) {                                                // S / the KV rows chain
+            if (!(c == 0 || stage[cell(l, c - 1)] > s)) return false;
+            if (dnc_on && types_[l]->gemm_block.kind == "linear")              // a dnc buffer set free
+                return std::find(dset_cell.begin(), dset_cell.end(), -1L) != dset_cell.end();
+            return true;
+        }
+        if (ops[l][s] == DNC) return c == 0 || stage[cell(l, c - 1)] > s;     // the state chain
         if (ops[l][s] == TAIL && is_moe(l) && c == glast(c)) {                 // the group's other chunks routed, a set free
             for (size_t c2 = gfirst(c); c2 < c; ++c2)
                 if (stage[cell(l, c2)] <= op_at(l, TAIL)) return false;
@@ -5654,7 +5681,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     double mid_prof[5] = {0, 0, 0, 0, 0};
     for (double& v : host::g_dn_prof) v = 0;
     for (double& v : host::g_dn_p1) v = 0;
-    double hst[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    double hst[13] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     int n_fa = 0;
     // OFLM_OPEN_PIPE_TRACE=<file>: every host op, NPU op and NPU kernel run as an event (machine,
     // layer, chunk, op, start, end ms from the pipe's start, kernel), written as CSV at the end
@@ -5696,7 +5723,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 };
                 const size_t nq = gb.kind == "linear" ? gb.qkv_dim + gb.vw : 2 * gb.qw + 2 * gb.kvw;
                 const size_t km = gb.kind == "linear" ? gb.vw : gb.qw;
-                if (op == QKV) {
+                if (op == DNC) {
+                    const std::string ks = std::to_string(dset_of[cell(l, c)]);
+                    run("dnc", {"dnc_rec" + ks, "dnc_vo" + ks, "dnc_s" + std::to_string(l)});
+                } else if (op == QKV) {
                     if (has2(nq, hid)) run(K2[std::to_string(nq) + "x" + std::to_string(hid)].get<std::string>(),
                                            {"pp_a2_" + cs, gb.program[0].args[0], "pp_q_" + cs});
                     else run(kname(nq, hid), {"pp_a_" + cs, gb.program[0].args[0], "pp_q_" + cs});
@@ -5853,6 +5883,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 if (err) std::rethrow_exception(err);
                 if (finished == L * C) break;
                 busy[cell(l, c)] = 1;
+                if (dnc_on && ops[l][stage[cell(l, c)]] == MID && types_[l]->gemm_block.kind == "linear") {
+                    const size_t k = static_cast<size_t>(std::find(dset_cell.begin(), dset_cell.end(), -1L) - dset_cell.begin());
+                    dset_cell[k] = static_cast<long>(cell(l, c));
+                    dset_of[cell(l, c)] = static_cast<int>(k);
+                }
                 if (ops[l][stage[cell(l, c)]] == TAIL && is_moe(l) && c == glast(c)) {
                     mset[(c / G) % 2].owner = gkey(l, c);
                     mset[(c / G) % 2].res_left = c - gfirst(c) + 1;
@@ -5900,17 +5935,46 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     g.qkv16 = q16; g.ld16 = nq;                    // qkv and z read as the C rows
                     g.z16 = q16 + nch; g.ldz = nq;
                     double ph[2] = {0, 0};
+                    host::DeltaP1 p1;
+                    if (dnc_on) g.p1 = &p1;
                     host::deltanet_block(g, ya.data(), nullptr, xc, hc.convw.data(), hc.Wa.data(), hc.Wb.data(),
                                          hc.A.data(), hc.dtb.data(), hc.nw.data(), reinterpret_cast<uint16_t*>(sp),
                                          reinterpret_cast<float*>(sp + gb.state_s_off), og.data(), ph);
                     sadd(timing_.dn_conv_ms, ph[0]);
                     sadd(timing_.dn_rule_ms, ph[1]);
-                    tm = std::chrono::steady_clock::now();
-                    if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
-                    sadd(mid_prof[3], ms_since(tm)); tm = std::chrono::steady_clock::now();
-                    if (has2(hid, vw)) to_bfp2(og.data(), vw, "pp_m2_" + cs, t_real);
-                    else to_bf16(og.data(), M, vw, "pp_m_" + cs);
-                    sadd(mid_prof[4], ms_since(tm));
+                    if (dnc_on) {
+                        // the chunk for the NPU's rule; at the first chunk the layer's state in dnc's layout
+                        const std::string ks = std::to_string(dset_of[cell(l, c)]);
+                        xrt::bo& rb = buffer("dnc_rec" + ks, 0);
+                        xrt::bo& vb = buffer("dnc_vo" + ks, 0);
+                        host::dnc_pack(g, p1, kDncSteps, rb.map<uint8_t*>(), vb.map<uint16_t*>());
+                        rb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 32 * kDncSteps * 9216, 0);
+                        vb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 32 * kDncSteps * 4096, 0);
+                        if (c == 0) {
+                            xrt::bo& sb = buffer("dnc_s" + std::to_string(l), 0);
+                            host::dnc_state_to_tiles(g, reinterpret_cast<const float*>(sp + gb.state_s_off), sb.map<float*>());
+                            sb.sync(XCL_BO_SYNC_BO_TO_DEVICE, 32 * 16 * 4096, 0);
+                        }
+                        // OFLM_OPEN_DNC_DUMP=<dir> (debug): layer 0, chunk 0's inputs; MIDB writes its outputs
+                        if (const char* dd = std::getenv("OFLM_OPEN_DNC_DUMP"); dd && l == 0 && c == 0) {
+                            auto wr = [&](const std::string& f, const void* p, size_t n) {
+                                if (FILE* fo = std::fopen((std::string(dd) + "/" + f).c_str(), "wb")) { std::fwrite(p, 1, n, fo); std::fclose(fo); }
+                            };
+                            wr("rec.bin", rb.map<const uint8_t*>(), 32 * kDncSteps * 9216);
+                            wr("vo.bin", vb.map<const uint8_t*>(), 32 * kDncSteps * 4096);
+                            wr("s.bin", buffer("dnc_s" + std::to_string(l), 0).map<const uint8_t*>(), 32 * 16 * 4096);
+                            const size_t tr = t_real;
+                            wr("treal.bin", &tr, sizeof tr);
+                        }
+                        sadd(mid_prof[4], ms_since(th));
+                    } else {
+                        tm = std::chrono::steady_clock::now();
+                        if (c + 1 == C) st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
+                        sadd(mid_prof[3], ms_since(tm)); tm = std::chrono::steady_clock::now();
+                        if (has2(hid, vw)) to_bfp2(og.data(), vw, "pp_m2_" + cs, t_real);
+                        else to_bf16(og.data(), M, vw, "pp_m_" + cs);
+                        sadd(mid_prof[4], ms_since(tm));
+                    }
                 } else {
                     const size_t qw = gb.qw, kvw = gb.kvw, row = lt.state_row;
                     const std::string fk = fa_kernel(c);
@@ -6111,6 +6175,42 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 }
                 if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs, t_real);
                 else to_bf16(og.data(), M, qw, "pp_m_" + cs);
+            } else if (op == MIDB) {
+                // dnc's o -> the gated norm -> the OUT GEMM's input; the set freed; after the last
+                // chunk the state back in the engine's layout (decode reads it there)
+                const size_t vw = gb.vw, nq = gb.qkv_dim + gb.vw;
+                const std::string ks = std::to_string(dset_of[cell(l, c)]);
+                xrt::bo& vb = buffer("dnc_vo" + ks, 0);
+                read_back(vb, 32 * kDncSteps * 4096, 0);
+                const uint16_t* q16 = buffer("pp_q_" + cs, 0).map<const uint16_t*>();
+                host::DeltaGeom g;
+                g.T = M; g.hid = hid;
+                g.key_heads = gb.key_heads; g.value_heads = gb.value_heads; g.head_dim = gb.head_dim;
+                g.taps = gb.conv_kernel; g.lanes = hc.lanes; g.s_rows = gb.s_rows; g.eps = gb.eps;
+                g.t_real = t_real;
+                g.z16 = q16 + gb.qkv_dim; g.ldz = nq;
+                og.resize(M * vw);
+                if (const char* dd = std::getenv("OFLM_OPEN_DNC_DUMP"); dd && l == 0 && c == 0) {
+                    xrt::bo& sb0 = buffer("dnc_s" + std::to_string(l), 0);
+                    read_back(sb0, 32 * 16 * 4096, 0);
+                    for (const auto& [f, b2, n] : {std::tuple<std::string, xrt::bo*, size_t>{"vo_out.bin", &vb, 32 * kDncSteps * 4096},
+                                                    {"s_out.bin", &sb0, 32 * 16 * 4096}})
+                        if (FILE* fo = std::fopen((std::string(dd) + "/" + f).c_str(), "wb")) { std::fwrite(b2->map<const uint8_t*>(), 1, n, fo); std::fclose(fo); }
+                }
+                host::dnc_finish(g, vb.map<const uint16_t*>(), kDncSteps, hc.nw.data(), og.data());
+                if (has2(hid, vw)) to_bfp2(og.data(), vw, "pp_m2_" + cs, t_real);
+                else to_bf16(og.data(), M, vw, "pp_m_" + cs);
+                if (c + 1 == C) {
+                    xrt::bo& sb = buffer("dnc_s" + std::to_string(l), 0);
+                    read_back(sb, 32 * 16 * 4096, 0);
+                    xrt::bo& st = state_[l];
+                    host::dnc_state_from_tiles(g, sb.map<const float*>(), reinterpret_cast<float*>(st.map<uint8_t*>() + gb.state_s_off));
+                    st.sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    dset_cell[static_cast<size_t>(dset_of[cell(l, c)])] = -1;
+                }
             } else if (op == TAIL) {
                 xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
                 read_back(yb2, t_real * hid * 2, 0);
@@ -6362,7 +6462,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     npu.join();
     if (err) std::rethrow_exception(err);
     if (ptrace) {
-        static const char* opn[] = {"PRE", "QKV", "MID", "FAT", "GATE", "OUT", "TAIL", "UP", "HPACK", "DOWN", "RES"};
+        static const char* opn[] = {"PRE", "QKV", "MID", "FAT", "GATE", "OUT", "TAIL", "UP", "HPACK", "DOWN", "RES", "DNC", "MIDB"};
         if (FILE* f = std::fopen(ptrace, "w")) {
             std::fprintf(f, "m,l,c,op,a,b,k\n");
             for (const auto& e : pev) std::fprintf(f, "%c,%d,%d,%s,%.3f,%.3f,%s\n", e.m, e.l, e.c, opn[e.op], e.a, e.b, e.k.c_str());

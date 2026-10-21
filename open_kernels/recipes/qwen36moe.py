@@ -1374,6 +1374,13 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
                                "env": {"MB_SLOTS": str(s), "MB_NT": str(MB_NT), "MB_HID": str(hid), "MB_FF": str(ff),
                                        "MB_EXPERTS": str(E), "MB_POOL_DOWN": str(L.POOL_DOWN),
                                        "MB_POOL_BYTES": str(L.POOL_BYTES), **({"MB_BFP": "1"} if MBE else {})}}
+    # designs/deltanet/dnc.py: the linear layers' delta rule over a 1024-token prompt chunk on the NPU
+    # (the driver's OFLM_OPEN_DNC=1); built for 32 value heads / 16 key heads of head dim 128
+    if (not dense and spec.has_linear and spec.lin_value_heads == 32 and spec.lin_key_heads == 16
+            and spec.lin_key_dim == 128 and spec.lin_value_dim == 128):
+        out["contexts"]["dnc"] = "dnc/final.xclbin"
+        out["kernels"]["dnc"] = {"context": "dnc", "insts": "dnc/insts.bin", "build": "dnc"}
+        out["builds"]["dnc"] = {"design": "deltanet/dnc.py", "build_dir": "deltanet/build_dnc_s64", "env": {"DNC_STEPS": "64"}}
     if not dense and MBI:
         out["globals"]["mb_x"] = mb_slots[0] * MBI_XSLOT
         out["globals"]["mb_y"] = mb_slots[0] * MBI_YSLOT
@@ -1578,7 +1585,7 @@ KERNEL_SOURCES = [
     "designs/ln/ln.h", "designs/ln/*.cc", "designs/ln/ln.py", "designs/lin_layer/ln_nr.cc",
     "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.cc", "designs/lm_head_q8/*.h",
     "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc", "designs/gemm_q4_prefill/*.h",
-    "designs/moe_batch/moe_batch.py", "designs/moe_batch/mbe.py", "designs/moe_batch/mbi.py", "designs/moe_batch/*.cc", "designs/moe_batch/*.h",
+    "designs/moe_batch/moe_batch.py", "designs/moe_batch/mbe.py", "designs/moe_batch/mbi.py", "designs/deltanet/dnc.py", "designs/moe_batch/*.cc", "designs/moe_batch/*.h",
     "designs/lfm2moe/eb_*.cc",
     "designs/attn_block/attn_gemm.py", "../npu_offload/gemm_rtp/gemm_pretiled.py", "../npu_offload/gemm_rtp/npue.py",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",

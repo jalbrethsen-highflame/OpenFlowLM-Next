@@ -571,6 +571,128 @@ __attribute__((target("avx512f"))) void dn_alpha_beta_512(size_t hid, size_t lan
                 }
         }
 }
+namespace {
+inline uint16_t dnc_bf(float x) { return f32_to_bf16(x); }
+inline void dnc_hilo(double x, uint16_t* h, uint16_t* l) {
+    *h = f32_to_bf16(static_cast<float>(x));
+    *l = f32_to_bf16(static_cast<float>(x - static_cast<double>(bf16_to_f32(*h))));
+}
+}  // namespace
+
+void dnc_pack(const DeltaGeom& g, const DeltaP1& p, size_t steps, uint8_t* rec, uint16_t* vo) {
+    const size_t D = 128, nv = g.value_heads, grp = nv / g.key_heads, key_w = g.key_heads * D, vw = nv * D, R = g.t_real;
+    if (g.head_dim != D || R > steps * 16) throw std::runtime_error("open_qwen36: dnc_pack: head dim 128, t_real <= steps * 16");
+#pragma omp parallel for schedule(dynamic, 4)
+    for (long long hn = 0; hn < static_cast<long long>(nv * steps); ++hn) {
+        const size_t h = static_cast<size_t>(hn) / steps, n = static_cast<size_t>(hn) % steps, kh = h / grp, t0 = n * 16;
+        uint16_t* r = reinterpret_cast<uint16_t*>(rec + (h * steps + n) * 9216);
+        // K, Q tiles [tb][kb][8 t][8 dk]
+        for (size_t which = 0; which < 2; ++which) {
+            const float* src = which ? p.Q : p.K;
+            uint16_t* dst = r + which * 2048;
+            for (size_t tb = 0; tb < 2; ++tb)
+                for (size_t kb = 0; kb < 16; ++kb)
+                    for (size_t i = 0; i < 8; ++i) {
+                        const size_t t = t0 + tb * 8 + i;
+                        uint16_t* d = dst + ((tb * 16 + kb) * 8 + i) * 8;
+                        if (t < R) {
+                            const float* x = src + t * key_w + kh * D + kb * 8;
+                            for (size_t j = 0; j < 8; ++j) d[j] = dnc_bf(x[j]);
+                        } else {
+                            for (size_t j = 0; j < 8; ++j) d[j] = 0;
+                        }
+                    }
+        }
+        // the decays: G_t = sum log a (in the step), e = G_t - G_7, f = G_7 - G_s, gamma = G_t, w = G_15 - G_s
+        double G[16], la = 0, bt[16];
+        for (size_t i = 0; i < 16; ++i) {
+            const size_t t = t0 + i;
+            // log a >= -10 (a >= 4.5e-5): e and f span up to 8 tokens of decay either side of the
+            // middle, and must stay below e^88 (bf16 / f32); some heads decay by e^-100 a token, where
+            // the state keeps 4.5e-5 instead of ~0
+            la += t < R ? std::max(-10.0, std::log(static_cast<double>(p.a[t * nv + h]))) : 0.0;
+            G[i] = la;
+            bt[i] = t < R ? p.b[t * nv + h] : 0.0;
+        }
+        uint16_t* aux = r + 4096;
+        std::memset(aux, 0, 1024);
+        for (size_t i = 0; i < 16; ++i) {
+            dnc_hilo(std::exp(G[i] - G[7]), aux + i, aux + 16 + i);
+            dnc_hilo(std::exp(G[7] - G[i]), aux + 32 + i, aux + 48 + i);
+            dnc_hilo(bt[i], aux + 64 + i, aux + 80 + i);
+        }
+        for (size_t tb = 0; tb < 2; ++tb)
+            for (size_t i = 0; i < 8; ++i) {
+                uint16_t gh, gl;
+                dnc_hilo(std::exp(G[tb * 8 + i]), &gh, &gl);
+                const uint16_t w = dnc_bf(static_cast<float>(std::exp(G[15] - G[tb * 8 + i])));
+                for (size_t c = 0; c < 8; ++c) {
+                    aux[96 + tb * 64 + i * 8 + c] = gh;          // [8 t][8]: row i
+                    aux[224 + tb * 64 + i * 8 + c] = gl;
+                    aux[352 + tb * 64 + c * 8 + i] = w;          // [8 dk][8 t]: column i
+                }
+            }
+        dnc_hilo(std::exp(G[15]), aux + 480, aux + 481);
+        // v pieces [4 rows][16 t][32]
+        uint16_t* v = vo + (h * steps + n) * 2048;
+        for (size_t q = 0; q < 4; ++q)
+            for (size_t i = 0; i < 16; ++i) {
+                const size_t t = t0 + i;
+                uint16_t* d = v + (q * 16 + i) * 32;
+                if (t < R) {
+                    const float* x = p.V + t * vw + h * D + q * 32;
+                    for (size_t j = 0; j < 32; ++j) d[j] = dnc_bf(x[j]);
+                } else {
+                    for (size_t j = 0; j < 32; ++j) d[j] = 0;
+                }
+            }
+    }
+}
+
+void dnc_finish(const DeltaGeom& g, const uint16_t* vo, size_t steps, const float* nw, float* og) {
+    const size_t D = 128, nv = g.value_heads, vw = nv * D, R = g.t_real;
+    const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(D));
+    std::fill(og + R * vw, og + g.T * vw, 0.f);
+#pragma omp parallel for schedule(static)
+    for (long long th = 0; th < static_cast<long long>(R * nv); ++th) {
+        const size_t t = static_cast<size_t>(th) / nv, h = static_cast<size_t>(th) % nv, n = t / 16, i = t % 16;
+        alignas(64) float o[128], on[128], zb[128];
+        for (size_t q = 0; q < 4; ++q) {
+            const uint16_t* s = vo + ((h * steps + n) * 4 + q) * 512 + i * 32;
+            for (size_t j = 0; j < 32; ++j) o[q * 32 + j] = bf16_to_f32(s[j]) * inv_sqrt;
+        }
+        rms_vec(o, D, nw, g.eps, on);
+        const float* zz = dn_zrow(g, nullptr, vw, t, h, zb);
+        float* out = og + t * vw + h * D;
+        for (size_t j = 0; j < D; j += 16) dn_st(out + j, dn_ld(on + j) * dn_silu(dn_ld(zz + j)));
+    }
+}
+
+namespace {
+// element (dk, dv) of head h in dnc's tile layout (floats)
+inline size_t dnc_tidx(size_t h, size_t dk, size_t dv) {
+    const size_t q = dv / 32, dvl = dv % 32, idx = (((dvl / 8) * 16 + dk / 8) * 8 + dvl % 8) * 8 + dk % 8;
+    return ((h * 16 + idx / 256) * 4 + q) * 256 + idx % 256;
+}
+}  // namespace
+
+void dnc_state_to_tiles(const DeltaGeom& g, const float* S, float* tiles) {
+#pragma omp parallel for
+    for (long long hh = 0; hh < static_cast<long long>(g.value_heads); ++hh) {
+        const size_t h = static_cast<size_t>(hh);
+        for (size_t dk = 0; dk < 128; ++dk)
+            for (size_t dv = 0; dv < 128; ++dv) tiles[dnc_tidx(h, dk, dv)] = S[(h * g.s_rows + dk) * 128 + dv];
+    }
+}
+void dnc_state_from_tiles(const DeltaGeom& g, const float* tiles, float* S) {
+#pragma omp parallel for
+    for (long long hh = 0; hh < static_cast<long long>(g.value_heads); ++hh) {
+        const size_t h = static_cast<size_t>(hh);
+        for (size_t dk = 0; dk < 128; ++dk)
+            for (size_t dv = 0; dv < 128; ++dv) S[(h * g.s_rows + dk) * 128 + dv] = tiles[dnc_tidx(h, dk, dv)];
+    }
+}
+
 // cloned like the rule: phase 1's silu and norms are 16-lane vector code (two AVX2 halves without it)
 __attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
 void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const float* xn, const float* convw,
@@ -805,6 +927,11 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
     }
 
     DN_MARK(3);
+    if (g.p1) {   // the rule runs elsewhere (dnc): hand phase 1's arrays over
+        g.p1->Q = Q.data(); g.p1->K = Kk.data(); g.p1->V = V.data(); g.p1->a = decay.data(); g.p1->b = beta.data();
+        if (phase_ms) phase_ms[0] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+        return;
+    }
     // ---- phase 2, per head over every token: the gated delta rule on S (in place), the gated norm
     const auto tp1 = std::chrono::steady_clock::now();
     // one pass per packed sequence, S zeroed where one starts
