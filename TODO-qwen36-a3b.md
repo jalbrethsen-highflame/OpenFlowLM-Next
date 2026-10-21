@@ -282,12 +282,12 @@ Decode:
 | Context | Prefill tok/s | Decode tok/s | GPU busy samples |
 |---|---|---|---|
 | 128K | 735 | 8.7 | 206/218 (trainer guard paused it 5x, 94-95 C) |
-| 64K | 1218 | 28.5 | 27/93 (mostly idle: rerun) |
+| 64K | 827 | 8.7 | 116/117 (rerun; the idle-GPU run gave 1218 / 28.5; trainer paused 3x) |
 | 32K | 888 | 13.5 | 83/83 |
 | 16K | 734 | 11.9 | 65/65 |
 | 8K | 743 | 12.7 | 51/51 |
 | 4K | 521 | 17.3 | 47/47 |
-| 2K | 611 | 37.4 | 24/39 (partly idle: rerun) |
+| 2K | 461 | 12.5 | 44/44 (rerun; the partly idle run gave 611 / 37.4) |
 | 1K | 414 | 15.1 | 45/45 |
 
 With the GPU busy no length meets either target. 128K: NPU busy 153.7 of 168.5 s, attention 58.7 s NPU.
