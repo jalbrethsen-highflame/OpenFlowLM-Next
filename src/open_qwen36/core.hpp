@@ -344,6 +344,7 @@ private:
     struct CfgStream { std::unique_ptr<xrt::bo> instr; size_t words = 0; };
     std::map<std::string, CfgStream> cfgs_;
     std::string cfg_cur_;                      ///< the context name whose configuration the array holds
+    size_t flush_runs_ = 0;                    ///< OFLM_OPEN_ONE_CTX_FLUSH runs between the mb and fab designs
     size_t cfg_runs_ = 0;
     std::map<std::string, Kern> kerns_;
 

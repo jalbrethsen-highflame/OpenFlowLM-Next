@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <thread>
 #include <cstdlib>
@@ -1747,6 +1748,10 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
             }
         }
     }
+    // the mb / fab flush run's zero buffers (start_run), made here: never inserted while the pipe runs
+    if (kerns_.count("mb_s8") || w_->contexts.count("fab"))
+        for (const char* nm : {"flush_a", "flush_b", "flush_c"})
+            if (!globals_.count(nm)) globals_[nm] = alloc(8u << 20);
     prompt_setup();
     weights_loaded_ = true;
     pos_ = 0;
@@ -1840,7 +1845,70 @@ Core::Inflight Core::start_run(Kern& k, const std::vector<std::string>& args, in
     f.ctx_change = last_dispatched_ && last_dispatched_->ctx != k.ctx;
     last_dispatched_ = &k;
     ++dispatches_;
-    if (one_ctx_ > 0 && k.ctx != cfg_cur_) {
+    // OFLM_OPEN_ONE_CTX_RECFG=<ctx> (debug): that context's configuration run before every one of its kernels
+    static const char* recfg = std::getenv("OFLM_OPEN_ONE_CTX_RECFG");
+    // OFLM_OPEN_ONE_CTX_BRIDGE=<from>:<to>:<via> (debug): from <from> to <to>, <via>'s configuration first
+    static const std::array<std::string, 3> bridge = [] {
+        std::array<std::string, 3> b;
+        if (const char* e = std::getenv("OFLM_OPEN_ONE_CTX_BRIDGE")) {
+            std::string v = e;
+            const size_t a = v.find(':'), c = v.find(':', a + 1);
+            if (a != std::string::npos && c != std::string::npos) b = {v.substr(0, a), v.substr(a + 1, c - a - 1), v.substr(c + 1)};
+        }
+        return b;
+    }();
+    // Between the mb (expert) and fab (attention) designs, either way, one run of a small dit2 GEMM on zero
+    // buffers of its own first. In one context, a fab kernel right after an mb run hung (ERT state 8; Flint at
+    // 8K, every time) and so did an mb run right after fab; a configuration replay in between did not help,
+    // a real dit2 run did -- some stream or DMA state of the run itself, not the configuration. The kernel:
+    // OFLM_OPEN_ONE_CTX_FLUSH (0 off), default the set's smallest dit2 stream (its tiny tier's).
+    static const std::string flush = [this] {
+        const char* e = std::getenv("OFLM_OPEN_ONE_CTX_FLUSH");
+        if (e) return std::string(*e == '0' ? "" : e);
+        std::string best;
+        for (const auto& [n, kk] : kerns_)
+            if (n.rfind("dit2_", 0) == 0 && n.size() > 5 && n.compare(n.size() - 5, 5, "_m256") == 0 && (best.empty() || n < best)) best = n;
+        return best;
+    }();
+    // (its buffers made at load: globals_ is read by the host threads while this runs on the NPU's)
+    if (one_ctx_ > 0 && !flush.empty() && kerns_.count(flush) && globals_.count("flush_c") &&
+        ((cfg_cur_ == "mb" && k.ctx == "fab") || (cfg_cur_ == "fab" && k.ctx == "mb"))) {
+        Kern& fk = kerns_.at(flush);
+        if (fk.ctx != cfg_cur_) {
+            const CfgStream& c = cfgs_.at(fk.ctx);
+            xrt::run cr(*cfg_k_);
+            cr.set_arg(0, kOpcode);
+            cr.set_arg(1, *c.instr);
+            cr.set_arg(2, static_cast<int>(c.words));
+            cr.set_arg(3, buffer("flush_a", 0)); cr.set_arg(4, buffer("flush_b", 0)); cr.set_arg(5, buffer("flush_c", 0));
+            cr.start();
+            cr.wait();
+            cfg_cur_ = fk.ctx;
+            ++cfg_runs_;
+        }
+        xrt::run fr(*fk.k);
+        fr.set_arg(0, kOpcode);
+        fr.set_arg(1, *fk.instr);
+        fr.set_arg(2, static_cast<int>(fk.words.size()));
+        fr.set_arg(3, buffer("flush_a", 0)); fr.set_arg(4, buffer("flush_b", 0)); fr.set_arg(5, buffer("flush_c", 0));
+        fr.start();
+        fr.wait();
+        ++flush_runs_;
+    }
+    if (one_ctx_ > 0 && !bridge[0].empty() && cfg_cur_ == bridge[0] && k.ctx == bridge[1] && cfgs_.count(bridge[2])) {
+        const CfgStream& c = cfgs_.at(bridge[2]);
+        xrt::run br(*cfg_k_);
+        br.set_arg(0, kOpcode);
+        br.set_arg(1, *c.instr);
+        br.set_arg(2, static_cast<int>(c.words));
+        int i = 3;
+        for (const auto& a : args) br.set_arg(i++, buffer(a, layer));
+        br.start();
+        br.wait();
+        cfg_cur_ = bridge[2];
+        ++cfg_runs_;
+    }
+    if (one_ctx_ > 0 && (k.ctx != cfg_cur_ || (recfg && k.ctx == recfg))) {
         // the array holds another design: its configuration run first (the context runs its
         // commands in order)
         const CfgStream& c = cfgs_.at(k.ctx);
@@ -5951,8 +6019,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     auto is_cb = [](const std::string& k) { return k.rfind("fa256bc", 0) == 0; };
     // fa.win (Flint's sliding layers): a chunk's MQ queries over the sink chunk and its keys from window - 1
     // before it, one stream for every chunk (lk = MQ + 1024 keys), the query offset patched per call; from
-    // OFLM_OPEN_FA_W_MIN prompt tokens (default 512), else the host's
-    static const size_t faw_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_W_MIN"); return e ? std::strtoul(e, nullptr, 10) : 512ul; }();
+    // OFLM_OPEN_FA_W_MIN prompt tokens (default 1024, where the full layers' NPU attention starts), else the
+    // host's. With the GPU idle the host's is a little faster below 4K (Flint 1K 425 against 389 tok/s, 2K
+    // 567 / 555, 4K 641 / 648), but host stages slow ~2x beside a GPU job and the NPU's DMA does not.
+    static const size_t faw_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_W_MIN"); return e ? std::strtoul(e, nullptr, 10) : 1024ul; }();
     std::string faw_kernel;
     size_t faw_lk = 0;
     if (cb_ok && fa_on && N >= faw_min && D["fa"].contains("win") && D["fa"]["win"].contains(std::to_string(MQ)) && (full_m || cbs_m)) {
@@ -5993,7 +6063,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             need("pp_a2_" + cs, M * hid * 9 / 8);
             need("pp_m2_" + cs, M * wmid * 9 / 8);
         }
-        if (down2) {
+        if (down2 && (!ffn_dev || std::getenv("OFLM_OPEN_FFN_CHECK"))) {   // (the device-packed FFN needs neither)
             need("pp_h_" + cs, M * 2 * ff * 2);
             need("pp_d2_" + cs, M * ff * 9 / 8);
         }
@@ -6280,6 +6350,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 } else if (op == FAT) {
                     auto tf = std::chrono::steady_clock::now();
                     const std::string fk = gb.window ? faw_kernel : fa_kernel(c);
+                    static const bool fa_log = std::getenv("OFLM_OPEN_FA_LOG") != nullptr;
+                    if (fa_log)
+                        std::fprintf(stderr, "fa: dispatch #%zu layer %zu chunk %zu %s (previous context %s)\n", dispatches_ + 1, l, c,
+                                     fk.c_str(), cfg_cur_.c_str());
                     if (gb.window) {
                         // fa.win: the chunk's queries at packed key p - kst + 64 (after the sink chunk)
                         const size_t p = pos0 + c * M;
@@ -7221,6 +7295,27 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     apply_thread_budget();
     npu.join();
     if (err) std::rethrow_exception(err);
+    {
+        // a long prompt's per-chunk buffers and the attention packs go (~9 GB at 128K; decode then needs its
+        // int8 KV copy): chunks past OFLM_OPEN_KEEP_CHUNKS (default 8) and the packs past 512 MB; the next
+        // prompt makes them again (need)
+        static const size_t keep = [] { const char* e = std::getenv("OFLM_OPEN_KEEP_CHUNKS"); return e ? std::strtoul(e, nullptr, 10) : 8ul; }();
+        static const char* per_chunk[] = {"pp_a_", "pp_m_", "pp_q_", "pp_y_", "pp_a2_", "pp_m2_", "pp_h_", "pp_d2_",
+                                          "fa_q_", "fa_o_", "fab_q_", "faw_k_", "faw_v_"};
+        size_t packs = 0;
+        for (const auto& [nm, b] : globals_)
+            if (nm.rfind("fabc_", 0) == 0) packs += b.size();
+        for (auto it = globals_.begin(); it != globals_.end();) {
+            bool drop = packs > (512u << 20) && it->first.rfind("fabc_", 0) == 0;
+            for (const char* pfx : per_chunk) {
+                const size_t n = std::strlen(pfx);
+                if (it->first.compare(0, n, pfx) == 0 && it->first.size() > n && std::isdigit(static_cast<unsigned char>(it->first[n])) &&
+                    std::strtoul(it->first.c_str() + n, nullptr, 10) >= keep)
+                    drop = true;
+            }
+            it = drop ? globals_.erase(it) : std::next(it);
+        }
+    }
     if (ptrace) {
         static const char* opn[] = {"PRE", "QKV", "MID", "FAT", "GATE", "OUT", "TAIL", "UP", "HPACK", "DOWN", "RES", "DNC", "MIDB"};
         if (FILE* f = std::fopen(ptrace, "w")) {
@@ -7260,7 +7355,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                          "hpack %.0f res %.0f idle %.0f\n",
                  N, C, M, L, timing_.total_ms, npu_busy_ms, n_fa, fa_ms, npu_idle_ms, hst[PRE], hst[MID], timing_.dn_conv_ms,
                  timing_.dn_rule_ms, timing_.attn_ms, hst[GATE], hst[TAIL], hst[HPACK], hst[RES], host_idle_ms);
-    if (one_ctx_ > 0) std::fprintf(stderr, "open_qwen36: one context: %zu configuration runs so far\n", cfg_runs_);
+    if (one_ctx_ > 0) std::fprintf(stderr, "open_qwen36: one context: %zu configuration runs, %zu mb/fab flush runs so far\n", cfg_runs_, flush_runs_);
     if (mbp)
         std::fprintf(stderr, "open_qwen36: pipe MoE: experts on the NPU %.0f ms; host route + gather %.0f (router %.0f, gate %.0f, "
                              "gather %.0f, x sync %.0f, slot plan %.0f), scatter %.0f (y read back %.0f) ms\n",
