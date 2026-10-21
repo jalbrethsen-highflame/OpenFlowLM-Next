@@ -5722,6 +5722,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         long owner = -1;                 // the group (l * groups + g) holding it
         size_t res_left = 0;             // its chunks' RES still to run
         bool ysynced = false;            // the passes' y read back (by the group's first RES)
+        // OFLM_OPEN_RES_EARLY: passes the NPU has finished (under mu), each pass's y read back yet, and
+        // per chunk of the group the passes its RES has already added
+        size_t done = 0;
+        std::vector<char> ysync;
+        std::vector<size_t> scat;
+        std::vector<char> shared_in;     // the chunk's gated shared expert added (on its first RES visit)
         std::vector<MoePass> passes;
         std::vector<std::vector<std::vector<std::pair<size_t, float>>>> per_token;   // [pass][group row]: (slot * NT + column, weight)
     };
@@ -5804,6 +5810,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     std::exception_ptr err;
     auto cell = [&](size_t l, size_t c) { return l * C + c; };
     auto nst = [&](size_t l) { return static_cast<int>(ops[l].size()); };
+    // OFLM_OPEN_RES_EARLY=1: a MoE chunk's RES adds the group's expert passes as the NPU finishes them
+    // (host threads idled 10.4 s at 30K waiting for a group's last pass)
+    static const bool res_early = [] { const char* e = std::getenv("OFLM_OPEN_RES_EARLY"); return e && (*e == '1' || *e == '2'); }() && mbi;
+    static const bool res_early_go = [] { const char* e = std::getenv("OFLM_OPEN_RES_EARLY"); return e && *e == '1'; }();   // 2: the path, never early (debug)
     auto ready = [&](size_t l, size_t c, bool npu) {
         const int s = stage[cell(l, c)];
         if (busy[cell(l, c)] || s >= nst(l) || ((s & 1) != 0) != npu) return false;
@@ -5821,7 +5831,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             const long o = mset[(c / G) % 2].owner;
             if (o >= 0 && o != gkey(l, c)) return false;
         }
-        if (ops[l][s] == RES && is_moe(l) && stage[cell(l, glast(c))] <= op_at(l, UP)) return false;   // the group's passes run
+        if (ops[l][s] == RES && is_moe(l) && stage[cell(l, glast(c))] <= op_at(l, UP)) {   // the group's passes run
+            // OFLM_OPEN_RES_EARLY: a chunk adds the passes already done meanwhile
+            const MoeSet& m = mset[(c / G) % 2];
+            return res_early_go && c != glast(c) && m.owner == gkey(l, c) && m.done > m.scat[c - gfirst(c)];
+        }
         if (noncausal_ && ops[l][s] == FAT)                                     // every chunk's K / V rows first
             for (size_t c2 = 0; c2 < C; ++c2)
                 if (stage[cell(l, c2)] < s) return false;
@@ -5957,6 +5971,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                             if (mbi) run(mp.kernel, {mbp->args[0], mbuf('x', set, mp.buf), mbuf('y', set, mp.buf)});
                             else run(mp.kernel, {mbp->args[0], mbuf('x', set, mp.buf), mbuf('h', set, mp.buf), mbuf('y', set, mp.buf)});
+                            if (res_early) {
+                                { std::lock_guard<std::mutex> lk(mu); ++mset[set].done; }
+                                cv.notify_all();
+                            }
                         }
                         timing_.moe_run_ms += ms_since(tm);
                     }
@@ -6076,6 +6094,9 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 if (ops[l][stage[cell(l, c)]] == TAIL && is_moe(l) && c == glast(c)) {
                     mset[(c / G) % 2].owner = gkey(l, c);
                     mset[(c / G) % 2].res_left = c - gfirst(c) + 1;
+                    mset[(c / G) % 2].done = 0;
+                    mset[(c / G) % 2].scat.assign(G, 0);
+                    mset[(c / G) % 2].shared_in.assign(G, 0);
                 }
             }
             const int op = ops[l][stage[cell(l, c)]];
@@ -6577,6 +6598,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             done += n;
                         }
                         ms.ysynced = false;
+                        ms.ysync.assign(ms.passes.size(), 0);
                     }
                     sadd(timing_.moe_prep_ms, ms_since(tm));
                     { std::lock_guard<std::mutex> g(smu); moe_ms[2] = timing_.moe_prep_ms - moe_ms[0] - moe_ms[1] - moe_ms[3]; }
@@ -6591,6 +6613,63 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                 for (long long r = 0; r < static_cast<long long>(M); ++r)
                     for (size_t j = 0; j < ff; ++j) hf[r * ff + j] = bf16_to_f32(h16[r * 2 * ff + (j / 64) * 128 + j % 64]);
                 to_bfp2(hf.data(), ff, "pp_d2_" + cs, M);
+            } else if (is_moe(l) && res_early) {
+                // RES_EARLY: the passes done since this chunk's last visit; the gated shared expert and
+                // the copy out once the group's last pass is in
+                const size_t set = (c / G) % 2, grow0 = (c - gfirst(c)) * M, gi = c - gfirst(c);
+                MoeSet& ms = mset[set];
+                size_t upto = 0, from = 0;
+                bool last = false;
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    last = stage[cell(l, glast(c))] > op_at(l, UP);
+                    upto = last ? ms.passes.size() : ms.done;
+                    from = ms.scat[gi];
+                }
+                auto tr = std::chrono::steady_clock::now();
+                if (!ms.shared_in[gi]) {
+                    // the shared expert first, as the plain RES adds it (the same sums, bit for bit)
+                    xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
+                    read_back(yb2, t_real * hid * 2, 0);
+                    const uint16_t* y16 = yb2.map<const uint16_t*>();
+#pragma omp parallel for
+                    for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
+                        const size_t o = static_cast<size_t>(tk) * hid;
+                        const float gt = gate_c[c][static_cast<size_t>(tk)];
+                        for (size_t i = 0; i < hid; ++i) rs[o + i] += gt * bf16_to_f32(y16[o + i]);
+                    }
+                    ms.shared_in[gi] = 1;
+                }
+                const size_t NTm = mbp->nt;
+                static const bool avx512r = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq");
+                std::vector<const uint16_t*> yp(ms.passes.size(), nullptr);
+                {
+                    std::lock_guard<std::mutex> yg(ysync_mu[set]);
+                    for (size_t p = from; p < upto; ++p) {
+                        xrt::bo& yb = buffer(mbuf('y', set, ms.passes[p].buf), 0);
+                        auto ty = std::chrono::steady_clock::now();
+                        if (!ms.ysync[p]) { read_back(yb, ms.passes[p].n * kMbiYslot, 0); ms.ysync[p] = 1; }
+                        sadd(moe_ms[4], ms_since(ty));
+                        yp[p] = yb.map<const uint16_t*>();
+                    }
+                }
+#pragma omp parallel for schedule(dynamic, 16)
+                for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk) {
+                    float* o = rs + static_cast<size_t>(tk) * hid;
+                    for (size_t p = from; p < upto; ++p)
+                        for (const auto& [col, wt] : ms.per_token[p][grow0 + static_cast<size_t>(tk)]) {
+                            const uint16_t* ys = yp[p] + (col / NTm) * (kMbiYslot / 2);
+                            if (avx512r) mbi_scatter_avx512(o, ys, col % NTm, wt);
+                            else mbi_scatter_scalar(o, ys, col % NTm, wt);
+                        }
+                }
+                { std::lock_guard<std::mutex> lk(mu); ms.scat[gi] = upto; }
+                if (last) {
+                    std::memcpy(xr, rs, t_real * hid * 4);
+                } else {
+                    advance = 0;
+                }
+                sadd(timing_.moe_read_ms, ms_since(tr));
             } else if (is_moe(l)) {   // RES of a MoE layer: the gated shared expert, then the routed experts
                 xrt::bo& yb2 = buffer("pp_y_" + cs, 0);
                 read_back(yb2, t_real * hid * 2, 0);
@@ -6665,7 +6744,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             {
                 std::lock_guard<std::mutex> lk(mu);
                 busy[cell(l, c)] = 0;
-                if (op == RES && is_moe(l) && --mset[(c / G) % 2].res_left == 0) mset[(c / G) % 2].owner = -1;
+                if (op == RES && is_moe(l) && advance && --mset[(c / G) % 2].res_left == 0) mset[(c / G) % 2].owner = -1;
                 stage[cell(l, c)] += advance;
                 if (stage[cell(l, c)] >= nst(l)) ++finished;
             }

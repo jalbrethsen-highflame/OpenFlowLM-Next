@@ -28,7 +28,7 @@ Items (gain: expected, until measured; measure inside one run where possible):
 
 | ID | Area | Item | Kind | Measured now | How to measure | Expected gain | Status |
 |---|---|---|---|---|---|---|---|
-| P1 | prefill | RES waits for every pass of a group (host idle UP -> RES 10.4 s at 30K) | flow | 10.4 s host wait | pipe trace "host idle by" | up to -5 s at 30K | open |
+| P1 | prefill | RES waits for every pass of a group | flow | k6 G 4096 with the GPU busy: host waits UP -> RES only 0.7-1.05 s at 30K (the 10.4 s was with G 16384 / dnc) | pipe trace "host idle by" | OFLM_OPEN_RES_EARLY=1 (RES adds finished passes early; bit-identical): no gain | measured: no gain (opt-in kept) |
 | P2 | prefill | x repeats each token's block sums 16x (4.4 KB a pair, 2.3 needed); ~42 GB host writes at 30K | waste | gather 5 thread-s | MID_PROF / moe_ms gather, x sync | -2 to -3 host thread-s, less NPU DMA | open |
 | P3 | prefill | shared expert as its own NPU GEMM (4.3 s at 30K) | waste | 4.3 s NPU | pipe trace kernels | -1.5 to -2.7 s NPU | open |
 | P4 | prefill | dnc kernel 6 ms a call against ~1.7 ms of math (dnc saves 13 host thread-s but makes the NPU the limit) | slow kernel | 5.4 s NPU at 30K | pipe trace DNC | 5-10 % at 16K+ | open |
@@ -49,6 +49,11 @@ Items (gain: expected, until measured; measure inside one run where possible):
 | M3 | memory | per-chunk prefill buffers grow with the prompt (0.77 GB at 16K) | waste | 0.77 GB at 16K | OFLM_OPEN_MEM_LOG | ~-1.3 GB at 30K (ring) | open |
 | T1 | testing | each CLI test reloads the weights (27 s) | waste | 27 s a test | wall | most of a short test | open |
 | T2 | testing | heavy tests heat the CPU to 94 C; the trainer's guard pauses the GPU job | validity | pauses logged | guard log HOT count, GPU busy samples | valid numbers | done (safe_run / safe_bench record both) |
+
+Accuracy note: the MoE path amplifies 1-ulp changes (int8 x roundings, near-tied routing): adding the
+shared expert after the routed ones instead of before moved the 600-token logits by KL 7.8e-3, as
+large as the whole quantization error (1.06e-2). Keep changes bit-identical where possible; judge
+others against the reference, not against the previous build.
 
 Test rules beside the GPU job: cap every run (systemd-run MemoryMax), start only with MemAvailable
 >= cap + 20 GB, stop the run's own PID if MemAvailable < 20 GB, record GPU busy samples and the
