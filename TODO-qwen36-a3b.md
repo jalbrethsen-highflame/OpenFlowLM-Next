@@ -173,6 +173,46 @@ fa256bc, dit2) do not name the geometry and the 9B build replaces them (k7bad: N
 Next: a hand-scheduled expert up/gate + down loop (the compiler gives ~27 bundles where 12 MACs are
 needed), the router on the NPU, dnc made to pay, NPU attention for long-context decode.
 
+## Round 2 (2026-10-21 morning, GPU busy; f02e85c .. 5b10a84)
+
+Experts (mbi) under GPU load: the full kernel ran at the DMA-only floor (256 slots 18.5 ms), so the
+expert time is bytes and rounds, not MACs. Three limits meet near 11-13 ms a 256-slot call (GPU
+idle): DDR, the stream into each core (each core receives every visit's full weights), core compute.
+- MBI_P (OPEN_QWEN36_MBI_P, opt-in): P columns share a weight stream. DDR bytes ~halved, rel 1.7 %
+  as P 1, but the per-core stream then binds (P 4 null 12.4-13.7 ms) and P adds empty slots for
+  experts with few tokens. In the model <= 5 % a call.
+- MBI_HKG (opt-in): one h scale a k-group; no faster when DMA binds, rel 2.2 % against 1.7 %.
+- Engine: a group's remainder pass takes the largest stream that fits (180 -> 128 + 32 + 16 + 8):
+  14 % of streamed slots were empty experts; 30K experts 17.6 -> 15.4 s, same logits.
+- Groups of 16384 cut slots 27 % but the wall got worse: two groups a layer leave no overlap for
+  the scatter (host waits UP -> RES 10 s).
+
+dnc made cheaper for the host (same logits for the layout steps): one record block a key head
+([aux even | K, Q | aux odd], the kernel reads the aux at 0 or 8192); phase 1 writes the bf16
+tiles straight into the buffers (pack + sync 0.53 -> 0.14 s at 4K); vector gated norm (2.8 -> 0.8
+ms a chunk; KL 1.31e-2 -> 1.34e-2). At 30K (no CPU job): host 57-60 -> 47 thread-s but the NPU
+goes to 100 % (38 s: experts 15.4, dnc 5.4, QKV 4.9, FAT 4.3, shared expert 4.3, OUT 2.3), so the
+wall is 2-4 s worse. Still opt-in.
+
+Bandwidth under the GPU job (the decode constraint): CPU reads median 12.4 GB/s (p10 11, p90 15,
+bursts to 109 when the GPU pauses), the NPU's DMA ~34 GB/s at the same time. Decode a pass reads
+~3 GB (dense 0.93, experts ~1.6 for 3 rows, head), so it is DDR-bound; a verify row costs ~18 ms
+(the experts it adds).
+- OFLM_OPEN_DEC_NPU default 16 (half a pass's experts on the NPU): -15 % MoE time a layer, A/B by
+  layer parity (OFLM_OPEN_DEC_NPU_AB); shares 40-60 % equal, 75 % worse, 100 % worst.
+- MoE MTP default k <= 4 with PCUM 0.4: 16.5 / 19.8 -> 16.9 / 22.2 tok/s on chat1 / chat2. A draft
+  vocabulary of 32768 ties with 65536.
+- 64K decode measured 19.3 tok/s in a lighter phase of the GPU job; the mixer (flash kv8, one KV
+  read a pass) costs ~5 ms a row at 64K, ~30 % of the CPU's bf16 peak.
+
+Run-to-run spread is 2x with the GPU job's phases (30K: 27.5-59 s). Compare within one run
+(A/B by layer parity, kernel ratios in the pipe trace, slot counts), not whole runs.
+
+App bench 128K..1K (05:27, k6, this round's binary). The GPU job was at 100 % at the start and had
+ended by the finish (train_ft.py gone), so these are mostly GPU-idle numbers, not the target case:
+1K 636 / 23.3, 2K 777 / 29.5, 4K 945 / 28.8, 8K 1323 / 25.8, 16K 1458 / 37.2, 32K 1470 / 22.1,
+64K 1370 / 22.1, 128K 1069 / 23.2 (prefill / decode tok/s).
+
 ## Plan (biggest first; re-profile after each)
 
 Prefill:
