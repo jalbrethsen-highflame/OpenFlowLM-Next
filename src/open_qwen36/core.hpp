@@ -401,6 +401,7 @@ private:
     /// per-thread ICV, and the server can reach a prefill from a thread the constructor
     /// never ran on.
     void apply_thread_budget() const;
+    void mem_report(const char* when) const;   ///< OFLM_OPEN_MEM_LOG=1: resident bytes by kind
     bool moe_redispatch_ = false;  ///< OFLM_OPEN_MOE_REDISPATCH: run each MoE pass twice and print both
     std::vector<float> gout_, sg_ug_, sg_y_;   ///< the block route's GEMM outputs, kept across layers
     std::map<std::string, std::vector<float>> split_y_;   ///< a split step's hi + lo, per y global (gemm_run)

@@ -607,6 +607,36 @@ struct HfBf16 {
     }
 };
 
+void Core::mem_report(const char* when) const {
+    static const bool on = std::getenv("OFLM_OPEN_MEM_LOG") != nullptr;
+    if (!on) return;
+    auto bos = [](const std::vector<xrt::bo>& v) { size_t s = 0; for (const auto& b : v) if (b) s += b.size(); return s; };
+    std::map<std::string, size_t> g;   // globals by name prefix (the part before a digit or '_<digit>')
+    for (const auto& [n, b] : globals_) {
+        std::string k = n;
+        while (!k.empty() && (std::isdigit(static_cast<unsigned char>(k.back())) || k.back() == '_')) k.pop_back();
+        g[k] += b.size();
+    }
+    size_t gw = 0;
+    for (const auto& [n, v] : gemm_w_) gw += bos(v);
+    size_t kv8 = 0;
+    for (const auto& v : kv8_) kv8 += v.size();
+    const size_t mtp = mtp_.fc41.size() + mtp_.qkvg41.size() + mtp_.o41.size() + mtp_.sh_ug41.size() + mtp_.sh_dn41.size() +
+                       mtp_.ex_ug41.size() + mtp_.ex_dn41.size();
+    auto mb = [](size_t b) { return std::to_string(b >> 20); };
+    std::string s = std::string("memory (") + when + ", MB): pools " + mb(bos(pools_)) + ", GEMM weights " + mb(gw) + ", consts " +
+                    mb(bos(consts_)) + ", act " + mb(bos(act_)) + ", state " + mb(bos(state_)) + ", lm_head q8 " + mb(lm_cpu_.size()) +
+                    " int4 " + mb(lm_b4_.size()) + ", kv8 " + mb(kv8) + ", mtp " + mb(mtp) + " | globals:";
+    std::vector<std::pair<size_t, std::string>> gs;
+    for (const auto& [k, v] : g) gs.push_back({v, k});
+    std::sort(gs.rbegin(), gs.rend());
+    size_t tot = 0;
+    for (const auto& [v, k] : gs) tot += v;
+    s += " total " + mb(tot);
+    for (size_t i = 0; i < gs.size() && i < 12; ++i) s += " " + gs[i].second + " " + mb(gs[i].first);
+    log(s);
+}
+
 void Core::apply_thread_budget() const {
     if (omp_threads_ > 0 && omp_get_max_threads() != omp_threads_) omp_set_num_threads(omp_threads_);
 }
@@ -1502,6 +1532,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
     pos_ = 0;
     log("weights resident: " + std::to_string(nl_) + " pools + lm_head, " +
         std::to_string(static_cast<int>(ms_since(t0) / 1000)) + " s");
+    mem_report("after load");
 }
 
 void Core::reset() {
@@ -5600,7 +5631,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // after its shared expert; each chunk's RES waits for them, scatters its rows with the router
     // weights, and the group's last RES frees the set. Core::moe_block's law: visits in expert
     // order, each pass the shortest stream that holds what is left, else the longest.
-    struct MoePass { std::string kernel; size_t n = 0; std::vector<uint32_t> ex; };
+    struct MoePass { std::string kernel; size_t n = 0; std::vector<uint32_t> ex; size_t buf = 0; };   // buf: its x / h / y buffers' index
     struct MoeSet {
         long owner = -1;                 // the group (l * groups + g) holding it
         size_t res_left = 0;             // its chunks' RES still to run
@@ -5629,21 +5660,33 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     std::vector<std::vector<uint16_t>> xsx_c(mbi ? C : 0);
     std::vector<std::vector<int16_t>> xqs_c(mbi ? C : 0);
     if (mbi && hid != 2048) throw std::runtime_error("open_qwen36: the mbi expert kernels are built for hidden 2048");
-    size_t mb_np = 0;
+    size_t mb_np = 0, mb_full = 0;
+    std::vector<size_t> mb_small;   // the smaller passes' buffer sizes (slots), after the mb_full full ones
     auto mbuf = [&](char what, size_t set, size_t p) { return std::string("pmb_") + what + std::to_string(set) + "_" + std::to_string(p); };
     if (mbp) {
         const size_t maxs = mbp->kernels.rbegin()->first, NTm = mbp->nt;
-        // slots <= P (E + G M topk / (NT P))
-        mb_np = (mbp->p * w_->moe.experts + (G * M * w_->moe.topk + NTm - 1) / NTm + maxs - 1) / maxs +
-                mbp->kernels.size();   // + the remainder's smaller passes
+        // A group's passes: full ones (the largest stream), then the remainder as the largest streams
+        // that fit -- each smaller size at most once, the smallest at most twice. Buffers: mb_full
+        // full-size ones (index 0 ..), then one a smaller size (the smallest two), each its own size,
+        // sized for the group's real rows (a short prompt does not fill a 4096-row group).
+        // slots <= P (min(E, rows topk) + rows topk / (NT P))
+        const size_t rows = std::min(G * M, ids.size()), pairs = rows * w_->moe.topk;
+        mb_full = (mbp->p * std::min<size_t>(w_->moe.experts, pairs) + (pairs + NTm - 1) / NTm) / maxs;
+        mb_small.clear();
+        for (auto it = mbp->kernels.rbegin(); it != mbp->kernels.rend(); ++it)
+            if (it->first < maxs) mb_small.push_back(it->first);
+        if (!mb_small.empty()) mb_small.push_back(mb_small.back());
+        mb_np = mb_full + mb_small.size();
         for (size_t set = 0; set < 2; ++set)
             for (size_t p = 0; p < mb_np; ++p) {
-                need(mbuf('x', set, p), globals_.at(mbp->args[1]).size());
+                const size_t sl = p < mb_full ? maxs : mb_small[p - mb_full];
+                auto part = [&](const std::string& g) { return globals_.at(g).size() / maxs * sl; };
+                need(mbuf('x', set, p), part(mbp->args[1]));
                 if (mbi) {
-                    need(mbuf('y', set, p), globals_.at(mbp->args[2]).size());
+                    need(mbuf('y', set, p), part(mbp->args[2]));
                 } else {
-                    need(mbuf('h', set, p), globals_.at(mbp->args[2]).size());
-                    need(mbuf('y', set, p), globals_.at(mbp->args[3]).size());
+                    need(mbuf('h', set, p), part(mbp->args[2]));
+                    need(mbuf('y', set, p), part(mbp->args[3]));
                 }
             }
     }
@@ -5811,8 +5854,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             Kern& mk = kerns_.at(mp.kernel);
                             stream_patch::moe2_apply(mk.iw(), mk.moe2, mp.ex.data(), w_->moe);
                             mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                            if (mbi) run(mp.kernel, {mbp->args[0], mbuf('x', set, p), mbuf('y', set, p)});
-                            else run(mp.kernel, {mbp->args[0], mbuf('x', set, p), mbuf('h', set, p), mbuf('y', set, p)});
+                            if (mbi) run(mp.kernel, {mbp->args[0], mbuf('x', set, mp.buf), mbuf('y', set, mp.buf)});
+                            else run(mp.kernel, {mbp->args[0], mbuf('x', set, mp.buf), mbuf('h', set, mp.buf), mbuf('y', set, mp.buf)});
                         }
                         timing_.moe_run_ms += ms_since(tm);
                     }
@@ -6356,10 +6399,23 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             // to the next stream left 14 % of the slots empty at 30K
                             for (const auto& [sl, k] : mbp->kernels)
                                 if (!kn || sl / Pv <= left) { slots = sl; kn = &k; }
-                            const size_t n = std::min(left, slots / Pv), p = ms.passes.size();
+                            const size_t n = std::min(left, slots / Pv);
+                            // its buffers: the next full one, or the first free one of its size
+                            size_t p = mb_np;
+                            if (slots == mbp->kernels.rbegin()->first) {
+                                size_t used = 0;
+                                for (const MoePass& q : ms.passes) used += q.buf < mb_full;
+                                if (used < mb_full) p = used;
+                            } else {
+                                for (size_t i = mb_full; i < mb_np && p == mb_np; ++i) {
+                                    bool taken = mb_small[i - mb_full] != slots;
+                                    for (const MoePass& q : ms.passes) taken = taken || q.buf == i;
+                                    if (!taken) p = i;
+                                }
+                            }
                             if (p >= mb_np) throw std::runtime_error("open_qwen36: a MoE group needs more expert passes than its buffers hold");
                             MoePass mp;
-                            mp.kernel = *kn; mp.n = n * Pv; mp.ex.assign(slots / Pv, 0);   // unused visits stream expert 0, ignored
+                            mp.kernel = *kn; mp.n = n * Pv; mp.ex.assign(slots / Pv, 0); mp.buf = p;   // unused visits stream expert 0, ignored
                             ms.per_token.emplace_back(grows);
                             auto& pt = ms.per_token.back();
                             for (size_t i = 0; i < n; ++i) {
@@ -6454,7 +6510,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     {
                         std::lock_guard<std::mutex> yg(ysync_mu[set]);   // the group's first RES reads y back
                         for (size_t p = 0; p < ms.passes.size(); ++p) {
-                            xrt::bo& yb = buffer(mbuf('y', set, p), 0);
+                            xrt::bo& yb = buffer(mbuf('y', set, ms.passes[p].buf), 0);
                             auto ty = std::chrono::steady_clock::now();
                             if (!ms.ysynced) read_back(yb, ms.passes[p].n * kMbiYslot, 0);
                             sadd(moe_ms[4], ms_since(ty));
@@ -6474,7 +6530,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     }
                 }
                 for (size_t p = 0; !mbi && p < ms.passes.size(); ++p) {
-                    xrt::bo& yb = buffer(mbuf('y', set, p), 0);
+                    xrt::bo& yb = buffer(mbuf('y', set, ms.passes[p].buf), 0);
                     auto ty = std::chrono::steady_clock::now();
                     if (!ms.ysynced) read_back(yb, ms.passes[p].n * hid * NTm * 4, 0);
                     sadd(moe_ms[4], ms_since(ty));
@@ -6527,6 +6583,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     for (size_t i = 1; i < nhost; ++i) hx.emplace_back(host_loop, nhost);
     host_loop(nhost);
     for (auto& t : hx) t.join();
+    mem_report("after the prompt");
     apply_thread_budget();
     npu.join();
     if (err) std::rethrow_exception(err);
