@@ -852,6 +852,16 @@ private:
     void moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x);
     /// one MoE layer's FFN for R rows from the q4_1 pool (step_cpu_rows' MoE tail)
     void moe_cpu_rows(int l, const float* xn, size_t R, float* x);
+    MoeCpuW moe_cpu_w(int l) const;
+    /// the prompt pipe's CPU share of a group's routed experts (OFLM_OPEN_PF_CPU): each expert of ex for
+    /// its rows (row = index into xq, weight), rows 8 a call; y [rows][hidden] += weight * expert(x_row),
+    /// each row's experts in ex's order. Its own OpenMP team (it runs beside the pipe's threads).
+    void moe_cpu_experts(const MoeCpuW& W, const ExRows& ex, const std::vector<const host::Q41X*>& xq, float* y, int threads);
+    double pf_cpu_k_ = 0.032;    ///< the CPU share's ms an expert unit (1 + rows / 10), measured
+    double pf_npu_s_ = 0.08;     ///< the NPU's ms an expert slot (64 tokens), measured
+    double pf_cpu_ms_ = 0;       ///< the CPU share's ms and experts since the last report
+    size_t pf_cpu_ex_ = 0;
+    std::mutex pf_mu_;
     /// the final norm and q8 lm_head on the CPU (CPU decode; OFLM_OPEN_CPU_HEAD=0 keeps the NPU's):
     /// the head repacked from the pool order (host::lmhead_q8_repack), the norm weight as f32
     bool cpu_head_ = false, cpu_head_check_ = false, head_b4_main_ = false;

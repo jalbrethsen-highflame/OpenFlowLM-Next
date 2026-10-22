@@ -280,17 +280,25 @@ static inline int32_t fa_row0(const int32_t *rtp, int32_t pass) {
 #ifndef FA_SINKS
 #define FA_SINKS 0
 #endif
+// FA_WRANGE (DF_WRANGE, a window stream's passes each on their own key range): pass p's keys start at
+// chunk p rtp[31] of the call's keys. The kernels' chunk index counts from the pass's first chunk (0:
+// the online softmax's first); key positions add this base.
+#ifndef FA_WRANGE
+#define FA_WRANGE 0
+#endif
+static inline int32_t fa_cb(const int32_t *rtp, int32_t pass) { return FA_WRANGE ? pass * rtp[31] : 0; }
 static inline bool fa_skip(const int32_t *rtp, int32_t pass, int32_t chunk) {
-  if (rtp[4] && chunk * LKP > fa_row0(rtp, pass) + TQ - 1)
+  const int32_t ac = chunk + fa_cb(rtp, pass);
+  if (rtp[4] && ac * LKP > fa_row0(rtp, pass) + TQ - 1)
     return true;
-  return rtp[7] && (FA_SINKS || chunk > 0) && (chunk + 1) * LKP <= fa_row0(rtp, pass) - rtp[7] + 1;
+  return rtp[7] && (FA_SINKS || ac > 0) && (ac + 1) * LKP <= fa_row0(rtp, pass) - rtp[7] + 1;
 }
 
 // A key chunk wholly at or past valid_len (the pad up to lk): nothing to compute.
-static inline bool fa_dead(const int32_t *rtp, int32_t chunk) { return chunk * LKP >= rtp[3]; }
+static inline bool fa_dead(const int32_t *rtp, int32_t pass, int32_t chunk) { return (chunk + fa_cb(rtp, pass)) * LKP >= rtp[3]; }
 // Either of the two, out of line: every kernel tests it, and inlined it took ~0.5 KB of the 16 KB.
 static __attribute__((noinline)) bool fa_off(const int32_t *rtp, int32_t pass, int32_t chunk) {
-  return fa_skip(rtp, pass, chunk) || fa_dead(rtp, chunk);
+  return fa_skip(rtp, pass, chunk) || fa_dead(rtp, pass, chunk);
 }
 #if FA_WIN
 static bool s_live = true;   // fa_qkpv_w: the next four fused calls have a live chunk (sm_all sets it)
@@ -591,9 +599,9 @@ void apply_mask(bfloat16 *__restrict g, int32_t *__restrict rtp, int32_t pass,
   const int32_t valid_len = rtp[3];
   const int32_t causal = rtp[4];
   const int32_t row0 = fa_row0(rtp, pass);
-  const int32_t col0 = chunk * LKP;
+  const int32_t col0 = (chunk + fa_cb(rtp, pass)) * LKP;
   // a sliding window (rtp[7], fa_skip): the last row's first key; keys below it masked for some row
-  const int32_t win = (FA_SINKS || chunk > 0) ? rtp[7] : 0;
+  const int32_t win = (FA_SINKS || col0 > 0) ? rtp[7] : 0;
   const bool low = win && col0 < row0 + TQ - win;
   // Last column any row may keep; all rows keep everything up to it?
   int32_t keep_all = valid_len; // columns < keep_all kept by every row
@@ -768,10 +776,13 @@ void softmax_step(bfloat16 *__restrict g, bfloat16 *__restrict up,
   m0 = aie::max(m0, m1);
   aie::vector<float, 16> mx = aie::max(aie::max(m0.extract<16>(0), m0.extract<16>(1)),
                                        aie::max(m0.extract<16>(2), m0.extract<16>(3)));
-  const bool redo = chunk == 0 || !aie::ge(mx, aie::broadcast<float, 16>(float(1ull << FA_TAU))).empty() ||
+  // (the call's chunk index: a ranged pass's first chunk is not the online softmax's start unless it is
+  // key 0, so its rows take the same path as in the plain stream)
+  const int32_t ac = chunk + fa_cb(rtp, pass);
+  const bool redo = ac == 0 || !aie::ge(mx, aie::broadcast<float, 16>(float(1ull << FA_TAU))).empty() ||
                     fa_sums_bad(s_rs);
   if (redo)
-    softmax_rescale(g, sp, gp, p, chunk);
+    softmax_rescale(g, sp, gp, p, ac);
 #pragma clang loop unroll(full)
   for (int i = 0; i < TQ * 8; i += 64)                          // l += this chunk's row sums
     aie::store_v(sp + i, aie::add(aie::load_v<64>(sp + i), aie::load_v<64>(s_rs + i)));
@@ -798,7 +809,7 @@ void sm_all(bfloat16 *__restrict g, bfloat16 *__restrict up, float *__restrict s
   const int32_t valid = rtp[3];
   // the chunk valid_len cuts, or (causal) one that may cross a row's diagonal: apply_mask returns
   // at once when no key of it is masked
-  if ((chunk + 1) * LKP > valid || rtp[4])
+  if ((chunk + fa_cb(rtp, pass) + 1) * LKP > valid || rtp[4])
     apply_mask(g, rtp, pass, chunk);
   SET_ROUNDING();
   fa_exp_call(g, s_ones, p, s_rs);
@@ -808,8 +819,9 @@ void sm_all(bfloat16 *__restrict g, bfloat16 *__restrict up, float *__restrict s
   m0 = aie::max(m0, m1);
   aie::vector<float, 16> mx = aie::max(aie::max(m0.extract<16>(0), m0.extract<16>(1)),
                                        aie::max(m0.extract<16>(2), m0.extract<16>(3)));
-  if (chunk == 0 || !aie::ge(mx, aie::broadcast<float, 16>(float(1ull << FA_TAU))).empty() || fa_sums_bad(s_rs))
-    softmax_rescale(g, sp, gp, p, chunk);
+  const int32_t ac = chunk + fa_cb(rtp, pass);   // (the call's chunk index, as softmax_step)
+  if (ac == 0 || !aie::ge(mx, aie::broadcast<float, 16>(float(1ull << FA_TAU))).empty() || fa_sums_bad(s_rs))
+    softmax_rescale(g, sp, gp, p, ac);
 #pragma clang loop unroll(full)
   for (int i = 0; i < TQ * 8; i += 64)                          // l += this chunk's row sums
     aie::store_v(sp + i, aie::add(aie::load_v<64>(sp + i), aie::load_v<64>(s_rs + i)));

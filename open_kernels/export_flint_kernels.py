@@ -135,15 +135,23 @@ FA_D = int(os.environ.get("FLINT_FA_D", 128))
 SINK_SENT = 0x51A70000                 # dit_fa256b.SINK_SENT
 
 
-def fa(L: int, lk: int, window: int = 0) -> tuple[str, dict]:
-    """A causal dit_fa256b stream; window > 0: the sliding layers'."""
+# a ranged window stream (DF_GROUPS=4, DF_WRANGE): passes of 256 rows, each streaming only its 13 key
+# chunks, not the call's 25 (bit-identical; harness, GPU busy: 4.0 -> 2.3 ms); for q_off >= WINDOW - 1
+FA_WRANGE = 13
+
+
+def fa(L: int, lk: int, window: int = 0, ranged: bool = False) -> tuple[str, dict]:
+    """A causal dit_fa256b stream; window > 0: the sliding layers' (ranged: DF_WRANGE's)."""
     kind = "bw" if window else "bc"
-    name = (f"fa128{kind[1]}" if FA_D == 128 else f"fa256{kind}") + f"{'s' if L == 512 else ''}_lk{lk}"
+    name = (f"fa128{'r' if ranged else kind[1]}" if FA_D == 128 else f"fa256{kind}") + f"{'s' if L == 512 else ''}_lk{lk}"
     env = {"DF_L": str(L), "DF_LK": str(lk), "DF_CAUSAL": "1", "DF_QOFF": str(FA_QOFF), "DF_KV_INTER": "1",
            "DF_HEADS": str(NH), "DF_KV_HEADS": str(KVH), "DF_WINDOW": str(window)}
     if FA_D == 128:
         env.update({"DF_D": "128", "DF_SINKS": "1"})
         bdir = f"dit_fa256b/build_d128s_l{L}_lk{lk}_causal_kvi_qs_h{NH}k{KVH}" + (f"_w{window}" if window else "")
+        if ranged:
+            env.update({"DF_GROUPS": "4", "DF_WRANGE": str(FA_WRANGE)})
+            bdir += f"_g4r{FA_WRANGE}"
     else:
         # (v3: the window streams' live-chunk check, fa_qkpv_w -- their own image, context faw)
         bdir = f"dit_fa256b/build_l{L}_lk{lk}_causal_kvi_qs_h{NH}k{KVH}" + (f"_w{window}_v3" if window else "_v2")
@@ -178,6 +186,9 @@ def builds() -> dict:
     for L, lk in FA_WIN.items():
         name, d = fa(L, lk, WINDOW)
         b[name] = d
+        if FA_D == 128:
+            name, d = fa(L, lk, WINDOW, True)
+            b[name] = d
     for s in (256, 128, 64, 32, 16, 8):
         b[f"mb_s{s}"] = {"design": "moe_batch/mbi.py", "build_dir": f"moe_batch/build_mbi_s{s}",
                          "env": {"MBI_SLOTS": str(s), "MBI_EXPERTS": str(E), "MBI_POOL_DOWN": str(POOL_DOWN),
@@ -190,6 +201,8 @@ def context_of(name: str) -> str:
         return "mb"
     if name.startswith("fa256bw") or name.startswith("fa128w"):
         return "faw"
+    if name.startswith("fa128r"):
+        return "fawr"
     if name.startswith("fa256b") or name.startswith("fa128"):
         return "fab"
     if name.startswith("dit2") and name.endswith("_m256"):
@@ -253,6 +266,7 @@ def manifest(bset: dict) -> dict:
             kernels[n]["patch"] = "moebatch"
     contexts = {"mb": "mb_s256/final.xclbin", "fab": f"{fa(1024, 1024)[0]}/final.xclbin",
                 "faw": f"{fa(1024, FA_WIN[1024], WINDOW)[0]}/final.xclbin", "dit2": f"dit2_n{HID}_k{QW}/final.xclbin",
+                **({"fawr": f"{fa(1024, FA_WIN[1024], WINDOW, True)[0]}/final.xclbin"} if FA_D == 128 else {}),
                 "dit2t": f"dit2_n{HID}_k{QW}_m256/final.xclbin"}
 
     def tier(m: int) -> dict:
@@ -265,7 +279,9 @@ def manifest(bset: dict) -> dict:
                 **({"sinks": "rtp", "sink_sent": SINK_SENT} if FA_D == 128 else {}),
                 "cb": {str(lk): fa(1024, lk)[0] for lk in FA_CB if fa(1024, lk)[0] in bset},
                 "cbs": {str(lk): fa(512, lk)[0] for lk in FA_CBS if fa(512, lk)[0] in bset},
-                "win": {str(L): {"kernel": fa(L, lk, WINDOW)[0], "lk": lk} for L, lk in FA_WIN.items()}}
+                "win": {str(L): {"kernel": fa(L, lk, WINDOW)[0], "lk": lk,
+                                 **({"ranged": fa(L, lk, WINDOW, True)[0], "ranged_min_qoff": WINDOW - 1} if FA_D == 128 else {})}
+                        for L, lk in FA_WIN.items()}}
     # experts over groups of 8192 tokens (bit-identical; 32K GPU idle: 35.2 -> 33.5 s, slots fuller at top-6)
     gd["moe_group"] = 8192
     gd["moe_group_min"] = 12288          # (a prompt of one group stalls the pipe: 8K 954 -> 748 tok/s)

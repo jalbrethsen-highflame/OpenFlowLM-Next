@@ -18,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <exception>
+#include <future>
 #include <condition_variable>
 #include <mutex>
 #include <set>
@@ -858,8 +859,10 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (man_.gemm_dit.contains("fa"))
         for (const char* key : {"lk", "nc", "ncb", "cb", "cbs", "win"})
             if (man_.gemm_dit["fa"].contains(key))
-                for (const auto& [lk, k] : man_.gemm_dit["fa"][key].items())
+                for (const auto& [lk, k] : man_.gemm_dit["fa"][key].items()) {
                     wanted[k.is_object() ? k["kernel"].get<std::string>() : k.get<std::string>()] = true;   // win: {kernel, lk}
+                    if (k.is_object() && k.contains("ranged")) wanted[k["ranged"].get<std::string>()] = true;   // win's ranged stream
+                }
     for (const auto& [slots, k] : w_->expert_batch.kernels) wanted[k] = true;
     // the prompt pipe's NPU delta rule (OFLM_OPEN_DNC=1), when the set carries it
     if (man_.kernels.count("dnc") && std::getenv("OFLM_OPEN_DNC") && *std::getenv("OFLM_OPEN_DNC") == '1') wanted["dnc"] = true;
@@ -3678,11 +3681,13 @@ void mbi_scatter_scalar(float* o, const uint16_t* ys, size_t j, float wt) {
 // shared expert (gated) and each row's top-k routed experts, every expert's up / gate stripes read
 // once for all rows that chose it; x += shared + sum of w_e expert_e. The staged route's order: the
 // shared expert first, then the experts ascending.
-void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
+void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) { moe_cpu(moe_cpu_w(l), xn, R, x); }
+
+Core::MoeCpuW Core::moe_cpu_w(int l) const {
     const GemmBlockProgram& gb = types_[l]->gemm_block;
     const HostConsts& hc = hc_[l];
     const size_t ff = gb.shared_ff, stripe = w_->moe.stripe;
-    const uint8_t* pool = pools_[l].map<const uint8_t*>();
+    const uint8_t* pool = const_cast<xrt::bo&>(pools_[l]).map<const uint8_t*>();
     MoeCpuW W;
     W.Wr = hc.router.data(); W.sgw = gb.shared_gated ? hc.sgw.data() : nullptr;
     W.E = w_->moe.experts; W.topk = w_->moe.topk;
@@ -3695,7 +3700,84 @@ void Core::moe_cpu_rows(int l, const float* xn, size_t R, float* x) {
     W.up0 = pool + w_->moe.base; W.up_stride = 2 * (W.ff / 128) * stripe; W.gate_off = stripe; W.up_lay = host::q41_stripe(2 * stripe);
     W.dn0 = pool + w_->moe.pool_down; W.dn_stride = w_->moe.up_bytes; W.dn_lay = host::q41_stripe(128 * W.ff * 5 / 8);
     if (mbi_on_) { W.mbi_s = mbi_s_.at(static_cast<size_t>(l)).data(); W.npu_layer = l; }
-    moe_cpu(W, xn, R, x);
+    return W;
+}
+
+void Core::moe_cpu_experts(const MoeCpuW& W, const ExRows& ex, const std::vector<const host::Q41X*>& xq, float* y, int threads) {
+    const size_t hid = w_->hidden, ff = W.ff;
+    // (expert, batch of up to 8 of its rows): the unit of both phases
+    struct Bat { size_t i, j0, n, h0; };   // ex index, first row in its list, rows, first h row
+    std::vector<Bat> bats;
+    size_t nh = 0;
+    for (size_t i = 0; i < ex.size(); ++i)
+        for (size_t j0 = 0; j0 < ex[i].second.size(); j0 += 8) {
+            const size_t n = std::min<size_t>(8, ex[i].second.size() - j0);
+            bats.push_back({i, j0, n, nh});
+            nh += n;
+        }
+    std::vector<float> hu(nh * 2 * ff), ye(nh * hid);
+    std::vector<host::Q41X> hq(nh);
+    struct Item { const uint8_t* base; host::Q41Lay lay; size_t K, b, R; const host::Q41X* x[8]; float* y[8]; };
+    std::vector<Item> items;
+    items.reserve(bats.size() * std::max<size_t>(2 * ff / 64, hid / 64));
+    for (const Bat& bt : bats) {
+        const uint32_t e = ex[bt.i].first;
+        for (size_t proj = 0; proj < 2; ++proj)
+            for (size_t b = 0; b < ff / 64; ++b) {
+                Item it{W.up0 + e * W.up_stride + proj * W.gate_off, W.up_lay, hid, b, bt.n, {}, {}};
+                if (W.mbi_s) it.lay.shift = W.mbi_s[2 * e];
+                for (size_t j = 0; j < bt.n; ++j) {
+                    it.x[j] = xq[ex[bt.i].second[bt.j0 + j].first];
+                    it.y[j] = hu.data() + (bt.h0 + j) * 2 * ff + proj * ff;
+                }
+                items.push_back(it);
+            }
+    }
+    auto run_items = [&] {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+        for (long long q = 0; q < static_cast<long long>(items.size()); ++q) {
+            const Item& it = items[static_cast<size_t>(q)];
+            host::gemv_q41_bands(it.base, it.lay, it.K, it.x, it.R, it.y, it.b, it.b + 1);
+        }
+    };
+    run_items();
+    // h = silu(gate) up, as moe_cpu, then each h row quantized for the down
+#pragma omp parallel for num_threads(threads)
+    for (long long r = 0; r < static_cast<long long>(nh); ++r) {
+        float* u = hu.data() + static_cast<size_t>(r) * 2 * ff;
+        const float* g = u + ff;
+        for (size_t j = 0; j < ff; ++j) u[j] = g[j] / (1.f + std::exp(-g[j])) * u[j];
+        host::q41_prep_x(u, ff, hq[static_cast<size_t>(r)]);
+    }
+    items.clear();
+    for (const Bat& bt : bats) {
+        const uint32_t e = ex[bt.i].first;
+        for (size_t b = 0; b < hid / 64; ++b) {
+            Item it{W.dn0 + e * W.dn_stride, W.dn_lay, ff, b, bt.n, {}, {}};
+            if (W.mbi_s) it.lay.shift = W.mbi_s[2 * e + 1];
+            for (size_t j = 0; j < bt.n; ++j) { it.x[j] = &hq[bt.h0 + j]; it.y[j] = ye.data() + (bt.h0 + j) * hid; }
+            items.push_back(it);
+        }
+    }
+    run_items();
+    // y[row] += weight * expert out: each row's terms in ex's order (rows split over the threads)
+    std::vector<std::vector<std::pair<size_t, float>>> per_row;   // row -> (h row, weight)
+    size_t rows = 0;
+    for (const auto& [e, rl] : ex)
+        for (const auto& [r, w] : rl) rows = std::max(rows, r + 1);
+    per_row.resize(rows);
+    for (const Bat& bt : bats)
+        for (size_t j = 0; j < bt.n; ++j) {
+            const auto& [r, w] = ex[bt.i].second[bt.j0 + j];
+            per_row[r].push_back({bt.h0 + j, w});
+        }
+#pragma omp parallel for num_threads(threads)
+    for (long long r = 0; r < static_cast<long long>(rows); ++r)
+        for (const auto& [hrow, w] : per_row[static_cast<size_t>(r)]) {
+            float* o = y + static_cast<size_t>(r) * hid;
+            const float* v = ye.data() + hrow * hid;
+            for (size_t c = 0; c < hid; ++c) o[c] += w * v[c];
+        }
 }
 
 void Core::moe_cpu(const MoeCpuW& W, const float* xn, size_t R, float* x) {
@@ -6109,8 +6191,8 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         if (pos.empty()) {
             for (size_t i = 0; i < k.words.size(); ++i)
                 if (k.words[i] >= sent && k.words[i] < sent + fab_nh) pos.push_back({static_cast<uint32_t>(i), k.words[i] - sent});
-            if (pos.size() != 16 * fab_nh)
-                throw std::runtime_error("open_qwen36: " + fk + " carries " + std::to_string(pos.size()) + " sink words, not 16 a head");
+            if (pos.empty() || pos.size() % fab_nh)   // (one a core of the head's group: 16, or 8 in a 4-group stream)
+                throw std::runtime_error("open_qwen36: " + fk + " carries " + std::to_string(pos.size()) + " sink words, not the same number a head");
         }
         if (auto it = sink_cur_.find(fk); it != sink_cur_.end() && it->second == static_cast<long>(l)) return;
         static const bool sink_off = std::getenv("OFLM_OPEN_FA_SINK_OFF") != nullptr;   // (debug: a term of 0)
@@ -6159,11 +6241,20 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // host's. With the GPU idle the host's is a little faster below 4K (Flint 1K 425 against 389 tok/s, 2K
     // 567 / 555, 4K 641 / 648), but host stages slow ~2x beside a GPU job and the NPU's DMA does not.
     static const size_t faw_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_W_MIN"); return e ? std::strtoul(e, nullptr, 10) : 1024ul; }();
-    std::string faw_kernel;
-    size_t faw_lk = 0;
+    // fa.win.ranged (dit_fa256b DF_WRANGE): the same stream with each 256-row pass reading only its own key
+    // chunks, bit-identical, for a q_off of at least ranged_min_qoff (every chunk past a prompt's first
+    // window); OFLM_OPEN_FA_WRANGE=0 keeps the plain one
+    static const bool faw_r_on = [] { const char* e = std::getenv("OFLM_OPEN_FA_WRANGE"); return !(e && *e == '0'); }();
+    std::string faw_kernel, faw_ranged;
+    size_t faw_lk = 0, faw_r_min = 0;
     if (cb_ok && fa_on && N >= faw_min && D["fa"].contains("win") && D["fa"]["win"].contains(std::to_string(MQ)) && (full_m || cbs_m)) {
-        faw_kernel = D["fa"]["win"][std::to_string(MQ)]["kernel"].get<std::string>();
-        faw_lk = D["fa"]["win"][std::to_string(MQ)]["lk"].get<size_t>();
+        const nlohmann::json& FW = D["fa"]["win"][std::to_string(MQ)];
+        faw_kernel = FW["kernel"].get<std::string>();
+        faw_lk = FW["lk"].get<size_t>();
+        if (faw_r_on && FW.contains("ranged")) {
+            faw_ranged = FW["ranged"].get<std::string>();
+            faw_r_min = FW.value("ranged_min_qoff", size_t{0});
+        }
     }
     // a window layer's first packed key for the chunk at query position p (64-aligned), and its q_off
     auto faw_kst = [&](size_t p, size_t W) { return p + 1 > W ? (p + 1 - W) / 64 * 64 : size_t{0}; };
@@ -6273,6 +6364,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         std::vector<char> shared_in;     // the chunk's gated shared expert added (on its first RES visit)
         std::vector<MoePass> passes;
         std::vector<std::vector<std::vector<std::pair<size_t, float>>>> per_token;   // [pass][group row]: (slot * NT + column, weight)
+        // OFLM_OPEN_PF_CPU: the group's CPU share (its experts left out of the passes), running beside UP;
+        // ycpu [group row][hidden] its sum for each row, added by the row's RES
+        std::shared_future<void> cpu;
+        std::vector<float> ycpu;
     };
     MoeSet mset[2];
     const MoeBatch* mbp = nullptr;
@@ -6297,6 +6392,14 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // mbi: each chunk's rows quantized once (int8 per 256-K group, bf16 scales, block sums)
     const bool mbi = mbi_on_;
     std::vector<std::vector<int8_t>> xq_c(mbi ? C : 0);
+    // OFLM_OPEN_PF_CPU=1: while the NPU runs a group's expert passes, the CPU runs the experts with the
+    // fewest tokens (an expert's slot streams all its weights for a few tokens): as many as the measured
+    // CPU ms an expert (pf_cpu_k_) and NPU ms a slot (pf_npu_s_) balance; OFLM_OPEN_PF_CPU_THREADS (16)
+    static const bool pf_cpu_env = [] { const char* e = std::getenv("OFLM_OPEN_PF_CPU"); return e && *e == '1'; }();
+    static const int pf_cpu_threads = [] { const char* e = std::getenv("OFLM_OPEN_PF_CPU_THREADS"); return e ? std::max(1, std::atoi(e)) : 16; }();
+    static const bool pf_res_early = [] { const char* e = std::getenv("OFLM_OPEN_RES_EARLY"); return e && (*e == '1' || *e == '2'); }();
+    const bool pf_cpu = pf_cpu_env && mbi && !pf_res_early;   // (the plain RES adds the share)
+    std::vector<std::vector<host::Q41X>> xq41_c(pf_cpu ? C : 0);
     std::vector<std::vector<uint16_t>> xsx_c(mbi ? C : 0);
     std::vector<std::vector<int16_t>> xqs_c(mbi ? C : 0);
     if (mbi && hid != 2048) throw std::runtime_error("open_qwen36: the mbi expert kernels are built for hidden 2048");
@@ -6492,15 +6595,19 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     auto tf = std::chrono::steady_clock::now();
                     const std::string fk = gb.window ? faw_kernel : fa_kernel(c);
                     static const bool fa_log = std::getenv("OFLM_OPEN_FA_LOG") != nullptr;
-                    if (fa_log)
+                    if (fa_log && !gb.window)
                         std::fprintf(stderr, "fa: dispatch #%zu layer %zu chunk %zu %s (previous context %s)\n", dispatches_ + 1, l, c,
                                      fk.c_str(), cfg_cur_.c_str());
                     if (gb.window) {
                         // fa.win: the chunk's queries at packed key p - kst + 64 (after the sink chunk)
-                        const size_t p = pos0 + c * M;
-                        cb_qoff(fk, static_cast<uint32_t>(p - faw_kst(p, gb.window) + fa_skc));
-                        sink_patch(fk, l);
-                        run(fk, {"fab_q_" + cs, "faw_k_" + cs, "faw_v_" + cs, "fa_o_" + cs});
+                        const size_t p = pos0 + c * M, qo = p - faw_kst(p, gb.window) + fa_skc;
+                        const std::string& fw = !faw_ranged.empty() && qo >= faw_r_min ? faw_ranged : fk;
+                        if (fa_log)
+                            std::fprintf(stderr, "fa: dispatch #%zu layer %zu chunk %zu %s q_off %zu (previous context %s)\n", dispatches_ + 1, l,
+                                         c, fw.c_str(), qo, cfg_cur_.c_str());
+                        cb_qoff(fw, static_cast<uint32_t>(qo));
+                        sink_patch(fw, l);
+                        run(fw, {"fab_q_" + cs, "faw_k_" + cs, "faw_v_" + cs, "fa_o_" + cs});
                     } else if (is_cb(fk)) {
                         const std::string fo = std::to_string(full_ord[l]);
                         cb_qoff(fk, static_cast<uint32_t>(pos0 + c * M + fa_skc));
@@ -6539,6 +6646,15 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             }
                         }
                         timing_.moe_run_ms += ms_since(tm);
+                        if (pf_cpu) {   // the NPU's ms a slot, for the CPU share's plan (the runs are queued: the
+                            // passes' wall, waited for here)
+                            size_t sl = 0;
+                            for (const MoePass& mp : mset[set].passes) sl += mp.ex.size();
+                            if (sl) {
+                                std::lock_guard<std::mutex> g(pf_mu_);
+                                pf_npu_s_ = 0.8 * pf_npu_s_ + 0.2 * ms_since(tm) / static_cast<double>(sl);
+                            }
+                        }
                     }
                     static const bool ffn_check = [] { const char* e = std::getenv("OFLM_OPEN_FFN_CHECK"); return e && *e == '1'; }();
                     if (ffn_check && c == 0 && l < 2 && !is_moe(l)) {
@@ -7145,6 +7261,12 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         // the chunk's rows as mbi's int8 k-group parts, once, for the group's gather
                         xq_c[c].resize(M * hid); xsx_c[c].resize(M * 8); xqs_c[c].resize(M * 64);
                         mbi_quant_rows(xc, t_real, xq_c[c].data(), xsx_c[c].data(), xqs_c[c].data());
+                        if (pf_cpu) {   // the CPU share's inputs (gemv_q41's int8 rows)
+                            xq41_c[c].resize(t_real);
+#pragma omp parallel for
+                            for (long long tk = 0; tk < static_cast<long long>(t_real); ++tk)
+                                host::q41_prep_x(xc + static_cast<size_t>(tk) * hid, hid, xq41_c[c][static_cast<size_t>(tk)]);
+                        }
                     } else {
                         // the chunk's rows as bf16 once, for the group's gather (copies of 8 at a time)
                         xb16_c[c].resize(M * hid);
@@ -7176,6 +7298,49 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                         throw std::runtime_error("open_qwen36: router produced expert index " + std::to_string(e));
                                     owed[e].push_back({static_cast<int>((c2 - c0) * M + t), rwt_c[c2][t * topk + k]});
                                 }
+                        }
+                        ms.cpu = {};
+                        if (pf_cpu) {
+                            // the experts with the fewest tokens to the CPU while its time (k (1 + n / 10) ms an
+                            // expert) stays under the NPU's for the rest (s ms a slot of NTm tokens)
+                            const double k = pf_cpu_k_, s = pf_npu_s_;
+                            const size_t NTs = mbp->nt * mbp->p;
+                            std::vector<uint32_t> ord;
+                            double tn = 0, tc = 0;
+                            for (size_t e = 0; e < E; ++e)
+                                if (!owed[e].empty()) { ord.push_back(static_cast<uint32_t>(e)); tn += s * static_cast<double>((owed[e].size() + NTs - 1) / NTs); }
+                            std::stable_sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) { return owed[a].size() < owed[b].size(); });
+                            ExRows cex;
+                            double units = 0;
+                            for (uint32_t e : ord) {
+                                const double n = static_cast<double>(owed[e].size()), ce = k * (1 + n / 10);
+                                const double se = s * static_cast<double>((owed[e].size() + NTs - 1) / NTs);
+                                if (tc + ce > tn - se) break;
+                                tc += ce; tn -= se; units += 1 + n / 10;
+                                cex.push_back({e, {}});
+                                for (const auto& [gr, w] : owed[e]) cex.back().second.push_back({static_cast<size_t>(gr), w});
+                                owed[e].clear();
+                            }
+                            std::sort(cex.begin(), cex.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+                            if (!cex.empty()) {
+                                ms.ycpu.assign(grows * hid, 0.f);
+                                std::vector<const host::Q41X*> xp(grows, nullptr);
+                                for (size_t gr = 0; gr < grows; ++gr) {
+                                    const size_t cc = c0 + gr / M, rr = gr % M;
+                                    if (rr < xq41_c[cc].size()) xp[gr] = &xq41_c[cc][rr];
+                                }
+                                const MoeCpuW Wc = moe_cpu_w(static_cast<int>(l));
+                                float* yc = ms.ycpu.data();
+                                ms.cpu = std::async(std::launch::async, [this, Wc, cex = std::move(cex), xp = std::move(xp), yc, units] {
+                                    auto t0 = std::chrono::steady_clock::now();
+                                    moe_cpu_experts(Wc, cex, xp, yc, pf_cpu_threads);
+                                    const double ms_ = ms_since(t0);
+                                    std::lock_guard<std::mutex> g(pf_mu_);
+                                    pf_cpu_k_ = 0.8 * pf_cpu_k_ + 0.2 * ms_ / units;
+                                    pf_cpu_ms_ += ms_;
+                                    pf_cpu_ex_ += cex.size();
+                                }).share();
+                            }
                         }
                         static FILE* hist = [] { const char* e = std::getenv("OFLM_OPEN_MOE_HIST"); return e ? std::fopen(e, "w") : nullptr; }();
                         if (hist) {
@@ -7415,6 +7580,16 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     }
                 }
                 ms.ysynced = true;
+                if (pf_cpu) {
+                    std::shared_future<void> f;
+                    { std::lock_guard<std::mutex> lk(mu); f = ms.cpu; }
+                    if (f.valid()) {
+                        f.get();
+                        const float* yc = ms.ycpu.data() + grow0 * hid;
+#pragma omp parallel for
+                        for (long long i = 0; i < static_cast<long long>(t_real * hid); ++i) rs[i] += yc[i];
+                    }
+                }
                 std::memcpy(xr, rs, t_real * hid * 4);
                 sadd(timing_.moe_read_ms, ms_since(tr));
             } else {   // RES
@@ -7514,6 +7689,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                  N, C, M, L, timing_.total_ms, npu_busy_ms, n_fa, fa_ms, npu_idle_ms, hst[PRE], hst[MID], timing_.dn_conv_ms,
                  timing_.dn_rule_ms, timing_.attn_ms, hst[GATE], hst[TAIL], hst[HPACK], hst[RES], host_idle_ms);
     if (one_ctx_ > 0) std::fprintf(stderr, "open_qwen36: one context: %zu configuration runs, %zu mb/fab flush runs so far\n", cfg_runs_, flush_runs_);
+    if (mbp && pf_cpu) {
+            std::lock_guard<std::mutex> g(pf_mu_);
+            std::fprintf(stderr, "open_qwen36: pipe MoE: CPU share %zu experts, %.0f ms (%.4f ms an expert unit; NPU %.4f ms a slot)\n",
+                         pf_cpu_ex_, pf_cpu_ms_, pf_cpu_k_, pf_npu_s_);
+            pf_cpu_ex_ = 0;
+            pf_cpu_ms_ = 0;
+    }
     if (mbp)
         std::fprintf(stderr, "open_qwen36: pipe MoE: experts on the NPU %.0f ms; host route + gather %.0f (router %.0f, gate %.0f, "
                              "gather %.0f, x sync %.0f, slot plan %.0f), scatter %.0f (y read back %.0f) ms\n",

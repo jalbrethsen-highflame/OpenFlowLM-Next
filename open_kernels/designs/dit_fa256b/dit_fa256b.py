@@ -40,7 +40,11 @@ KERNEL_SRC = str(HERE / "fa256b.cc")
 TQ, LKP, DC, DFULL = 32, 64, 32, int(os.environ.get("DF_D", 256))
 assert DFULL in (128, 256), DFULL
 NDCH = DFULL // DC
-N_GROUPS, GROUP_COLS, N_ROWS = 2, 4, 4
+# DF_GROUPS (default 2): the array's 8 columns as that many groups, each its own heads and K / V broadcast;
+# 4 (the ranged window streams): 8 cores a group, a pass 256 rows, so its window spans fewer keys
+N_GROUPS = int(os.environ.get("DF_GROUPS", 2))
+assert N_GROUPS in (2, 4), N_GROUPS
+GROUP_COLS, N_ROWS = 8 // N_GROUPS, 4
 CORES = GROUP_COLS * N_ROWS            # per group
 QROWS_PASS = CORES * TQ                # 512
 PIECE = 4608                           # bytes: one K piece (16 keys; 32 at head dim 128) / V element (64 d columns)
@@ -55,6 +59,10 @@ RTP_HEADS, RTP_PASSES, RTP_CHUNKS, RTP_VALID, RTP_CAUSAL, RTP_ROW0, RTP_QOFF, RT
 # DF_SINKS=1 (Flint): learned sinks from rtp[8 + local head] (log2 units), added in finalize_s; the engine
 # patches the words (SINK_SENT + global head in the stream) per layer
 SINKS = int(os.environ.get("DF_SINKS", 0))
+# DF_WRANGE=n (a window stream, with DF_SINKS): each pass streams only its own n key chunks, from chunk
+# p * QROWS_PASS / 64 (rtp[31] the step), so a core gets the keys its pass's rows can see, not the call's:
+# valid when the call's q_off >= window - 1 (the engine keeps the plain stream for a prompt's start)
+WRANGE = int(os.environ.get("DF_WRANGE", 0))
 SINK_SENT = 0x51A70000
 RTP_LEN = 32 if SINKS else 8      # (32: the buffers after rtp stay 64-byte aligned; pass_init stores up as one 64-byte vector)
 EXP_FIX = int(os.environ.get("DF_EXP_FIX", 0))   # fa_dit.cc FA_EXP_FIX (a build-wide choice)
@@ -100,7 +108,8 @@ def dit_fa256b(
 
     flags = [f"-DFA_TQ={TQ}", f"-DFA_LKP={LKP}", f"-DFA_DC={DC}", f"-DFA_DFULL={DFULL}",
              f"-DFA_QROWS_PASS={QROWS_PASS}", f"-DFA_HS={HS}", *[f"-DFA_X_{x.upper()}" for x in _EXPT if x], f"-DFA_EXP_FIX={EXP_FIX}", f"-DFA_TAU={TAU}",
-             "-Wno-deprecated-declarations", f"-DFA_WIN={1 if window else 0}", f"-DFA_SINKS={SINKS}"]
+             "-Wno-deprecated-declarations", f"-DFA_WIN={1 if window else 0}", f"-DFA_SINKS={SINKS}",
+             f"-DFA_WRANGE={1 if WRANGE else 0}"]
     # One ExternalFunction compiles the file; every call goes through a plain Kernel
     # sibling (whisper_fa's note: ExternalFunction's arg check rejects acquired bf16
     # elements).
@@ -269,6 +278,12 @@ def dit_fa256b(
     heads_local = heads // N_GROUPS
     n_pass = L // QROWS_PASS
     n_chunks = lk // LKP
+    cstep = 0
+    if WRANGE:
+        assert window and SINKS and kv_inter and RTP_LEN == 32, "DF_WRANGE: a window stream with DF_SINKS and DF_KV_INTER"
+        cstep = QROWS_PASS // LKP
+        assert (n_pass - 1) * cstep + WRANGE <= n_chunks, (n_pass, cstep, WRANGE, n_chunks)
+        n_chunks = WRANGE        # a pass's chunks (the cores' loop)
     gqa = heads // kv_heads
 
     Q_ty = np.ndarray[(heads * (L // TQ) * Q_CORE,), np.dtype[np.uint8]]
@@ -287,6 +302,8 @@ def dit_fa256b(
             buf[RTP_ROW0] = i * TQ
             buf[RTP_QOFF] = q_off
             buf[RTP_WINDOW] = window      # a sliding window (Flint): row r sees r - window + 1 .. r
+            if WRANGE:
+                buf[31] = cstep           # pass p's first key chunk: p * cstep
             if SINKS:                     # group g's heads g * heads_local + hl: their sinks, patched in per layer
                 for hl in range(heads_local):
                     buf[8 + hl] = SINK_SENT + g * heads_local + hl
@@ -314,11 +331,12 @@ def dit_fa256b(
                       # the shim wraps a dimension at 1023 and limits a repeat's stride to 4 MB: past
                       # 1023 chunks (~64K keys) K and V go as several fills of up to 1023 chunks each
                       # (2 passes in flight x (1 Q + 3) fills + 2 drains fit a shim tile's 16 BDs)
+                      pb = p * cstep        # (DF_WRANGE: this pass's first chunk)
                       for c0 in range(0, n_chunks, 1023):
                           nc = min(1023, n_chunks - c0)
-                          a_prods[g].fill(k, offset=kvbase + c0 * kv_step, sizes=[nc, CHUNK // W, W],
+                          a_prods[g].fill(k, offset=kvbase + (pb + c0) * kv_step, sizes=[nc, CHUNK // W, W],
                                           strides=[kv_step, W, 1], group=tg)
-                          b_prods[g].fill(v, offset=kvbase + c0 * kv_step, sizes=[nc, CHUNK // W, W],
+                          b_prods[g].fill(v, offset=kvbase + (pb + c0) * kv_step, sizes=[nc, CHUNK // W, W],
                                           strides=[kv_step, W, 1], group=tg)
                     for cc in range(GROUP_COLS):
                         col = g * GROUP_COLS + cc
