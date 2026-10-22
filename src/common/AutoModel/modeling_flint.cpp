@@ -75,12 +75,35 @@ void Flint::load_model(std::string model_path, json model_info, int default_cont
 }
 
 std::string Flint::apply_chat_template(nlohmann::ordered_json& messages, nlohmann::ordered_json tools) {
+    // The template writes a tool call as <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>, which minja's
+    // capability probe does not recognise (it looks for "argument_needle":), so its polyfills rewrote the history's
+    // tool calls and tool results as JSON text, ids included, and Flint copied that format in its next turn. The
+    // template renders both itself; its arguments.items() needs objects, so string arguments are parsed here.
+    minja::chat_template_options opt;
+    opt.polyfill_tool_calls = false;
+    opt.polyfill_tool_responses = false;
+    opt.polyfill_object_arguments = false;
+    nlohmann::ordered_json msgs = messages;
+    for (auto& m : msgs) {
+        if (!m.is_object() || !m.contains("tool_calls") || !m["tool_calls"].is_array()) continue;
+        for (auto& tc : m["tool_calls"]) {
+            auto& fn = tc.contains("function") ? tc["function"] : tc;
+            if (!fn.contains("arguments") || !fn["arguments"].is_string()) continue;
+            const std::string a = fn["arguments"].get<std::string>();
+            try {
+                fn["arguments"] = nlohmann::ordered_json::parse(a.empty() ? "{}" : a);
+            } catch (...) {
+                fn["arguments"] = nlohmann::ordered_json{{"input", a}};
+            }
+            if (!fn["arguments"].is_object()) fn["arguments"] = nlohmann::ordered_json{{"input", fn["arguments"]}};
+        }
+    }
     minja::chat_template_inputs inputs;
     inputs.add_generation_prompt = true;
-    inputs.messages = messages;
+    inputs.messages = msgs;
     inputs.extra_context = this->extra_context;
     if (!tools.empty() && this->enable_tool) inputs.tools = tools;
-    return this->_shared_apply_template(inputs);
+    return this->_shared_apply_template(inputs, opt);
 }
 
 bool Flint::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std::function<bool()> is_cancelled) {
