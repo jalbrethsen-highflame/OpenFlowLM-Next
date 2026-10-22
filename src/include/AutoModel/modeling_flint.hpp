@@ -45,7 +45,16 @@ public:
                 return false;
             }
         }
-        // Flint always reasons first (its template has no switch for it)
-        return parameter_name == "enable_think" || parameter_name == "reasoning_effort" || parameter_name == "toggle_think";
+        // the template has no reasoning switch; "think": false makes the turn start with an empty <think></think>
+        // (not trained for: an experiment's switch, off by default)
+        if (parameter_name == "enable_think") {
+            try {
+                this->enable_think = std::any_cast<bool>(value);
+                return true;
+            } catch (const std::bad_any_cast&) {
+                return false;
+            }
+        }
+        return parameter_name == "reasoning_effort" || parameter_name == "toggle_think";
     }
 };

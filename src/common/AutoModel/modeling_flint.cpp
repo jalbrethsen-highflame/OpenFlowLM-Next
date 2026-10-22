@@ -60,6 +60,7 @@ void Flint::load_model(std::string model_path, json model_info, int default_cont
     this->lm_engine->clear_context();
     this->_shared_setup_tokenizer(model_path);
     this->sampler.reset();
+    this->enable_think = true;   // Flint reasons unless a request sends "think": false
 
     // generation_config.json's
     sampler_config config;
@@ -103,7 +104,9 @@ std::string Flint::apply_chat_template(nlohmann::ordered_json& messages, nlohman
     inputs.messages = msgs;
     inputs.extra_context = this->extra_context;
     if (!tools.empty() && this->enable_tool) inputs.tools = tools;
-    return this->_shared_apply_template(inputs, opt);
+    std::string text = this->_shared_apply_template(inputs, opt);
+    if (!this->enable_think) text += "<think></think>";
+    return text;
 }
 
 bool Flint::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std::function<bool()> is_cancelled) {
