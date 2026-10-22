@@ -4278,11 +4278,12 @@ void Core::step_cpu_rows(const int* toks, size_t R, bool want_logits) {
             // a sliding-window layer: room for the rows, keeping the first row's window
             if (lt.state_ring) kv_room(l, pos + R, pos + 1 > gb.window ? pos + 1 - gb.window : 0);
             static const bool kv8_on = [] { const char* e = std::getenv("OFLM_OPEN_KV8"); return !(e && *e == '0'); }();
-            if (q41_cpu_ && kv8_on && !gb.window && __builtin_cpu_supports("avx512bf16")) {
+            if (q41_cpu_ && kv8_on && !gb.window && __builtin_cpu_supports("avx512bf16") && __builtin_cpu_supports("avx512vbmi")) {
                 // the int8 copy: rows the bf16 cache got from elsewhere (a prompt, an NPU step) first
                 if (kv8_.size() != static_cast<size_t>(nl_)) { kv8_.assign(nl_, {}); kv8_valid_.assign(nl_, 0); }
                 kv8_row_ = 2 * gb.kvh * gb.hd + 8 * gb.kvh;
-                if (kv8_[l].size() < (cfg_.max_ctx + 16) * kv8_row_) kv8_[l].resize((cfg_.max_ctx + 16) * kv8_row_);
+                const size_t kv8_rows = (cfg_.max_ctx + 16 + 31) / 32 * 32;   // whole blocks of 32 positions
+                if (kv8_[l].size() < kv8_rows * kv8_row_) kv8_[l].resize(kv8_rows * kv8_row_);
                 if (kv8_valid_[l] < pos)
                     host::kv8_quant_rows(state_[l].map<const uint16_t*>(), row / 2, gb.kvh, gb.hd, kv8_valid_[l], pos, kv8_[l].data(), kv8_row_);
                 g.kv8 = kv8_[l].data();

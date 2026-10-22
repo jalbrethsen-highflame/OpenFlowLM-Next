@@ -132,9 +132,9 @@ struct AttnGeom {
     const float* sinks = nullptr;
     size_t window = 0;
 };
-/// kv rows [r0, r1) (bf16 [K | V], kvh x hd each) as int8 rows of row8 bytes: K int8 [kvh hd], V int8
-/// [kvh hd], then the K scales and the V scales (f32 [kvh] each): one symmetric scale per position
-/// and kv head. row8 >= 2 kvh hd + 8 kvh.
+/// kv rows [r0, r1) (bf16 [K | V], kvh x hd each) into the int8 copy: one symmetric scale per position
+/// and kv head, in blocks of 32 positions (block_host.cpp kv8_byte), row8 = 2 kvh hd + 8 kvh bytes a
+/// position; the buffer holds whole blocks (a multiple of 32 positions).
 void kv8_quant_rows(const uint16_t* kv, size_t kv_row_elems, size_t kvh, size_t hd, size_t r0, size_t r1, uint8_t* kv8, size_t row8);
 
 /// The full-attention layer's middle over a block. q / gate [T, nh*hd], k / v [T, kvh*hd]

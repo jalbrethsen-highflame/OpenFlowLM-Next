@@ -1736,34 +1736,67 @@ void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, siz
             }
     }
 }
+// The int8 copy's layout: blocks of kKv8Blk keys, [block][kv head] kv8_blk_bytes(hd) each: K (hd/2
+// lines: pair (2p, 2p + 1) of keys 0-15, then of keys 16-31), V (16 key pairs x hd/32 lines: dims
+// d..d + 15, then d + 16..d + 31, keys (2jp, 2jp + 1) each), the 32 K scales, the 32 V scales (f32).
+// A line is 64 bytes, value i at kv8_byte(i): the order kv8_cvt's unpacks put back. Values are
+// sign-magnitude (sign bit 7, |q| <= 127), so their bf16 bytes come from two 128-entry tables.
+constexpr size_t kKv8Blk = 32;
+constexpr size_t kv8_blk_bytes(size_t hd) { return kKv8Blk * (2 * hd + 8); }
+constexpr size_t kv8_byte(size_t i) { return ((i & 31) >> 3) * 16 + (i >> 5) * 8 + (i & 7); }
+struct Kv8Tab { __m512i hi0, hi1, lo0, lo1; };
+__attribute__((target("avx512f,avx512bw")))
+inline Kv8Tab kv8_tab() {
+    alignas(64) uint8_t t[4][64];
+    for (int m = 0; m < 128; ++m) {
+        const float f = static_cast<float>(m);
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        t[m >> 6][m & 63] = static_cast<uint8_t>(u >> 24);           // bf16 high byte
+        t[2 + (m >> 6)][m & 63] = static_cast<uint8_t>(u >> 16);     // bf16 low byte (exact: m has <= 7 bits)
+    }
+    return {_mm512_load_si512(t[0]), _mm512_load_si512(t[1]), _mm512_load_si512(t[2]), _mm512_load_si512(t[3])};
+}
+// one line (64 sign-magnitude int8) -> two vectors of 32 bf16, exact: values 0-31 in a, 32-63 in b
+__attribute__((target("avx512f,avx512bw,avx512vbmi")))
+inline void kv8_cvt(const uint8_t* line, const Kv8Tab& t, __m512i& a, __m512i& b) {
+    const __m512i x = _mm512_loadu_si512(line);   // (the engine's buffer: no 64-byte alignment)
+    const __m512i hi = _mm512_ternarylogic_epi32(_mm512_permutex2var_epi8(t.hi0, x, t.hi1), x, _mm512_set1_epi8(static_cast<char>(0x80)), 0xF8);
+    const __m512i lo = _mm512_permutex2var_epi8(t.lo0, x, t.lo1);
+    a = _mm512_unpacklo_epi8(lo, hi);
+    b = _mm512_unpackhi_epi8(lo, hi);
+}
 // The bf16 flash decoding over an int8 copy of the cache (kv8_quant_rows: one scale per position
 // and kv head, symmetric): K and V rows half the bytes; int8 values are exact in bf16, so the dot
 // products are the bf16 kernel's, the K scales multiply each block's 32 scores and the V scales
 // fold into the probabilities the value products read (the softmax sums keep the unscaled ones).
-__attribute__((target("avx512f,avx512bw,avx512dq,avx512bf16,fma")))
+// The copy is in blocks of 32 keys (kKv8Blk, kv8_byte): a 64-byte line converts to two vectors of
+// bf16 pairs with two table lookups and two unpacks (kv8_cvt), with no transpose; all of a kv
+// head's queries (up to 8 a pass) read each converted line.
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512bf16,avx512vbmi,fma")))
 void attention_decode_flash_kv8(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
                                 const uint8_t* kv8, size_t row8, float* og, const float* sinks = nullptr) {
-    const size_t kvw8 = kvh * hd;                // K int8 at 0, V int8 at kvw8, K scales (f32) at 2 kvw8, V scales after
-    constexpr size_t CK = 512, KB = 32, MAXQ = 64, KB0 = 0, window = 0;   // (no window: the full layers' copy)
+    constexpr size_t CK = 512, KB = kKv8Blk, MAXQ = 64, KB0 = 0, window = 0;   // (no window: the full layers' copy)
     const size_t grp = nh / kvh, qw = nh * hd, Kmax = pos0 + R, NC = (Kmax - KB0 + CK - 1) / CK, NQ = R * grp, PS = hd + 2;
-    const size_t HP = hd / 2;                   // bf16 pairs a row
-    if (NQ > MAXQ || hd % 64 || hd > 512) throw std::runtime_error("open_qwen36: attention_decode_flash_kv8: geometry");
+    const size_t HP = hd / 2, DL = hd / 32;      // bf16 pairs a row; V lines a key pair
+    const size_t BLK = kv8_blk_bytes(hd);        // a block's bytes for one kv head: K, V, K scales, V scales
+    if (NQ > MAXQ || hd % 64 || hd > 512 || row8 != 2 * kvh * hd + 8 * kvh)
+        throw std::runtime_error("open_qwen36: attention_decode_flash_kv8: geometry");
     static thread_local std::vector<float> part_tl;
     std::vector<float>& part = part_tl;
     part.resize(R * nh * NC * PS);
     float* pp = part.data();
 #pragma omp parallel num_threads(flash_threads(Kmax))
     {
-        std::vector<uint32_t> buf(MAXQ * HP + HP * KB + (KB / 2) * hd + MAXQ * hd + 64);
+        std::vector<uint32_t> buf(MAXQ * HP + MAXQ * hd + 64);
         uint32_t* base = reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(buf.data()) + 63) & ~uintptr_t(63));
         uint32_t* qb = base;                                   // [NQ][HP] bf16 pairs of the scaled queries
-        uint32_t* KT = qb + MAXQ * HP;                         // [HP][KB] key pairs transposed
-        uint32_t* VI = KT + HP * KB;                           // [KB / 2][hd] (v_2j, v_2j+1) per dim
-        float* acc = reinterpret_cast<float*>(VI + (KB / 2) * hd);   // [NQ][hd]
+        float* acc = reinterpret_cast<float*>(qb + MAXQ * HP); // [NQ][hd]
         float m[MAXQ], l[MAXQ], corr[MAXQ];
         size_t nvq[MAXQ];
         alignas(64) float sc[MAXQ][KB];
         alignas(64) uint16_t pb[MAXQ][KB];
+        const Kv8Tab tab = kv8_tab();
 #pragma omp for schedule(dynamic, 1)
         for (long long it = 0; it < static_cast<long long>(kvh * NC); ++it) {
             const size_t kh = static_cast<size_t>(it) % kvh, c = static_cast<size_t>(it) / kvh;
@@ -1782,140 +1815,111 @@ void attention_decode_flash_kv8(size_t hd, size_t nh, size_t kvh, size_t R, size
                 }
             for (size_t b0 = k0; b0 < k1; b0 += KB) {
                 const size_t nk = std::min(KB, k1 - b0);
-                // K pairs transposed: KT[p][j] = (k_j[2p], k_j[2p + 1]), 16 keys x 16 pairs a tile
-                for (size_t jg = 0; jg < KB; jg += 16)
-                    for (size_t p0 = 0; p0 < HP; p0 += 16) {
-                        __m512 r[16];
-                        for (size_t i = 0; i < 16; ++i) {
-                            if (jg + i >= nk) { r[i] = _mm512_setzero_ps(); continue; }
-                            const __m256i b8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kv8 + (b0 + jg + i) * row8 + kh * hd + 2 * p0));
-                            const __m512 lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(b8)));
-                            const __m512 hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(b8, 1)));
-                            r[i] = reinterpret_cast<__m512>(_mm512_cvtne2ps_pbh(hi, lo));   // int8 values are exact in bf16
-                        }
-                        transpose16(r);
-                        for (size_t i = 0; i < 16; ++i) _mm512_store_ps(reinterpret_cast<float*>(KT + (p0 + i) * KB + jg), r[i]);
-                    }
-                // V paired by key: VI[jp][d] = v_2jp[d] (low) | v_2jp+1[d] (high)
-                for (size_t jp = 0; jp < KB / 2; ++jp) {
-                    const size_t ja = 2 * jp, jb = ja + 1;
-                    const int8_t* va = reinterpret_cast<const int8_t*>(kv8 + (b0 + ja) * row8 + kvw8 + kh * hd);
-                    const int8_t* vb = reinterpret_cast<const int8_t*>(kv8 + (b0 + jb) * row8 + kvw8 + kh * hd);
-                    if (b0 + KB + ja < k1) {
-                        const char* nkp = reinterpret_cast<const char*>(kv8 + (b0 + KB + ja) * row8 + kh * hd);
-                        const char* nvp = reinterpret_cast<const char*>(kv8 + (b0 + KB + ja) * row8 + kvw8 + kh * hd);
-                        for (size_t l2 = 0; l2 < hd; l2 += 64) {
-                            _mm_prefetch(nkp + l2, _MM_HINT_T0); _mm_prefetch(nvp + l2, _MM_HINT_T0);
-                            _mm_prefetch(nkp + row8 + l2, _MM_HINT_T0); _mm_prefetch(nvp + row8 + l2, _MM_HINT_T0);
-                        }
-                    }
-                    // 16 int8 -> 16 bf16 (exact) as u16 lanes
-#define KV8_V16(q) _mm512_cvtepu16_epi32(reinterpret_cast<__m256i>(_mm512_cvtneps_pbh(_mm512_cvtepi32_ps( \
-                           _mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(q)))))))
-                    for (size_t d = 0; d < hd; d += 16) {
-                        const __m512i lo = ja < nk ? KV8_V16(va + d) : _mm512_setzero_si512();
-                        const __m512i hi = jb < nk ? KV8_V16(vb + d) : _mm512_setzero_si512();
-                        _mm512_store_si512(VI + jp * hd + d, _mm512_or_si512(lo, _mm512_slli_epi32(hi, 16)));
-                    }
-#undef KV8_V16
+                const uint8_t* blk = kv8 + ((b0 / KB) * kvh + kh) * BLK;
+                const uint8_t* Kb = blk;                       // [HP lines]: keys 0-15, 16-31, pair (2p, 2p + 1)
+                const uint8_t* Vb = blk + 32 * hd;             // [16 key pairs][DL lines]: dims d, d + 16; keys 2jp, 2jp + 1
+                const float* sp = reinterpret_cast<const float*>(blk + 64 * hd);
+                if (b0 + KB < k1) {   // the head's next block (a longer distance measured the same)
+                    const char* nb = reinterpret_cast<const char*>(blk + kvh * BLK);
+                    for (size_t o = 0; o < BLK; o += 64) _mm_prefetch(nb + o, _MM_HINT_T0);
                 }
                 // this block's per-key scales (K for the scores, V for the probabilities), keys past nk 0
-                alignas(64) float ksc[KB], vsc[KB];
-                for (size_t j = 0; j < KB; ++j) {
-                    if (j < nk) {
-                        const float* sp = reinterpret_cast<const float*>(kv8 + (b0 + j) * row8 + 2 * kvw8);
-                        ksc[j] = sp[kh];
-                        vsc[j] = sp[kvh + kh];
-                    } else {
-                        ksc[j] = vsc[j] = 0.f;
-                    }
-                }
-                const __m512 ks0 = _mm512_load_ps(ksc), ks1 = _mm512_load_ps(ksc + 16);
-                const __m512 vs0 = _mm512_load_ps(vsc), vs1 = _mm512_load_ps(vsc + 16);
-                // scores, 6 queries at a time (12 sums in flight: 8 left the dot products' latency
-                // exposed)
-                for (size_t q0 = 0; q0 < NQ; q0 += 6) {
-                    const size_t nq6 = std::min<size_t>(6, NQ - q0);
-                    const uint32_t* qr[6];
-                    for (size_t u = 0; u < 6; ++u) qr[u] = qb + (q0 + (u < nq6 ? u : 0)) * HP;
-                    __m512 s6[6][2];
-                    for (int u = 0; u < 6; ++u) s6[u][0] = s6[u][1] = _mm512_setzero_ps();
+                const __mmask16 n0 = static_cast<__mmask16>(nk >= 16 ? 0xFFFF : (1u << nk) - 1);
+                const __mmask16 n1 = static_cast<__mmask16>(nk >= 32 ? 0xFFFF : nk > 16 ? (1u << (nk - 16)) - 1 : 0);
+                const __m512 ks0 = _mm512_maskz_loadu_ps(n0, sp), ks1 = _mm512_maskz_loadu_ps(n1, sp + 16);
+                const __m512 vs0 = _mm512_maskz_loadu_ps(n0, sp + 32), vs1 = _mm512_maskz_loadu_ps(n1, sp + 48);
+                // scores, 8 queries at a time over each converted K line (keys past nk: masked below)
+                for (size_t q0 = 0; q0 < NQ; q0 += 8) {
+                    const size_t nq8 = std::min<size_t>(8, NQ - q0);
+                    const uint32_t* qr[8];
+                    for (size_t u = 0; u < 8; ++u) qr[u] = qb + (q0 + (u < nq8 ? u : 0)) * HP;
+                    __m512 s8[8][2];
+                    for (int u = 0; u < 8; ++u) s8[u][0] = s8[u][1] = _mm512_setzero_ps();
                     for (size_t p = 0; p < HP; ++p) {
-                        const __m512bh ka = reinterpret_cast<__m512bh>(_mm512_load_si512(KT + p * KB));
-                        const __m512bh kb2 = reinterpret_cast<__m512bh>(_mm512_load_si512(KT + p * KB + 16));
-                        for (int u = 0; u < 6; ++u) {
+                        __m512i ka, kb2;
+                        kv8_cvt(Kb + p * 64, tab, ka, kb2);
+                        for (int u = 0; u < 8; ++u) {
                             const __m512bh qv = reinterpret_cast<__m512bh>(_mm512_set1_epi32(static_cast<int>(qr[u][p])));
-                            s6[u][0] = _mm512_dpbf16_ps(s6[u][0], qv, ka);
-                            s6[u][1] = _mm512_dpbf16_ps(s6[u][1], qv, kb2);
+                            s8[u][0] = _mm512_dpbf16_ps(s8[u][0], qv, reinterpret_cast<__m512bh>(ka));
+                            s8[u][1] = _mm512_dpbf16_ps(s8[u][1], qv, reinterpret_cast<__m512bh>(kb2));
                         }
                     }
-                    for (size_t u = 0; u < nq6; ++u) {
-                        _mm512_store_ps(sc[q0 + u], _mm512_mul_ps(s6[u][0], ks0));
-                        _mm512_store_ps(sc[q0 + u] + 16, _mm512_mul_ps(s6[u][1], ks1));
+                    for (size_t u = 0; u < nq8; ++u) {
+                        _mm512_store_ps(sc[q0 + u], _mm512_mul_ps(s8[u][0], ks0));
+                        _mm512_store_ps(sc[q0 + u] + 16, _mm512_mul_ps(s8[u][1], ks1));
                     }
                 }
-                // the online softmax; p rounded to bf16 (the sums use the rounded values too)
-                for (size_t qi = 0; qi < NQ; ++qi) {
-                    const size_t t = qi / grp, lim = pos0 + t + 1, lo = window && lim > window ? lim - window : 0;
-                    size_t nv = b0 >= lim ? 0 : std::min(nk, lim - b0);
-                    const size_t nlo = lo > b0 ? std::min(nk, lo - b0) : 0;   // the block's keys below the row's window
-                    if (nlo >= nv) nv = 0;
-                    nvq[qi] = nv;
-                    if (!nv) { corr[qi] = 1.f; std::fill(pb[qi], pb[qi] + KB, uint16_t(0)); continue; }
-                    const uint32_t vm = static_cast<uint32_t>((nv >= 32 ? 0xFFFFFFFFull : (1ull << nv) - 1) & ~((1ull << nlo) - 1));
-                    const __mmask16 v0 = static_cast<__mmask16>(vm & 0xFFFF);
-                    const __mmask16 v1 = static_cast<__mmask16>(vm >> 16);
-                    const __m512 s0 = _mm512_mask_mov_ps(_mm512_set1_ps(-INFINITY), v0, _mm512_load_ps(sc[qi]));
-                    const __m512 s1 = _mm512_mask_mov_ps(_mm512_set1_ps(-INFINITY), v1, _mm512_load_ps(sc[qi] + 16));
-                    const float bm = std::max(_mm512_reduce_max_ps(s0), _mm512_reduce_max_ps(s1));
-                    const float mn = std::max(m[qi], bm);
-                    corr[qi] = m[qi] == -INFINITY ? 0.f : std::exp(m[qi] - mn);
-                    const __m256bh b0h = _mm512_cvtneps_pbh(_mm512_maskz_mov_ps(v0, exp512_neg(_mm512_sub_ps(s0, _mm512_set1_ps(mn)))));
-                    const __m256bh b1h = _mm512_cvtneps_pbh(_mm512_maskz_mov_ps(v1, exp512_neg(_mm512_sub_ps(s1, _mm512_set1_ps(mn)))));
-                    const __m512 r0 = _mm512_cvtpbh_ps(b0h), r1 = _mm512_cvtpbh_ps(b1h);
-                    // p v = (p vs) v_int8: the V scales into the probabilities the products read
-                    _mm256_store_si256(reinterpret_cast<__m256i*>(pb[qi]), reinterpret_cast<__m256i>(_mm512_cvtneps_pbh(_mm512_mul_ps(r0, vs0))));
-                    _mm256_store_si256(reinterpret_cast<__m256i*>(pb[qi] + 16), reinterpret_cast<__m256i>(_mm512_cvtneps_pbh(_mm512_mul_ps(r1, vs1))));
-                    l[qi] = l[qi] * corr[qi] + (_mm512_reduce_add_ps(r0) + _mm512_reduce_add_ps(r1));
-                    m[qi] = mn;
+                // the online softmax; p rounded to bf16 (the sums use the rounded values too). 8 queries a
+                // pass, in phases (masks and maxima, then the exponentials, then the sums), so their
+                // reductions overlap; exp(0) = 1 exactly, so an unchanged maximum skips the call
+                for (size_t q0 = 0; q0 < NQ; q0 += 8) {
+                    const size_t nq8 = std::min<size_t>(8, NQ - q0);
+                    __m512 S0[8], S1[8], P0[8], P1[8];
+                    __mmask16 V0[8], V1[8];
+                    float bm[8], mn[8];
+                    for (size_t u = 0; u < nq8; ++u) {
+                        const size_t qi = q0 + u;
+                        const size_t t = qi / grp, lim = pos0 + t + 1, lo = window && lim > window ? lim - window : 0;
+                        size_t nv = b0 >= lim ? 0 : std::min(nk, lim - b0);
+                        const size_t nlo = lo > b0 ? std::min(nk, lo - b0) : 0;   // the block's keys below the row's window
+                        if (nlo >= nv) nv = 0;
+                        nvq[qi] = nv;
+                        const uint32_t vm = nv ? static_cast<uint32_t>((nv >= 32 ? 0xFFFFFFFFull : (1ull << nv) - 1) & ~((1ull << nlo) - 1)) : 0;
+                        V0[u] = static_cast<__mmask16>(vm & 0xFFFF);
+                        V1[u] = static_cast<__mmask16>(vm >> 16);
+                        S0[u] = _mm512_mask_mov_ps(_mm512_set1_ps(-INFINITY), V0[u], _mm512_load_ps(sc[qi]));
+                        S1[u] = _mm512_mask_mov_ps(_mm512_set1_ps(-INFINITY), V1[u], _mm512_load_ps(sc[qi] + 16));
+                    }
+                    for (size_t u = 0; u < nq8; ++u) bm[u] = std::max(_mm512_reduce_max_ps(S0[u]), _mm512_reduce_max_ps(S1[u]));
+                    for (size_t u = 0; u < nq8; ++u) {
+                        const size_t qi = q0 + u;
+                        if (!nvq[qi]) { corr[qi] = 1.f; std::fill(pb[qi], pb[qi] + KB, uint16_t(0)); continue; }
+                        mn[u] = std::max(m[qi], bm[u]);
+                        corr[qi] = m[qi] == -INFINITY ? 0.f : m[qi] == mn[u] ? 1.f : std::exp(m[qi] - mn[u]);
+                        const __m256bh b0h = _mm512_cvtneps_pbh(_mm512_maskz_mov_ps(V0[u], exp512_neg(_mm512_sub_ps(S0[u], _mm512_set1_ps(mn[u])))));
+                        const __m256bh b1h = _mm512_cvtneps_pbh(_mm512_maskz_mov_ps(V1[u], exp512_neg(_mm512_sub_ps(S1[u], _mm512_set1_ps(mn[u])))));
+                        P0[u] = _mm512_cvtpbh_ps(b0h);
+                        P1[u] = _mm512_cvtpbh_ps(b1h);
+                        // p v = (p vs) v_int8: the V scales into the probabilities the products read
+                        _mm256_store_si256(reinterpret_cast<__m256i*>(pb[qi]), reinterpret_cast<__m256i>(_mm512_cvtneps_pbh(_mm512_mul_ps(P0[u], vs0))));
+                        _mm256_store_si256(reinterpret_cast<__m256i*>(pb[qi] + 16), reinterpret_cast<__m256i>(_mm512_cvtneps_pbh(_mm512_mul_ps(P1[u], vs1))));
+                    }
+                    for (size_t u = 0; u < nq8; ++u) {
+                        const size_t qi = q0 + u;
+                        if (!nvq[qi]) continue;
+                        l[qi] = l[qi] * corr[qi] + (_mm512_reduce_add_ps(P0[u]) + _mm512_reduce_add_ps(P1[u]));
+                        m[qi] = mn[u];
+                    }
                 }
-                // sum p v, 3 queries x 64 dims a pass (12 sums in flight), 2 keys an instruction
-                for (size_t q0 = 0; q0 < NQ; q0 += 3) {
-                    const size_t q1 = std::min(q0 + 1, NQ - 1), q2 = std::min(q0 + 2, NQ - 1);
-                    const size_t nv = std::max({nvq[q0], nvq[q1], nvq[q2]});
+                // sum p v, 8 queries x 32 dims a pass over each converted V line, 2 keys an instruction
+                for (size_t q0 = 0; q0 < NQ; q0 += 8) {
+                    const size_t nq8 = std::min<size_t>(8, NQ - q0);
+                    size_t qs[8], nv = 0;
+                    for (size_t u = 0; u < 8; ++u) { qs[u] = q0 + (u < nq8 ? u : 0); nv = std::max(nv, nvq[qs[u]]); }
                     if (!nv) continue;
                     const size_t npair = (nv + 1) / 2;
-                    float* a0p = acc + q0 * hd;
-                    float* a1p = acc + q1 * hd;
-                    float* a2p = acc + q2 * hd;
-                    const uint32_t* p0w = reinterpret_cast<const uint32_t*>(pb[q0]);
-                    const uint32_t* p1w = reinterpret_cast<const uint32_t*>(pb[q1]);
-                    const uint32_t* p2w = reinterpret_cast<const uint32_t*>(pb[q2]);
-                    const __m512 c0 = _mm512_set1_ps(corr[q0]), c1 = _mm512_set1_ps(corr[q1]), c2 = _mm512_set1_ps(corr[q2]);
-                    for (size_t d = 0; d < hd; d += 64) {
-                        __m512 x[3][4];
-                        for (int i = 0; i < 4; ++i) {
-                            x[0][i] = _mm512_mul_ps(_mm512_load_ps(a0p + d + 16 * i), c0);
-                            x[1][i] = _mm512_mul_ps(_mm512_load_ps(a1p + d + 16 * i), c1);
-                            x[2][i] = _mm512_mul_ps(_mm512_load_ps(a2p + d + 16 * i), c2);
+                    const uint32_t* pw[8];
+                    __m512 cr[8];
+                    for (size_t u = 0; u < 8; ++u) { pw[u] = reinterpret_cast<const uint32_t*>(pb[qs[u]]); cr[u] = _mm512_set1_ps(corr[qs[u]]); }
+                    for (size_t dl = 0; dl < DL; ++dl) {
+                        __m512 x[8][2];
+                        for (int u = 0; u < 8; ++u) {
+                            x[u][0] = _mm512_mul_ps(_mm512_load_ps(acc + qs[u] * hd + dl * 32), cr[u]);
+                            x[u][1] = _mm512_mul_ps(_mm512_load_ps(acc + qs[u] * hd + dl * 32 + 16), cr[u]);
                         }
                         for (size_t jp = 0; jp < npair; ++jp) {
-                            const uint32_t* vr = VI + jp * hd + d;
-                            const __m512bh pa = reinterpret_cast<__m512bh>(_mm512_set1_epi32(static_cast<int>(p0w[jp])));
-                            const __m512bh pbv = reinterpret_cast<__m512bh>(_mm512_set1_epi32(static_cast<int>(p1w[jp])));
-                            const __m512bh pc = reinterpret_cast<__m512bh>(_mm512_set1_epi32(static_cast<int>(p2w[jp])));
-                            for (int i = 0; i < 4; ++i) {
-                                const __m512bh v = reinterpret_cast<__m512bh>(_mm512_load_si512(vr + 16 * i));
-                                x[0][i] = _mm512_dpbf16_ps(x[0][i], pa, v);
-                                x[1][i] = _mm512_dpbf16_ps(x[1][i], pbv, v);
-                                x[2][i] = _mm512_dpbf16_ps(x[2][i], pc, v);
+                            __m512i va, vb;
+                            kv8_cvt(Vb + (jp * DL + dl) * 64, tab, va, vb);
+                            for (int u = 0; u < 8; ++u) {
+                                const __m512bh pv = reinterpret_cast<__m512bh>(_mm512_set1_epi32(static_cast<int>(pw[u][jp])));
+                                x[u][0] = _mm512_dpbf16_ps(x[u][0], pv, reinterpret_cast<__m512bh>(va));
+                                x[u][1] = _mm512_dpbf16_ps(x[u][1], pv, reinterpret_cast<__m512bh>(vb));
                             }
                         }
                         // (a clamped duplicate in the last group holds the same sums as its query)
-                        for (int i = 0; i < 4; ++i) {
-                            _mm512_store_ps(a2p + d + 16 * i, x[2][i]);
-                            _mm512_store_ps(a1p + d + 16 * i, x[1][i]);
-                            _mm512_store_ps(a0p + d + 16 * i, x[0][i]);
+                        for (int u = 7; u >= 0; --u) {
+                            _mm512_store_ps(acc + qs[u] * hd + dl * 32, x[u][0]);
+                            _mm512_store_ps(acc + qs[u] * hd + dl * 32 + 16, x[u][1]);
                         }
                     }
                 }
@@ -2056,23 +2060,44 @@ void attention_decode_split(size_t hd, size_t nh, size_t kvh, size_t R, size_t p
 }
 }  // namespace
 
+// (the blocked layout of kv8_byte; the values as the scalar lrint(x * 127 / amax) gave, rounded to
+// nearest even; one block of 32 rows a work item)
+__attribute__((target("avx512f,avx512bw,avx512dq,fma")))
 void kv8_quant_rows(const uint16_t* kv, size_t kv_row_elems, size_t kvh, size_t hd, size_t r0, size_t r1, uint8_t* kv8, size_t row8) {
-    const size_t kvw = kvh * hd;
+    const size_t kvw = kvh * hd, BLK = kv8_blk_bytes(hd), DL = hd / 32;
+    if (hd % 64 || hd > 512 || row8 != 2 * kvw + 8 * kvh) throw std::runtime_error("open_qwen36: kv8_quant_rows: geometry");
+    if (r1 <= r0) return;
+    const long long b0 = static_cast<long long>(r0 / kKv8Blk), b1 = static_cast<long long>((r1 - 1) / kKv8Blk);
 #pragma omp parallel for schedule(static) if (r1 - r0 > 16)
-    for (long long rr = static_cast<long long>(r0); rr < static_cast<long long>(r1); ++rr) {
-        const uint16_t* src = kv + static_cast<size_t>(rr) * kv_row_elems;
-        uint8_t* dst = kv8 + static_cast<size_t>(rr) * row8;
-        float* sc = reinterpret_cast<float*>(dst + 2 * kvw);
-        for (size_t part = 0; part < 2; ++part)            // K, then V
-            for (size_t h = 0; h < kvh; ++h) {
-                const uint16_t* x = src + part * kvw + h * hd;
-                float amax = 0.f;
-                for (size_t i = 0; i < hd; ++i) amax = std::max(amax, std::fabs(bf16_to_f32(x[i])));
-                const float s = amax / 127.f, inv = amax > 0.f ? 127.f / amax : 0.f;
-                int8_t* q = reinterpret_cast<int8_t*>(dst + part * kvw + h * hd);
-                for (size_t i = 0; i < hd; ++i) q[i] = static_cast<int8_t>(std::lrint(bf16_to_f32(x[i]) * inv));
-                std::memcpy(&sc[part * kvh + h], &s, 4);
-            }
+    for (long long bi = b0; bi <= b1; ++bi) {
+        alignas(64) uint8_t q[512];
+        const size_t ra = std::max(r0, static_cast<size_t>(bi) * kKv8Blk), rb = std::min(r1, static_cast<size_t>(bi + 1) * kKv8Blk);
+        for (size_t rr = ra; rr < rb; ++rr) {
+            const uint16_t* src = kv + rr * kv_row_elems;
+            const size_t j = rr % kKv8Blk;
+            for (size_t part = 0; part < 2; ++part)            // K, then V
+                for (size_t h = 0; h < kvh; ++h) {
+                    const uint16_t* x = src + part * kvw + h * hd;
+                    uint8_t* blk = kv8 + (static_cast<size_t>(bi) * kvh + h) * BLK;
+                    __m512 mx = _mm512_setzero_ps();
+                    for (size_t i = 0; i < hd; i += 16) mx = _mm512_max_ps(mx, _mm512_abs_ps(ld_bf16x16(x + i)));
+                    const float amax = _mm512_reduce_max_ps(mx);
+                    const float s = amax / 127.f, inv = amax > 0.f ? 127.f / amax : 0.f;
+                    for (size_t i = 0; i < hd; i += 16) {
+                        const __m512i v = _mm512_cvtps_epi32(_mm512_mul_ps(ld_bf16x16(x + i), _mm512_set1_ps(inv)));
+                        const __m512i sm = _mm512_or_si512(_mm512_abs_epi32(v), _mm512_and_si512(_mm512_srli_epi32(v, 24), _mm512_set1_epi32(0x80)));
+                        _mm_store_si128(reinterpret_cast<__m128i*>(q + i), _mm512_cvtepi32_epi8(sm));
+                    }
+                    if (part == 0) {
+                        const size_t o = kv8_byte((j / 16) * 32 + 2 * (j % 16));   // the pair's two bytes are adjacent
+                        for (size_t p = 0; p < hd / 2; ++p) std::memcpy(blk + p * 64 + o, q + 2 * p, 2);
+                    } else {
+                        uint8_t* vb = blk + 32 * hd + (j / 2) * DL * 64;
+                        for (size_t d = 0; d < hd; ++d) vb[(d / 32) * 64 + kv8_byte(((d % 32) / 16) * 32 + 2 * (d % 16) + j % 2)] = q[d];
+                    }
+                    std::memcpy(blk + 64 * hd + part * 128 + j * 4, &s, 4);
+                }
+        }
     }
 }
 
