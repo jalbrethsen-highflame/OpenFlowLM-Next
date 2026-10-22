@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 
 #include <omp.h>
@@ -30,6 +31,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 #include <immintrin.h>
 
@@ -45,6 +48,61 @@ bool g_mbi_qsc = false;   // the mbi x elements' compact block sums (moe_batch.x
 }  // namespace
 
 namespace fs = std::filesystem;
+
+namespace {
+// The machine's other load over ms: the busiest GPU's gpu_busy_percent (sampled 3 times) and the CPU
+// cores other processes used (all CPU time less this process's). Linux only; elsewhere {100, 0}.
+struct OtherLoad { int gpu = 100; double cores = 0; };
+OtherLoad other_load(int ms) {
+    OtherLoad o;
+#ifndef _WIN32
+    auto cpu_busy = [] {   // the busy ticks of all CPUs
+        std::ifstream f("/proc/stat");
+        std::string cpu;
+        unsigned long long v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        f >> cpu >> v[0] >> v[1] >> v[2] >> v[3] >> v[4] >> v[5] >> v[6] >> v[7];
+        return v[0] + v[1] + v[2] + v[5] + v[6] + v[7];   // (less idle and iowait)
+    };
+    auto self_ticks = [] {   // utime + stime: fields 14 and 15, after the ")" of the command name
+        std::ifstream f("/proc/self/stat");
+        std::string l((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const size_t p = l.rfind(')');
+        if (p == std::string::npos) return 0ull;
+        std::istringstream is(l.substr(p + 2));
+        std::string x;
+        unsigned long long u = 0, st = 0;
+        for (int i = 3; i <= 13; ++i) is >> x;
+        is >> u >> st;
+        return u + st;
+    };
+    auto gpu = [] {
+        int m = -1;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator("/sys/class/drm", ec)) {
+            std::ifstream f(e.path() / "device" / "gpu_busy_percent");
+            int b = -1;
+            if (f >> b) m = std::max(m, b);
+        }
+        return m;
+    };
+    const unsigned long long c0 = cpu_busy(), s0 = self_ticks();
+    const auto t0 = std::chrono::steady_clock::now();
+    int g = gpu();
+    for (int i = 0; i < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms / 2));
+        g = std::max(g, gpu());
+    }
+    const unsigned long long c1 = cpu_busy(), s1 = self_ticks();
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double tick = static_cast<double>(sysconf(_SC_CLK_TCK));
+    o.gpu = std::max(g, 0);
+    o.cores = std::max(0.0, (static_cast<double>(c1 - c0) - static_cast<double>(s1 - s0)) / tick / sec);
+#else
+    (void)ms;
+#endif
+    return o;
+}
+}  // namespace
 
 namespace {
 // dit_gemm's B operand from a q4_1 pool region (q4_1_pack.py's chunk order, rs = 2: a 64-row
@@ -6243,15 +6301,18 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     static const size_t faw_min = [] { const char* e = std::getenv("OFLM_OPEN_FA_W_MIN"); return e ? std::strtoul(e, nullptr, 10) : 1024ul; }();
     // fa.win.ranged (dit_fa256b DF_WRANGE): the same stream with each 256-row pass reading only its own key
     // chunks, bit-identical, for a q_off of at least ranged_min_qoff (every chunk past a prompt's first
-    // window); OFLM_OPEN_FA_WRANGE=0 keeps the plain one
+    // window); OFLM_OPEN_FA_WRANGE=0 keeps the plain one. Only from OFLM_OPEN_FA_WRANGE_MIN keys (prompt
+    // end, default 24576): below, the NPU is not the limit, and the shorter calls change its order so
+    // that the host waits more (GPU idle, A B A B: 16K 1160 -> 1122 tok/s, 8K -2 %; 32K +2 %, 64K +3 %)
     static const bool faw_r_on = [] { const char* e = std::getenv("OFLM_OPEN_FA_WRANGE"); return !(e && *e == '0'); }();
+    static const size_t faw_r_keys = [] { const char* e = std::getenv("OFLM_OPEN_FA_WRANGE_MIN"); return e ? std::strtoul(e, nullptr, 10) : 24576ul; }();
     std::string faw_kernel, faw_ranged;
     size_t faw_lk = 0, faw_r_min = 0;
     if (cb_ok && fa_on && N >= faw_min && D["fa"].contains("win") && D["fa"]["win"].contains(std::to_string(MQ)) && (full_m || cbs_m)) {
         const nlohmann::json& FW = D["fa"]["win"][std::to_string(MQ)];
         faw_kernel = FW["kernel"].get<std::string>();
         faw_lk = FW["lk"].get<size_t>();
-        if (faw_r_on && FW.contains("ranged")) {
+        if (faw_r_on && pos0 + N >= faw_r_keys && FW.contains("ranged")) {
             faw_ranged = FW["ranged"].get<std::string>();
             faw_r_min = FW.value("ranged_min_qoff", size_t{0});
         }
@@ -6395,7 +6456,20 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
     // OFLM_OPEN_PF_CPU=1: while the NPU runs a group's expert passes, the CPU runs the experts with the
     // fewest tokens (an expert's slot streams all its weights for a few tokens): as many as the measured
     // CPU ms an expert (pf_cpu_k_) and NPU ms a slot (pf_npu_s_) balance; OFLM_OPEN_PF_CPU_THREADS (16)
-    static const bool pf_cpu_env = [] { const char* e = std::getenv("OFLM_OPEN_PF_CPU"); return e && *e == '1'; }();
+    // OFLM_OPEN_PF_CPU=auto: on only while the machine is otherwise idle (the GPU < 30 % busy, other processes
+    // < 4 cores over 60 ms at the prompt's start): GPU idle, 1K 435 -> 516 tok/s, 4K 736 -> 834, 16K +5 %; GPU
+    // busy, 16K 905 -> 839 (its weight reads slow the NPU's and the host's)
+    static const int pf_cpu_mode = [] {
+        const char* e = std::getenv("OFLM_OPEN_PF_CPU");
+        return !e ? 0 : std::strcmp(e, "auto") == 0 ? 2 : *e == '1' ? 1 : 0;
+    }();
+    bool pf_cpu_env = pf_cpu_mode == 1;
+    if (pf_cpu_mode == 2 && mbi_on_) {
+        const OtherLoad ol = other_load(60);
+        pf_cpu_env = ol.gpu < 30 && ol.cores < 4.0;
+        std::fprintf(stderr, "open_qwen36: pipe MoE: CPU share %s (GPU %d %% busy, other processes %.1f cores)\n",
+                     pf_cpu_env ? "on" : "off", ol.gpu, ol.cores);
+    }
     static const int pf_cpu_threads = [] { const char* e = std::getenv("OFLM_OPEN_PF_CPU_THREADS"); return e ? std::max(1, std::atoi(e)) : 16; }();
     static const bool pf_res_early = [] { const char* e = std::getenv("OFLM_OPEN_RES_EARLY"); return e && (*e == '1' || *e == '2'); }();
     const bool pf_cpu = pf_cpu_env && mbi && !pf_res_early;   // (the plain RES adds the share)
