@@ -78,11 +78,14 @@ class Sched:
         v[2] = max(v[2], t)
 
 
+# HSGEN_D=128 (fa_hs128.inc, dit_fa256b with DF_D=128): the same two loops at head dim 128 -- qk over 16
+# k-steps (a row pair's Q 2304 bytes), O's row blocks 2048 bytes apart; the same function names
+HSGEN_D = int(__import__("os").environ.get("HSGEN_D", 256))
 SHAPES = {
     # nu units, ks k-steps a unit, sw: first unit of the second row pair, load: C in from memory,
     # a_step: bytes between the row pairs' A streams, row: bytes between C row blocks (pv)
-    "fa_pv_call": dict(nu=8, ks=8, sw=4, load=True, a_step=1152, row=4096),
-    "fa_qk_call": dict(nu=2, ks=32, sw=1, load=False, a_step=4608, row=0, neg_m=True),
+    "fa_pv_call": dict(nu=8, ks=8, sw=4, load=True, a_step=1152, row=16 * HSGEN_D),
+    "fa_qk_call": dict(nu=2, ks=HSGEN_D // 8, sw=1, load=False, a_step=18 * HSGEN_D, row=0, neg_m=True),
 }
 
 

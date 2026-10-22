@@ -345,6 +345,9 @@ private:
     std::map<std::string, CfgStream> cfgs_;
     std::string cfg_cur_;                      ///< the context name whose configuration the array holds
     size_t flush_runs_ = 0;                    ///< OFLM_OPEN_ONE_CTX_FLUSH runs between the mb and fab designs
+    /// fa.sinks "rtp": each attention stream's sink words (instruction index, head) and the layer they hold
+    std::map<std::string, std::vector<std::pair<uint32_t, uint32_t>>> sink_pos_;
+    std::map<std::string, long> sink_cur_;
     size_t cfg_runs_ = 0;
     std::map<std::string, Kern> kerns_;
 

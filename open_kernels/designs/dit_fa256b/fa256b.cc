@@ -275,10 +275,15 @@ static inline int32_t fa_row0(const int32_t *rtp, int32_t pass) {
 // rtp[7] = W > 0) one wholly below the first row's window -- row r sees keys r - W + 1 .. r. A window
 // never masks chunk 0: with a window the keys start after a 64-key chunk of sinks (Flint), which
 // every row sees. Nothing to compute.
+// FA_SINKS (DF_SINKS, head dim 128): the sinks come with the runtime parameters, not as a chunk, so a
+// window masks chunk 0 like any other.
+#ifndef FA_SINKS
+#define FA_SINKS 0
+#endif
 static inline bool fa_skip(const int32_t *rtp, int32_t pass, int32_t chunk) {
   if (rtp[4] && chunk * LKP > fa_row0(rtp, pass) + TQ - 1)
     return true;
-  return rtp[7] && chunk > 0 && (chunk + 1) * LKP <= fa_row0(rtp, pass) - rtp[7] + 1;
+  return rtp[7] && (FA_SINKS || chunk > 0) && (chunk + 1) * LKP <= fa_row0(rtp, pass) - rtp[7] + 1;
 }
 
 // A key chunk wholly at or past valid_len (the pad up to lk): nothing to compute.
@@ -297,9 +302,10 @@ using Acc = aie::accum<accfloat, 64>;
 using Acc16 = aie::accum<accfloat, 16>;
 constexpr int TILE_B = 72;                           // one 8x8 bfp16ebs8 tile
 constexpr int Q_BYTES = (TQ / 16) * (DFULL / 8) * 2 * TILE_B;      // 9216
-constexpr int KPIECE_BYTES = (DFULL / 8) * 2 * TILE_B;             // 16 keys: 4608
+constexpr int KPIECE_BYTES = (DFULL / 8) * 2 * TILE_B;             // 16 keys: 4608 (head dim 128: 2304)
+constexpr int PIECE_BYTES = 4608;                                  // a fifo element (head dim 128: a K piece of 32 keys)
 constexpr int VPAIR_BYTES = (LKP / 8) * 2 * TILE_B;                // 16 d columns: 1152
-constexpr int VPAIRS_PER_ELEM = KPIECE_BYTES / VPAIR_BYTES;        // 4
+constexpr int VPAIRS_PER_ELEM = PIECE_BYTES / VPAIR_BYTES;         // 4
 static_assert(TQ == 32 && LKP == 64, "pop orders written for 4 row blocks and 8 key blocks");
 
 static inline const bfp16ebs8 *bfp(const uint8_t *p) { return reinterpret_cast<const bfp16ebs8 *>(p); }
@@ -359,7 +365,17 @@ static inline uint32_t prof_now() { return 0; }   // (no readable cycle counter 
 #define PROF_BEGIN
 #define PROF_END(i)
 #endif
-#if FA_HS
+#if FA_HS && FA_DFULL == 128
+#include "fa_hs128.inc"
+// fa_qkpv at head dim 128: a K piece is 32 keys (two 16-key qk calls into G's columns 32j..), a V element
+// still 64 d columns (O's columns 64j..); a plain C step (the kernel is DMA-bound here)
+extern "C" void fa_qkpv(const uint8_t *q, const uint8_t *kp, bfloat16 *g, const uint8_t *p, const uint8_t *ve, bfloat16 *o,
+                        int32_t j) {
+  fa_qk_call(q, kp, g + (2 * j) * 2 * (TQ / 8) * 64, fa_nuc);
+  fa_qk_call(q, kp + KPIECE_BYTES, g + (2 * j + 1) * 2 * (TQ / 8) * 64, fa_nuc);
+  fa_pv_call(p, ve, o + j * 2 * VPAIRS_PER_ELEM * 64);
+}
+#elif FA_HS
 #include "fa_hs.inc"
 // fa_qkpv(q, kp, g, p, ve, o, j): the pipelined loop's step without a C wrapper (one cost ~70
 // cycles: register saves, rtp checks, two calls): fa_qk_call on K piece j into G's columns
@@ -425,10 +441,10 @@ extern "C" {
 
 #define SET_ROUNDING() ::aie::set_rounding(::aie::rounding_mode::conv_even)
 
-// Q capture: this core's 9216 bytes arrive as two 4608-byte pieces (k = 0, 1).
+// Q capture: this core's 9216 bytes arrive as two 4608-byte pieces (k = 0, 1); at head dim 128, one.
 void capture_q(uint8_t *__restrict src, uint8_t *__restrict dst, int32_t k) {
-  uint8_t *__restrict d = dst + k * KPIECE_BYTES;
-  for (int i = 0; i < KPIECE_BYTES; i += 64)
+  uint8_t *__restrict d = dst + k * PIECE_BYTES;
+  for (int i = 0; i < PIECE_BYTES; i += 64)
     aie::store_v(d + i, aie::load_v<64>(src + i));
 }
 
@@ -464,7 +480,9 @@ void qk(uint8_t *__restrict q, uint8_t *__restrict kp, bfloat16 *__restrict g, i
   SET_ROUNDING();
 #if FA_HS
   PROF_BEGIN
-  fa_qk_call(q, kp, g + j * 2 * (TQ / 8) * 64, s_nuc);
+  fa_qk_call(q, kp, g + (DFULL == 128 ? 2 * j : j) * 2 * (TQ / 8) * 64, s_nuc);
+  if (DFULL == 128)   // (a 32-key piece: its second 16 keys)
+    fa_qk_call(q, kp + KPIECE_BYTES, g + (2 * j + 1) * 2 * (TQ / 8) * 64, s_nuc);
   PROF_END(0)
   return;
 #endif
@@ -575,7 +593,7 @@ void apply_mask(bfloat16 *__restrict g, int32_t *__restrict rtp, int32_t pass,
   const int32_t row0 = fa_row0(rtp, pass);
   const int32_t col0 = chunk * LKP;
   // a sliding window (rtp[7], fa_skip): the last row's first key; keys below it masked for some row
-  const int32_t win = chunk > 0 ? rtp[7] : 0;
+  const int32_t win = (FA_SINKS || chunk > 0) ? rtp[7] : 0;
   const bool low = win && col0 < row0 + TQ - win;
   // Last column any row may keep; all rows keep everything up to it?
   int32_t keep_all = valid_len; // columns < keep_all kept by every row
@@ -814,6 +832,38 @@ void fa_qkpv_w(const uint8_t *q, const uint8_t *kp, bfloat16 *g, const uint8_t *
 #endif
 
 // End of a pass: O /= l (l replicated, so its bf16 inverse is scale_rows' table).
+#if FA_SINKS
+// 2^x for 16 lanes (x >= -126): x = n + f by the round-to-nearest constant, 2^f from its Taylor terms on
+// [-0.5, 0.5] (relative error < 2e-7), 2^n built in the exponent bits
+static inline aie::vector<float, 16> fa_exp2v(aie::vector<float, 16> x) {
+  x = aie::max(x, aie::broadcast<float, 16>(-126.f));
+  const aie::vector<float, 16> big = aie::broadcast<float, 16>(12582912.f);
+  aie::vector<float, 16> t = aie::add(x, big);                                   // n + 1.5 2^23
+  aie::vector<float, 16> nf = aie::sub(t, big);
+  aie::vector<float, 16> f = aie::sub(x, nf);                                    // [-0.5, 0.5]
+  const float c[6] = {1.f, 0.6931471806f, 0.2402265070f, 0.0555041087f, 0.0096181291f, 0.0013333558f};
+  aie::vector<float, 16> p = aie::broadcast<float, 16>(c[5]);
+  for (int i = 4; i >= 0; i--)
+    p = aie::add(aie::mul(p, f).template to_vector<float>(), aie::broadcast<float, 16>(c[i]));
+  aie::vector<int32_t, 16> n = aie::sub(aie::vector_cast<int32_t>(t), aie::broadcast<int32_t, 16>(0x4B400000));
+  aie::vector<int32_t, 16> e = aie::upshift(aie::add(n, aie::broadcast<int32_t, 16>(127)), 23);
+  return aie::mul(p, aie::vector_cast<float>(e)).template to_vector<float>();
+}
+// The learned sinks (Flint): l += 2^(sink - m) for each row before O /= l -- one more term in the softmax's
+// denominator, no value. rtp[8 + hl] is the pass's head's sink in log2 units (the engine patches it per layer).
+void finalize(float *__restrict sp, bfloat16 *__restrict gp);
+void finalize_s(float *__restrict sp, bfloat16 *__restrict gp, int32_t *__restrict rtp, int32_t hl) {
+  SET_ROUNDING();
+  int32_t sb = rtp[8 + hl];
+  float sv;
+  __builtin_memcpy(&sv, &sb, 4);
+  const aie::vector<float, 16> sk = aie::broadcast<float, 16>(sv);
+  for (int i = 0; i < TQ * 8; i += 16)   // (sp and -m share the replicated layout)
+    aie::store_v(sp + i, aie::add(aie::load_v<16>(sp + i), fa_exp2v(aie::add(sk, aie::load_v<16>(s_nuc + i)))));
+  finalize(sp, gp);
+}
+#endif
+
 void finalize(float *__restrict sp, bfloat16 *__restrict gp) {
   SET_ROUNDING();
 #ifdef FA_X_PROF

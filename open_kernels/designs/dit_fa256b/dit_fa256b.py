@@ -35,19 +35,28 @@ from aie.iron.device import Tile
 HERE = Path(__file__).resolve().parent
 KERNEL_SRC = str(HERE / "fa256b.cc")
 
-TQ, LKP, DC, DFULL = 32, 64, 32, 256
+# DF_D=128 (Flint): the head dim 128 natively -- a K piece 32 keys (two 16-key qk calls), a chunk two
+# pieces / two V elements, a core's Q one piece (fa_hs128.inc)
+TQ, LKP, DC, DFULL = 32, 64, 32, int(os.environ.get("DF_D", 256))
+assert DFULL in (128, 256), DFULL
 NDCH = DFULL // DC
 N_GROUPS, GROUP_COLS, N_ROWS = 2, 4, 4
 CORES = GROUP_COLS * N_ROWS            # per group
 QROWS_PASS = CORES * TQ                # 512
-PIECE = 4608                           # bytes: one K piece (16 keys) / V element (64 d columns)
-CHUNK = 4 * PIECE                      # a 64-key chunk of K (or of V)
-Q_CORE = 2 * PIECE                     # one core's 32 rows of Q
+PIECE = 4608                           # bytes: one K piece (16 keys; 32 at head dim 128) / V element (64 d columns)
+NPC = DFULL // 64                      # K pieces = V elements a 64-key chunk
+CHUNK = NPC * PIECE                    # a 64-key chunk of K (or of V)
+Q_CORE = TQ * DFULL * 9 // 8           # one core's 32 rows of Q
+QPC = Q_CORE // PIECE                  # its pieces
 MAX_INFLIGHT = 2                       # passes queued ahead
 STACK = 0x800                          # frames <= 0x280 + 0x80 (softmax_rescale -> scale_o)
 
 RTP_HEADS, RTP_PASSES, RTP_CHUNKS, RTP_VALID, RTP_CAUSAL, RTP_ROW0, RTP_QOFF, RTP_WINDOW = range(8)
-RTP_LEN = 8
+# DF_SINKS=1 (Flint): learned sinks from rtp[8 + local head] (log2 units), added in finalize_s; the engine
+# patches the words (SINK_SENT + global head in the stream) per layer
+SINKS = int(os.environ.get("DF_SINKS", 0))
+SINK_SENT = 0x51A70000
+RTP_LEN = 32 if SINKS else 8      # (32: the buffers after rtp stay 64-byte aligned; pass_init stores up as one 64-byte vector)
 EXP_FIX = int(os.environ.get("DF_EXP_FIX", 0))   # fa_dit.cc FA_EXP_FIX (a build-wide choice)
 TAU = int(os.environ.get("DF_TAU", 32))          # fa_dit.cc FA_TAU, the lazy-rescale threshold
 _EXPT = os.environ.get("DF_EXPT", "").split(",")  # ablation builds only
@@ -91,7 +100,7 @@ def dit_fa256b(
 
     flags = [f"-DFA_TQ={TQ}", f"-DFA_LKP={LKP}", f"-DFA_DC={DC}", f"-DFA_DFULL={DFULL}",
              f"-DFA_QROWS_PASS={QROWS_PASS}", f"-DFA_HS={HS}", *[f"-DFA_X_{x.upper()}" for x in _EXPT if x], f"-DFA_EXP_FIX={EXP_FIX}", f"-DFA_TAU={TAU}",
-             "-Wno-deprecated-declarations", f"-DFA_WIN={1 if window else 0}"]
+             "-Wno-deprecated-declarations", f"-DFA_WIN={1 if window else 0}", f"-DFA_SINKS={SINKS}"]
     # One ExternalFunction compiles the file; every call goes through a plain Kernel
     # sibling (whisper_fa's note: ExternalFunction's arg check rejects acquired bf16
     # elements).
@@ -115,7 +124,7 @@ def dit_fa256b(
     else:
         k_qkpv = Kernel("qkpv", obj, [q_ty, elem_ty, g_ty, p_ty, elem_ty, o_l1_ty, np.int32, rtp_ty,
                                       np.int32, np.int32])
-    k_fin = Kernel("finalize", obj, [sp_ty, o_l1_ty])
+    k_fin = Kernel("finalize_s", obj, [sp_ty, o_l1_ty, rtp_ty, np.int32]) if SINKS else Kernel("finalize", obj, [sp_ty, o_l1_ty])
     kernels = [k_capture, k_init, k_qk, k_pv, k_mask, k_step, k_fin, k_exp, k_qkpv, k_all]
 
     def core_tile(g, i):
@@ -162,15 +171,15 @@ def dit_fa256b(
             n_heads = my_rtp[RTP_HEADS]
             n_pass = my_rtp[RTP_PASSES]
             n_chunks = my_rtp[RTP_CHUNKS]
-            for _ in range_(n_heads):
+            for hl in range_(n_heads):
                 for p in range_(n_pass):
-                    # Q: 32 pieces, 2 a core in core order, cores 0-7 on A, 8-15 on B -- before
-                    # the O buffer is taken, so it overlaps the previous pass's O drain
-                    for k in range(2 * CORES):
-                        fifo = a_in if k < CORES else b_in
+                    # Q: 32 pieces (16 at head dim 128), QPC a core in core order, cores 0-7 on A,
+                    # 8-15 on B -- before the O buffer is taken, so it overlaps the previous pass's O drain
+                    for k in range(QPC * CORES):
+                        fifo = a_in if k < QPC * CORES // 2 else b_in
                         e = fifo.acquire(1)
-                        if k // 2 == i:
-                            capture(e, q_saved, k % 2)
+                        if k // QPC == i:
+                            capture(e, q_saved, k % QPC)
                         fifo.release(1)
                     o = o_out.acquire(1)
                     init(o, up, sp)
@@ -208,11 +217,11 @@ def dit_fa256b(
                     # elements, so fifos A and B drain evenly (one after the other, each
                     # stalled while the core worked on the other: compute and transfer
                     # added up instead of overlapping)
-                    for j in range(4):
+                    for j in range(NPC):
                         k_piece(0, j)
                     scores_done(0)
                     for c in range_(1, n_chunks):
-                        for j in range(4):
+                        for j in range(NPC):
                             if "nokv" in _EXPT and HS:   # compute only, the same fused calls
                                 if "noqkpv" not in _EXPT:
                                     qkpv(q_saved, dummy[0], g_buf, p_buf, dummy[0], o, j)
@@ -229,9 +238,12 @@ def dit_fa256b(
                                 a_in.release(1)
                                 b_in.release(1)
                         scores_done(c)
-                    for e2 in range(4):
+                    for e2 in range(NPC):
                         v_elem(n_chunks - 1, e2)
-                    fin(sp, o)
+                    if SINKS:
+                        fin(sp, o, my_rtp, hl)
+                    else:
+                        fin(sp, o)
                     o_out.release(1)
             barrier.release_with_value(1)
         return core_fn
@@ -274,7 +286,10 @@ def dit_fa256b(
             buf[RTP_CAUSAL] = causal       # the queries are positions q_off .. q_off + L - 1 of the keys
             buf[RTP_ROW0] = i * TQ
             buf[RTP_QOFF] = q_off
-            buf[RTP_WINDOW] = window      # a sliding window (Flint): keys from 64 on, row r sees r - window + 1 .. r
+            buf[RTP_WINDOW] = window      # a sliding window (Flint): row r sees r - window + 1 .. r
+            if SINKS:                     # group g's heads g * heads_local + hl: their sinks, patched in per layer
+                for hl in range(heads_local):
+                    buf[8 + hl] = SINK_SENT + g * heads_local + hl
         for b in barriers.values():
             b.set(1)
 

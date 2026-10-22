@@ -1,4 +1,4 @@
-# TODO: Flint (RecursiveSI/flint) on the NPU (branch feat/qwen36-a3b)
+# TODO: Flint (RecursiveSI/flint) on the NPU (branch feat/flint)
 
 Targets (the A3B push's): prefill >= 1000 tok/s and decode >= 30 tok/s at every context, 1K to 128K,
 with the GPU busy.
@@ -61,16 +61,16 @@ without positions (NoPE). Vocab 150144, untied head. No MTP head; no drafter exi
 
 ## Results (oflm bench, one length a process, GPU idle: the trainer was not running)
 
-| Context | Prefill tok/s (port, kf2) | Prefill tok/s (now, kf3) | Decode tok/s (port) | Decode tok/s (now) |
-|---|---|---|---|---|
-| 1K | 436 | 424 | 21.9 | 30.9 |
-| 2K | 564 | 559 | 21.9 | 31.1 |
-| 4K | 653 | 668 | 21.8 | 33.1 |
-| 8K | 954 | 964 | 22.2 | 31.4 |
-| 16K | 981 | 1006 | 19.4 | 25.4 |
-| 32K | 925 | 973 | 16.7 | 22.0 |
-| 64K | 771 | 810 | 13.3 | 17.2 |
-| 128K | 570 | 590 | 9.8 | 11.4 |
+| Context | Prefill tok/s (port, kf2) | Prefill tok/s (kf3) | Prefill tok/s (now, kf4: hd 128) | Decode tok/s (port) | Decode tok/s (kf3) | Decode tok/s (now, kf4) |
+|---|---|---|---|---|---|---|
+| 1K | 436 | 424 | 431 | 21.9 | 30.9 | 29.8 |
+| 2K | 564 | 559 | 628 | 21.9 | 31.1 | 30.8 |
+| 4K | 653 | 668 | 740 | 21.8 | 33.1 | 30.0 |
+| 8K | 954 | 964 | 1103 | 22.2 | 31.4 | 33.1 |
+| 16K | 981 | 1006 | 1169 | 19.4 | 25.4 | 26.4 |
+| 32K | 925 | 973 | 1170 | 16.7 | 22.0 | 21.7 |
+| 64K | 771 | 810 | 1001 | 13.3 | 17.2 | 17.1 |
+| 128K | 570 | 590 | 757 | 9.8 | 11.4 | 10.9 |
 
 ## Constraint tracker (2026-10-21, GPU idle unless noted)
 
@@ -88,5 +88,5 @@ without positions (NoPE). Vocab 150144, untied head. No MTP head; no drafter exi
 | P1 | prefill | expert slots part-filled: top-6 over groups of 4096 tokens leaves ~96 tokens an expert, 2 slots of 64 | waste | 14.2 s at 32K | OFLM_OPEN_MOE_GROUP 8192 / 16384, slot counts | NPU -10..25 % at 16K+ | done: groups of 8192 from 12288-token prompts (gemm_dit.moe_group / moe_group_min; bit-identical): 32K experts 14.2 -> 12.1 s, wall 35.2 -> 33.5 s; 16384 cut experts more but stalled the pipe (34.4 s); one group a prompt stalled 8K (954 -> 748) |
 | P2 | prefill | window attention streams 2048 keys for ~576 needed, and the fused qk/pv runs every chunk | waste | 5.8 s at 32K | pipe trace FAT fa256bw | -3..4 s at 32K | done, small: 1664-key streams + a live-chunk flag (bit-identical): 5.8 -> 5.6 s. The kernel is DMA-bound: every pass of 512 query rows streams its kv head's whole K / V again (window: ~61 MB a call; full layers at 128K ~4.9 GB a call), so the math skip barely shows |
 | P4 | prefill | K / V re-streamed per pass of 512 query rows (16x per kv head: 8 q heads x 2 passes) | waste (DMA) | ~all of the attention time | bytes a call | per-pass key ranges for window streams (~-35 %); hd 128 halves every stream | open |
-| P3 | prefill | head dim 128 padded to 256 in dit_fa256b | waste | ~2x attention work | NPU attention s | -4..5 s at 32K, ~-70 s at 128K | open (new hd-128 kernel) |
+| P3 | prefill | head dim 128 padded to 256 in dit_fa256b | waste | ~2x attention work | NPU attention s | -4..5 s at 32K, ~-70 s at 128K | done: kf4, dit_fa256b DF_D=128 with the sinks in the runtime parameters (no sink chunk); prefill +2 % (1K) .. +28 % (128K), 32K 973 -> 1170 tok/s; long1 logits vs llama.cpp mean KL 1.31 -> 1.24, argmax 2333 -> 2344 / 3109; decode tokens identical |
 | M1 | memory | 128K peak ~45 GB (per-chunk buffers ~9 GB, padded key packs 3.9 GB) | memory | fits 46 GB cap | OFLM_OPEN_MEM_LOG | ring buffers: -6 GB | open |

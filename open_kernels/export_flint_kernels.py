@@ -129,20 +129,30 @@ FA_CBS = [512 * i for i in range(1, 6)]             # the small tier's (512 quer
 FA_MAX_LK = int(os.environ.get("FLINT_FA_MAX_LK", 132096))
 
 
+# FLINT_FA_D=256: the earlier set's head dim 256 zero-padded, the sinks as a key chunk in front (kf2 / kf3);
+# 128 (default): dit_fa256b at DF_D=128 with the sinks in its runtime parameters (DF_SINKS, patched per layer)
+FA_D = int(os.environ.get("FLINT_FA_D", 128))
+SINK_SENT = 0x51A70000                 # dit_fa256b.SINK_SENT
+
+
 def fa(L: int, lk: int, window: int = 0) -> tuple[str, dict]:
-    """A causal dit_fa256b stream; window > 0: the sliding layers' (keys after the 64-key sink chunk)."""
+    """A causal dit_fa256b stream; window > 0: the sliding layers'."""
     kind = "bw" if window else "bc"
-    name = f"fa256{kind}{'s' if L == 512 else ''}_lk{lk}"
+    name = (f"fa128{kind[1]}" if FA_D == 128 else f"fa256{kind}") + f"{'s' if L == 512 else ''}_lk{lk}"
     env = {"DF_L": str(L), "DF_LK": str(lk), "DF_CAUSAL": "1", "DF_QOFF": str(FA_QOFF), "DF_KV_INTER": "1",
            "DF_HEADS": str(NH), "DF_KV_HEADS": str(KVH), "DF_WINDOW": str(window)}
-    # (v3: the window streams' live-chunk check, fa_qkpv_w -- their own image, context faw)
-    bdir = f"dit_fa256b/build_l{L}_lk{lk}_causal_kvi_qs_h{NH}k{KVH}" + (f"_w{window}_v3" if window else "_v2")
+    if FA_D == 128:
+        env.update({"DF_D": "128", "DF_SINKS": "1"})
+        bdir = f"dit_fa256b/build_d128s_l{L}_lk{lk}_causal_kvi_qs_h{NH}k{KVH}" + (f"_w{window}" if window else "")
+    else:
+        # (v3: the window streams' live-chunk check, fa_qkpv_w -- their own image, context faw)
+        bdir = f"dit_fa256b/build_l{L}_lk{lk}_causal_kvi_qs_h{NH}k{KVH}" + (f"_w{window}_v3" if window else "_v2")
     return name, {"design": "dit_fa256b/dit_fa256b.py", "build_dir": bdir, "env": env}
 
 
-# the sliding layers' streams: a chunk's queries over the sink chunk and keys from 512 before it (64 + at
-# most 576 + M keys)
-FA_WIN = {1024: 1664, 512: 1152}
+# the sliding layers' streams: a chunk's queries over its keys from 512 before it (at most 575 + M keys;
+# head dim 256 also the 64-key sink chunk in front)
+FA_WIN = {1024: 1600, 512: 1088} if FA_D == 128 else {1024: 1664, 512: 1152}
 
 
 EPI_PH = {"epi": {"first_cb": 0}, "pack_h": True}
@@ -178,9 +188,9 @@ def builds() -> dict:
 def context_of(name: str) -> str:
     if name.startswith("mb_"):
         return "mb"
-    if name.startswith("fa256bw"):
+    if name.startswith("fa256bw") or name.startswith("fa128w"):
         return "faw"
-    if name.startswith("fa256b"):
+    if name.startswith("fa256b") or name.startswith("fa128"):
         return "fab"
     if name.startswith("dit2") and name.endswith("_m256"):
         return "dit2t"
@@ -241,7 +251,7 @@ def manifest(bset: dict) -> dict:
     for n in kernels:
         if n.startswith("mb_"):
             kernels[n]["patch"] = "moebatch"
-    contexts = {"mb": "mb_s256/final.xclbin", "fab": "fa256bc_lk1024/final.xclbin",
+    contexts = {"mb": "mb_s256/final.xclbin", "fab": f"{fa(1024, 1024)[0]}/final.xclbin",
                 "faw": f"{fa(1024, FA_WIN[1024], WINDOW)[0]}/final.xclbin", "dit2": f"dit2_n{HID}_k{QW}/final.xclbin",
                 "dit2t": f"dit2_n{HID}_k{QW}_m256/final.xclbin"}
 
@@ -251,7 +261,8 @@ def manifest(bset: dict) -> dict:
 
     gd = tier(1024)
     # the full layers' attention on dit_fa256b: head dim 256, Flint's 128 zero-padded, the sinks a chunk in front
-    gd["fa"] = {"hd": 256, "q_cols": NH * 256, "cb_qoff": FA_QOFF, "cbs_m": 512,
+    gd["fa"] = {"hd": FA_D, "q_cols": NH * FA_D, "cb_qoff": FA_QOFF, "cbs_m": 512,
+                **({"sinks": "rtp", "sink_sent": SINK_SENT} if FA_D == 128 else {}),
                 "cb": {str(lk): fa(1024, lk)[0] for lk in FA_CB if fa(1024, lk)[0] in bset},
                 "cbs": {str(lk): fa(512, lk)[0] for lk in FA_CBS if fa(512, lk)[0] in bset},
                 "win": {str(L): {"kernel": fa(L, lk, WINDOW)[0], "lk": lk} for L, lk in FA_WIN.items()}}

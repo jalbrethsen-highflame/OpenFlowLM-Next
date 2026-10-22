@@ -113,12 +113,14 @@ void dit2_pack_a(const float* x, size_t rows, size_t M, size_t K, uint8_t* out, 
 constexpr size_t kFabQBlock = 9216, kFabChunk = 18432;
 // hd: the head's real dims (Flint 128: the kernel's 256 zero-padded past them); sink_dim >= 0: that
 // padded dim reads 1 (times s) on every real row -- the column a sink key's logit sits in (fab_sink_k)
+// kd: the kernel's head dim (256, or 128: dit_fa256b DF_D=128), its blocks kd 36 (Q, 32 rows) / kd 72 (a
+// 64-key chunk) bytes
 void fab_pack_q(const float* x, size_t ld, size_t col, size_t T, size_t t_real, float s, uint8_t* out, size_t hd = 256,
-                long sink_dim = -1) {
+                long sink_dim = -1, size_t kd = 256) {
     float v[8];
     for (size_t rb = 0; rb < T / 32; ++rb)
         for (size_t zp = 0; zp < 2; ++zp)
-            for (size_t i = 0; i < 32; ++i)
+            for (size_t i = 0; i < kd / 8; ++i)
                 for (size_t r2 = 0; r2 < 2; ++r2)
                     for (size_t r8 = 0; r8 < 8; ++r8) {
                         const size_t row = rb * 32 + zp * 16 + r2 * 8 + r8;
@@ -135,12 +137,12 @@ void fab_pack_q(const float* x, size_t ld, size_t col, size_t T, size_t t_real, 
 // [piece 4][d step 32][tile 2][8 keys][8 d] = 18432 bytes.
 // cstep: bytes from one 64-key chunk to the next (kFabChunk; kvh * kFabChunk for [chunk][kv head]).
 void fab_pack_k(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t t_real, uint8_t* base,
-                size_t cstep = kFabChunk, size_t hd = 256) {
+                size_t cstep = kFabChunk, size_t hd = 256, size_t kd = 256) {
     float v[8];
     for (size_t c = 0; c < T / 64; ++c) {
         uint8_t* out = base + c * cstep;
         for (size_t j = 0; j < 4; ++j)
-            for (size_t i = 0; i < 32; ++i)
+            for (size_t i = 0; i < kd / 8; ++i)
                 for (size_t n2 = 0; n2 < 2; ++n2)
                     for (size_t k8 = 0; k8 < 8; ++k8) {
                         const size_t key = c * 64 + j * 16 + n2 * 8 + k8;
@@ -153,11 +155,11 @@ void fab_pack_k(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t 
 }
 // V^T: per 64-key chunk [element 4][column pair 4][key step 8][tile 2][8 d columns][8 keys].
 void fab_pack_v(const uint16_t* kv, size_t stride, size_t col, size_t T, size_t t_real, uint8_t* base,
-                size_t cstep = kFabChunk, size_t hd = 256) {
+                size_t cstep = kFabChunk, size_t hd = 256, size_t kd = 256) {
     float v[8];
     for (size_t c = 0; c < T / 64; ++c) {
         uint8_t* out = base + c * cstep;
-        for (size_t e = 0; e < 4; ++e)
+        for (size_t e = 0; e < kd / 64; ++e)
             for (size_t jl = 0; jl < 4; ++jl)
                 for (size_t i = 0; i < 8; ++i)
                     for (size_t n2 = 0; n2 < 2; ++n2)
@@ -6008,8 +6010,35 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             fab_kvh = types_[l]->gemm_block.kvh;
             if (types_[l]->gemm_block.sinks) fa_skc = 64;
         }
-    // the NPU attention kernel's head dim (dit_fa256b: 256; Flint's 128 runs zero-padded in it)
+    // the NPU attention kernel's head dim (dit_fa256b: 256, Flint's 128 zero-padded in it; or 128 natively,
+    // DF_D=128) and its block sizes; fa.sinks "rtp": the sinks in its runtime parameters, patched per layer
+    // (no sink chunk)
     const size_t fa_hd = D.contains("fa") ? D["fa"].value("hd", size_t{0}) : 0;
+    const size_t fkd = fa_hd ? fa_hd : 256, fQB = fkd * 36, fCH = fkd * 72;
+    const bool fa_rtp = D.contains("fa") && D["fa"].value("sinks", std::string()) == "rtp";
+    if (fa_rtp) fa_skc = 0;
+    // the sink words of a stream (SINK_SENT + head, one per core of the head's group), found once, then
+    // set to the layer's sinks in log2 units before each run of it
+    auto sink_patch = [&](const std::string& fk, size_t l) {
+        if (!fa_rtp || hc_[l].sinks.empty()) return;
+        const uint32_t sent = D["fa"]["sink_sent"].get<uint32_t>();
+        Kern& k = kerns_.at(fk);
+        auto& pos = sink_pos_[fk];
+        if (pos.empty()) {
+            for (size_t i = 0; i < k.words.size(); ++i)
+                if (k.words[i] >= sent && k.words[i] < sent + fab_nh) pos.push_back({static_cast<uint32_t>(i), k.words[i] - sent});
+            if (pos.size() != 16 * fab_nh)
+                throw std::runtime_error("open_qwen36: " + fk + " carries " + std::to_string(pos.size()) + " sink words, not 16 a head");
+        }
+        if (auto it = sink_cur_.find(fk); it != sink_cur_.end() && it->second == static_cast<long>(l)) return;
+        static const bool sink_off = std::getenv("OFLM_OPEN_FA_SINK_OFF") != nullptr;   // (debug: a term of 0)
+        for (const auto& [i, h] : pos) {
+            const float v = sink_off ? -1e4f : hc_[l].sinks[h] * 1.4426950408889634f;
+            std::memcpy(&k.iw()[i], &v, 4);
+        }
+        k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        sink_cur_[fk] = static_cast<long>(l);
+    };
     // fa.cb (designs/dit_fa256b causal, ~3x dit_fa256): the causal prompt's NPU attention when the
     // prompt starts at position 0 (the packs hold this prompt's K / V rows only), from
     // OFLM_OPEN_FA_CB_MIN keys (default 1024; dit_fa256 keeps OFLM_OPEN_FA_MIN_LK); Q / K / V
@@ -6041,7 +6070,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
         if (!full_m || lk < fa_min || !FA.contains(std::to_string(lk))) return {};
         return FA[std::to_string(lk)].get<std::string>();
     };
-    auto is_cb = [](const std::string& k) { return k.rfind("fa256bc", 0) == 0; };
+    auto is_cb = [](const std::string& k) { return k.rfind("fa256bc", 0) == 0 || k.rfind("fa128c", 0) == 0; };
     // fa.win (Flint's sliding layers): a chunk's MQ queries over the sink chunk and its keys from window - 1
     // before it, one stream for every chunk (lk = MQ + 1024 keys), the query offset patched per call; from
     // OFLM_OPEN_FA_W_MIN prompt tokens (default 1024, where the full layers' NPU attention starts), else the
@@ -6096,21 +6125,21 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
             need("fa_q_" + cs, M * wmid * 2);
             need("fa_o_" + cs, M * wmid * 2);
         }
-        if (nc_b || any_cb || !faw_kernel.empty()) need("fab_q_" + cs, fab_nh * (MQ / 32) * kFabQBlock);
+        if (nc_b || any_cb || !faw_kernel.empty()) need("fab_q_" + cs, fab_nh * (MQ / 32) * fQB);
         if (any_cb || !faw_kernel.empty()) { need("fa_o_" + cs, MQ * std::max(wmid, fab_nh * fa_hd) * 2); }
         if (!faw_kernel.empty()) {
-            need("faw_k_" + cs, (faw_lk / 64) * fab_kvh * kFabChunk);
-            need("faw_v_" + cs, (faw_lk / 64) * fab_kvh * kFabChunk);
+            need("faw_k_" + cs, (faw_lk / 64) * fab_kvh * fCH);
+            need("faw_v_" + cs, (faw_lk / 64) * fab_kvh * fCH);
         }
     }
     if (nc_b)
         for (const char* nm : {"fab_k0", "fab_k1", "fab_v0", "fab_v1"})
-            need(nm, fab_kvh * (lkn / 64) * kFabChunk);
+            need(nm, fab_kvh * (lkn / 64) * fCH);
     if (any_cb)
         for (int l = 0; l < nl_; ++l)
             if (types_[l]->gemm_block.kind == "full" && !types_[l]->gemm_block.window) {
-                need("fabc_k" + std::to_string(full_ord[l]), fab_kvh * (lkc / 64) * kFabChunk);
-                need("fabc_v" + std::to_string(full_ord[l]), fab_kvh * (lkc / 64) * kFabChunk);
+                need("fabc_k" + std::to_string(full_ord[l]), fab_kvh * (lkc / 64) * fCH);
+                need("fabc_v" + std::to_string(full_ord[l]), fab_kvh * (lkc / 64) * fCH);
             }
     need("pp_h", M * 2 * ff * 2);
     if (ffn_dev) need("pp_hu", M / MT * (ff / 64) * 36864);   // h unit slots, one NPU step uses and frees them
@@ -6387,11 +6416,13 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     if (gb.window) {
                         // fa.win: the chunk's queries at packed key p - kst + 64 (after the sink chunk)
                         const size_t p = pos0 + c * M;
-                        cb_qoff(fk, static_cast<uint32_t>(p - faw_kst(p, gb.window) + 64));
+                        cb_qoff(fk, static_cast<uint32_t>(p - faw_kst(p, gb.window) + fa_skc));
+                        sink_patch(fk, l);
                         run(fk, {"fab_q_" + cs, "faw_k_" + cs, "faw_v_" + cs, "fa_o_" + cs});
                     } else if (is_cb(fk)) {
                         const std::string fo = std::to_string(full_ord[l]);
                         cb_qoff(fk, static_cast<uint32_t>(pos0 + c * M + fa_skc));
+                        sink_patch(fk, l);
                         run(fk, {"fab_q_" + cs, "fabc_k" + fo, "fabc_v" + fo, "fa_o_" + cs});
                     } else {
                         run(fk, {"fa_q_" + cs, "state", "state", "fa_o_" + cs});
@@ -6698,10 +6729,10 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                                              man_.rope_inv_freq.data(), kvl, row / 2, og.data());
                         sadd(timing_.attn_ms, ms_since(ta));
                         const size_t MQr = cbk ? MQ : M;            // the stream's query rows (padded past M)
-                        const size_t nh = gb.nh, kvh = gb.kvh, hd = gb.hd, qb_head = (MQr / 32) * kFabQBlock;
+                        const size_t nh = gb.nh, kvh = gb.kvh, hd = gb.hd, qb_head = (MQr / 32) * fQB;
                         // Flint (head dim 128 on the 256 kernel, learned sinks): the real dims, the rest zero; the
                         // sinks as a 64-key chunk in front (fab_sink_k), every real key one chunk later
-                        const size_t grp = nh / kvh, skc = gb.sinks ? 64 : 0;
+                        const size_t grp = nh / kvh, skc = fa_skc;
                         xrt::bo& qbuf = buffer("fab_q_" + cs, 0);
                         uint8_t* qm = qbuf.map<uint8_t*>();
                         const std::string par = std::to_string(full_ord[l] % 2), fo = std::to_string(full_ord[l]);
@@ -6713,25 +6744,25 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         const size_t k0 = cbk ? (c == 0 ? 0 : (pos0 + r0) / 64 * 64) : pos0 + r0;
                         const size_t kn_rows = cbk ? pos0 + r0 + t_real - k0 : t_real, kT = cbk ? (kn_rows + 63) / 64 * 64 : M;
                         const uint16_t* kvr = kvl + k0 * (row / 2);
-                        const size_t kv_head = cbk ? kFabChunk : (lkn / 64) * kFabChunk;
-                        const size_t cstep = cbk ? kvh * kFabChunk : kFabChunk;
-                        const size_t at = cbk ? ((k0 + skc) / 64) * cstep : (r0 / 64) * cstep, span = (M / 64) * kFabChunk;
+                        const size_t kv_head = cbk ? fCH : (lkn / 64) * fCH;
+                        const size_t cstep = cbk ? kvh * fCH : fCH;
+                        const size_t at = cbk ? ((k0 + skc) / 64) * cstep : (r0 / 64) * cstep, span = (M / 64) * fCH;
 #pragma omp parallel for schedule(dynamic, 1)
                         for (long long w = 0; w < static_cast<long long>(nh + 2 * kvh); ++w) {
                             const size_t u = static_cast<size_t>(w);
                             if (u < nh)
                                 fab_pack_q(og.data(), qw, u * hd, MQr, t_real, 1.4426950408889634f, qm + u * qb_head, hd,
-                                           skc ? static_cast<long>(hd + 8 * (u % grp)) : -1);
+                                           skc ? static_cast<long>(hd + 8 * (u % grp)) : -1, fkd);
                             else if (u < nh + kvh)
-                                fab_pack_k(kvr, row / 2, (u - nh) * hd, kT, kn_rows, kbuf.map<uint8_t*>() + (u - nh) * kv_head + at, cstep, hd);
+                                fab_pack_k(kvr, row / 2, (u - nh) * hd, kT, kn_rows, kbuf.map<uint8_t*>() + (u - nh) * kv_head + at, cstep, hd, fkd);
                             else
                                 fab_pack_v(kvr, row / 2, kvh * hd + (u - nh - kvh) * hd, kT, kn_rows,
-                                           vbuf.map<uint8_t*>() + (u - nh - kvh) * kv_head + at, cstep, hd);
+                                           vbuf.map<uint8_t*>() + (u - nh - kvh) * kv_head + at, cstep, hd, fkd);
                         }
                         if (cbk && skc && c == 0) {   // the sink chunk (chunk 0), every kv head's
                             for (size_t g2 = 0; g2 < kvh; ++g2) {
-                                fab_sink_k(hc.sinks.data() + g2 * grp, grp, hd, kbuf.map<uint8_t*>() + g2 * kFabChunk);
-                                std::memset(vbuf.map<uint8_t*>() + g2 * kFabChunk, 0, kFabChunk);
+                                fab_sink_k(hc.sinks.data() + g2 * grp, grp, hd, kbuf.map<uint8_t*>() + g2 * fCH);
+                                std::memset(vbuf.map<uint8_t*>() + g2 * fCH, 0, fCH);
                             }
                             kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, cstep, 0);
                             vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, cstep, 0);
@@ -6778,10 +6809,11 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         host::attention_prep(g, ya.data(), yb.data(), yc.data(), hc.qn.data(), hc.kn.data(),
                                              man_.rope_inv_freq.data(), kvl, row / 2, og.data());
                         sadd(timing_.attn_ms, ms_since(ta));
-                        const size_t nh = gb.nh, kvh = gb.kvh, hd = gb.hd, grp = nh / kvh, qb_head = (MQ / 32) * kFabQBlock;
+                        const size_t nh = gb.nh, kvh = gb.kvh, hd = gb.hd, grp = nh / kvh, qb_head = (MQ / 32) * fQB;
                         const size_t p = pos0 + r0, kst = faw_kst(p, gb.window), nk = p + t_real - kst, kT = (nk + 63) / 64 * 64;
-                        const size_t cstep = kvh * kFabChunk;
-                        if (kT + 64 > faw_lk) throw std::runtime_error("open_qwen36: fa.win: " + std::to_string(nk) + " keys past the stream's " + std::to_string(faw_lk));
+                        const size_t cstep = kvh * fCH;
+                        if (kT + fa_skc > faw_lk) throw std::runtime_error("open_qwen36: fa.win: " + std::to_string(nk) + " keys past the stream's " + std::to_string(faw_lk));
+                        const size_t so = fa_skc ? cstep : 0;   // (the sink chunk first, when the sinks are one)
                         uint8_t* qm = buffer("fab_q_" + cs, 0).map<uint8_t*>();
                         xrt::bo& kbuf = buffer("faw_k_" + cs, 0);
                         xrt::bo& vbuf = buffer("faw_v_" + cs, 0);
@@ -6791,20 +6823,20 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                             const size_t u = static_cast<size_t>(w);
                             if (u < nh)
                                 fab_pack_q(og.data(), qw, u * hd, MQ, t_real, 1.4426950408889634f, qm + u * qb_head, hd,
-                                           static_cast<long>(hd + 8 * (u % grp)));
+                                           fa_skc ? static_cast<long>(hd + 8 * (u % grp)) : -1, fkd);
                             else if (u < nh + kvh)
-                                fab_pack_k(kvr, row / 2, (u - nh) * hd, kT, nk, kbuf.map<uint8_t*>() + (u - nh) * kFabChunk + cstep, cstep, hd);
+                                fab_pack_k(kvr, row / 2, (u - nh) * hd, kT, nk, kbuf.map<uint8_t*>() + (u - nh) * fCH + so, cstep, hd, fkd);
                             else
                                 fab_pack_v(kvr, row / 2, kvh * hd + (u - nh - kvh) * hd, kT, nk,
-                                           vbuf.map<uint8_t*>() + (u - nh - kvh) * kFabChunk + cstep, cstep, hd);
+                                           vbuf.map<uint8_t*>() + (u - nh - kvh) * fCH + so, cstep, hd, fkd);
                         }
-                        for (size_t g2 = 0; g2 < kvh; ++g2) {
-                            fab_sink_k(hc.sinks.data() + g2 * grp, grp, hd, kbuf.map<uint8_t*>() + g2 * kFabChunk);
-                            std::memset(vbuf.map<uint8_t*>() + g2 * kFabChunk, 0, kFabChunk);
+                        for (size_t g2 = 0; g2 < kvh && fa_skc; ++g2) {
+                            fab_sink_k(hc.sinks.data() + g2 * grp, grp, hd, kbuf.map<uint8_t*>() + g2 * fCH);
+                            std::memset(vbuf.map<uint8_t*>() + g2 * fCH, 0, fCH);
                         }
                         buffer("fab_q_" + cs, 0).sync(XCL_BO_SYNC_BO_TO_DEVICE, nh * qb_head, 0);
-                        kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (kT / 64 + 1) * cstep, 0);
-                        vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, (kT / 64 + 1) * cstep, 0);
+                        kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, kT / 64 * cstep + so, 0);
+                        vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, kT / 64 * cstep + so, 0);
                     } else {
                         // NPU attention: q / k normed and roped here, K / V rows into the cache (synced),
                         // Q to the kernel unscaled (it applies 1 / sqrt(hd) itself; prep scaled by it)
@@ -6825,7 +6857,7 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     if (!noncausal_ && any_cb && !cbk && !gb.window) {
                         // a chunk under OFLM_OPEN_FA_CB_MIN: its K / V rows into the fa.cb packs too,
                         // for the later chunks' kernels
-                        const size_t kvh = gb.kvh, hd = gb.hd, cstep = kvh * kFabChunk, skc = gb.sinks ? 64 : 0;
+                        const size_t kvh = gb.kvh, hd = gb.hd, cstep = kvh * fCH, skc = fa_skc;
                         const size_t k0 = c == 0 ? 0 : (pos0 + r0) / 64 * 64, kn_rows = pos0 + r0 + t_real - k0;
                         const size_t kT = (kn_rows + 63) / 64 * 64, at = ((k0 + skc) / 64) * cstep;
                         const std::string fo = std::to_string(full_ord[l]);
@@ -6836,15 +6868,15 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                         for (long long w = 0; w < static_cast<long long>(2 * kvh); ++w) {
                             const size_t u = static_cast<size_t>(w);
                             if (u < kvh)
-                                fab_pack_k(kvr, row / 2, u * hd, kT, kn_rows, kbuf.map<uint8_t*>() + u * kFabChunk + at, cstep, hd);
+                                fab_pack_k(kvr, row / 2, u * hd, kT, kn_rows, kbuf.map<uint8_t*>() + u * fCH + at, cstep, hd, fkd);
                             else
                                 fab_pack_v(kvr, row / 2, kvh * hd + (u - kvh) * hd, kT, kn_rows,
-                                           vbuf.map<uint8_t*>() + (u - kvh) * kFabChunk + at, cstep, hd);
+                                           vbuf.map<uint8_t*>() + (u - kvh) * fCH + at, cstep, hd, fkd);
                         }
                         if (skc && c == 0) {
                             for (size_t g2 = 0; g2 < kvh; ++g2) {
-                                fab_sink_k(hc.sinks.data() + g2 * (gb.nh / kvh), gb.nh / kvh, hd, kbuf.map<uint8_t*>() + g2 * kFabChunk);
-                                std::memset(vbuf.map<uint8_t*>() + g2 * kFabChunk, 0, kFabChunk);
+                                fab_sink_k(hc.sinks.data() + g2 * (gb.nh / kvh), gb.nh / kvh, hd, kbuf.map<uint8_t*>() + g2 * fCH);
+                                std::memset(vbuf.map<uint8_t*>() + g2 * fCH, 0, fCH);
                             }
                             kbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, cstep, 0);
                             vbuf.sync(XCL_BO_SYNC_BO_TO_DEVICE, cstep, 0);
@@ -6928,6 +6960,20 @@ void Core::step_prompt_pipe(const std::vector<int>& ids, bool want_logits) {
                     }
                     std::fprintf(stderr, "fa_check layer %zu chunk %zu: rel_fro %.3e worst row %zu (pos %zu) rel %.3e\n", l, c,
                                  std::sqrt(num / den), wr, pos0 + r0 + wr, worst);
+                    static const bool fa_heads = std::getenv("OFLM_OPEN_FA_CHECK_HEADS") != nullptr;   // (debug: per head)
+                    if (fa_heads && l < 2 && c < 2)
+                        for (size_t t : {size_t{0}, size_t{1}, size_t{100}, t_real - 1}) {
+                            std::fprintf(stderr, "  row %zu:", t);
+                            for (size_t h = 0; h < qw / gb.hd; ++h) {
+                                double n2 = 0, d2 = 0;
+                                for (size_t i = h * gb.hd; i < (h + 1) * gb.hd; ++i) {
+                                    const double e = og[t * qw + i] - ref[t * qw + i];
+                                    n2 += e * e; d2 += static_cast<double>(ref[t * qw + i]) * ref[t * qw + i];
+                                }
+                                std::fprintf(stderr, " %.2f", std::sqrt(n2 / std::max(d2, 1e-30)));
+                            }
+                            std::fprintf(stderr, "\n");
+                        }
                 }
                 if (has2(hid, qw)) to_bfp2(og.data(), qw, "pp_m2_" + cs, t_real);
                 else to_bf16(og.data(), M, qw, "pp_m_" + cs);
