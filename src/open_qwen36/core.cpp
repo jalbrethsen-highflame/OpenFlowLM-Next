@@ -4605,7 +4605,13 @@ int spec_dthreads() {
 }
 }  // namespace
 
-bool Core::spec_ok() const { return mtp_.on && cpu_head_ && cpu_decode_on_; }
+// a model with no MTP head (Flint): prompt-lookup drafts only (OFLM_OPEN_PLD, default on), the same
+// passes and rollback -- a pass with no lookup match verifies the fed token alone
+bool Core::pld_only() const {
+    static const bool pld_on = [] { const char* e = std::getenv("OFLM_OPEN_PLD"); return !(e && *e == '0'); }();
+    return !mtp_.on && pld_on;
+}
+bool Core::spec_ok() const { return (mtp_.on || pld_only()) && cpu_head_ && cpu_decode_on_; }
 
 // the MTP weights: OFLM_OPEN_MTP (a safetensors file with the mtp.* tensors: the HF shard or
 // mtp.safetensors; "0" none), else <model dir>/mtp.safetensors when it is there
@@ -4628,6 +4634,12 @@ void Core::spec_begin() {
     sp.k = spec_k_;
     sp.P = static_cast<size_t>(pos_);           // the first fed token's position
     mtp_.kv0 = sp.P - 1;
+    if (!mtp_.on) {   // prompt-lookup drafts only: no MTP rows to keep
+        verify_save_ = true;
+        sp.active = true;
+        sp.t0 = std::chrono::steady_clock::now();
+        return;
+    }
     // the prompt's context first (when step_prompt_pipe kept it): MTP rows (hidden at i, id at i + 1)
     // for the kept rows but the last, 8 at a time; their slots precede P - 1
     const size_t C = mtp_prompt_ids_.size();
@@ -4665,14 +4677,15 @@ void Core::spec_settle(size_t keep) {
     const double rms_ = ms_since(tr);
     sp.t_roll += rms_;
     sp.accepted += keep - 1;
+    if (!mtp_.on && sp.took_pld) pld_observe(keep - 1, keep < R);
     if (spec_log()) {
         std::fprintf(spec_log(), "%zu %zu %d %.2f %.2f", R, keep - 1, sp.took_pld ? 1 : 0, sp.vms, rms_);
         for (float p : sp.dp) std::fprintf(spec_log(), " %.4f", p);
         std::fprintf(spec_log(), "\n");
     }
-    sp.ph.assign(keep * hid, 0.f);
+    sp.ph.assign(mtp_.on ? keep * hid : 0, 0.f);
     sp.pt.clear();
-    for (size_t i = 0; i < keep; ++i) {
+    for (size_t i = 0; i < keep && mtp_.on; ++i) {
         spec_norm(rows_x_.data() + i * hid, sp.ph.data() + i * hid);
         if (i + 1 < keep) sp.pt.push_back(sp.rows[i + 1]);
     }
@@ -4689,8 +4702,32 @@ FILE* Core::spec_log() {
     return f;
 }
 
+// a lookup draft's tokens held, then (failed) the one that did not: the chance pld_p_ an average over ~20
+void Core::pld_observe(size_t held, bool failed) {
+    constexpr double a = 0.05;
+    for (size_t i = 0; i < held; ++i) pld_p_ += a * (1 - pld_p_);
+    if (failed) pld_p_ -= a * pld_p_;
+}
+
+// the draft length (0 .. avail, at most 7) with the most expected tokens a verify ms: a draft of L holds
+// 1 + p + .. + p^L tokens, the pass costs the measured verify ms of L + 1 rows (unmeasured: 1 row's x
+// (1 + 0.43 a row more), Flint with the experts on the CPU)
+size_t Core::pld_choose(size_t avail) const {
+    const double c1 = pld_vms_[1] > 0 ? pld_vms_[1] : 30.0;
+    auto cost = [&](size_t R) { return pld_vms_[R] > 0 ? pld_vms_[R] : c1 * (1 + 0.43 * static_cast<double>(R - 1)); };
+    size_t best = 0;
+    double bv = 1.0 / cost(1), e = 1, pk = 1;
+    for (size_t L = 1; L <= std::min<size_t>(avail, 7); ++L) {
+        pk *= pld_p_;
+        e += pk;
+        const double v = e / cost(L + 1);
+        if (v > bv) { bv = v; best = L; }
+    }
+    return best;
+}
+
 void Core::spec_step(int tok) {
-    if (!spec_ok()) throw std::runtime_error("open_qwen36: spec_step without OFLM_OPEN_MTP / CPU decode / the CPU head");
+    if (!spec_ok()) throw std::runtime_error("open_qwen36: spec_step without OFLM_OPEN_MTP or OFLM_OPEN_PLD / CPU decode / the CPU head");
     const size_t hid = w_->hidden, V = w_->vocab, RV = w_->real_vocab ? w_->real_vocab : V;
     // a pass holds up to 8 rows: near the context's end, plain steps
     if (pos_ == 0 || static_cast<size_t>(pos_) + 9 > max_ctx()) {
@@ -4702,6 +4739,11 @@ void Core::spec_step(int tok) {
     Spec& sp = spec_;
     ++sp.fed;
     hist_ids_.push_back(tok);           // prompt + every fed id (prompt-lookup drafts)
+    if (!pld_shadow_.empty()) {         // a lookup not drafted: would its next token have held?
+        const bool held = tok == pld_shadow_[pld_shadow_i_];
+        pld_observe(held ? 1 : 0, !held);
+        if (!held || ++pld_shadow_i_ == pld_shadow_.size()) pld_shadow_.clear();
+    }
     if (!sp.rows.empty()) {
         if (sp.served < sp.rows.size() && tok == sp.rows[sp.served]) {
             // the caller fed the draft: its row's logits are ready
@@ -4732,9 +4774,11 @@ void Core::spec_step(int tok) {
     std::vector<float> xn(hid), lg(V);
     auto td = std::chrono::steady_clock::now();
     omp_set_num_threads(spec_dthreads());
-    std::vector<float> pxn(sp.pt.size() * hid);
-    mtp_forward(sp.ph.data(), sp.pt.data(), sp.pt.size(), sp.pslot - mtp_.kv0, pxn.data());
-    std::copy(pxn.end() - static_cast<long>(hid), pxn.end(), xn.begin());
+    if (mtp_.on) {
+        std::vector<float> pxn(sp.pt.size() * hid);
+        mtp_forward(sp.ph.data(), sp.pt.data(), sp.pt.size(), sp.pslot - mtp_.kv0, pxn.data());
+        std::copy(pxn.end() - static_cast<long>(hid), pxn.end(), xn.begin());
+    }
     std::vector<int> d;
     sp.dp.clear();
     sp.took_pld = false;
@@ -4755,7 +4799,21 @@ void Core::spec_step(int tok) {
             }
         }
     }
-    for (int j = 0; j < k; ++j) {
+    // prompt lookup alone: the draft's length from pld_choose (OFLM_OPEN_PLD_ADAPT=0: the whole lookup when
+    // it is OFLM_OPEN_PLD_MIN long, else none); a lookup not drafted becomes the shadow
+    static const bool pld_adapt = [] { const char* e = std::getenv("OFLM_OPEN_PLD_ADAPT"); return !(e && *e == '0'); }();
+    if (!mtp_.on && !pld.empty()) {
+        const size_t L = pld_adapt ? pld_choose(pld.size()) : pld.size() >= pld_min ? pld.size() : 0;
+        if (L) {
+            d.assign(pld.begin(), pld.begin() + static_cast<long>(L));
+            ++sp.pld_passes;
+            sp.took_pld = true;
+        } else if (pld_shadow_.empty()) {
+            pld_shadow_ = pld;
+            pld_shadow_i_ = 0;
+        }
+    }
+    for (int j = 0; j < k && mtp_.on; ++j) {
         // mtp.norm applied: the head direct (its int4 copy when there: only the top token matters),
         // over the first OFLM_OPEN_MTP_DRAFT_VOCAB ids (default 65536: 99 % of generated tokens on
         // the test prompts) -- the int4 head's 128-row strips make that a prefix of it
@@ -4800,14 +4858,37 @@ void Core::spec_step(int tok) {
     sp.rows.insert(sp.rows.end(), d.begin(), d.end());
     step_cpu_rows(sp.rows.data(), sp.rows.size(), true);
     sp.vms = ms_since(tv);
+    if (!mtp_.on && sp.passes > 0) {    // (the first pass also builds the int8 cache copy)
+        double& c = pld_vms_[sp.rows.size()];
+        c = c < 0 ? sp.vms : 0.9 * c + 0.1 * sp.vms;
+    }
+    // OFLM_OPEN_SPEC_CHECK=1 (debug): the pass again one row at a time -- its rows' final residuals and
+    // logits must be the same bits
+    static const bool spec_check = std::getenv("OFLM_OPEN_SPEC_CHECK") != nullptr;
+    if (spec_check && sp.rows.size() > 1) {
+        const size_t R = sp.rows.size();
+        const std::vector<float> xR = rows_x_, lR = rows_logits_;
+        cpu_rollback(0, R);
+        size_t bx = 0, bl = 0;
+        for (size_t r = 0; r < R; ++r) {
+            step_cpu_rows(&sp.rows[r], 1, true);
+            if (std::memcmp(rows_x_.data(), xR.data() + r * hid, hid * 4)) ++bx;
+            if (std::memcmp(logits_host_.data(), lR.data() + r * V, V * 4)) ++bl;
+        }
+        std::fprintf(stderr, "spec check pos %zu, %zu rows: residuals differ in %zu, logits in %zu\n", sp.P, R, bx, bl);
+        rows_x_ = xR;
+        rows_logits_ = lR;
+    }
     sp.t_verify += sp.vms;
     ++sp.passes;
     sp.drafted += d.size();
-    std::copy(rows_logits_.begin(), rows_logits_.begin() + static_cast<long>(V), logits_host_.begin());
+    // (one row -- a pass with no draft, prompt lookup alone: step_cpu_rows left them in logits_host_)
+    if (sp.rows.size() > 1) std::copy(rows_logits_.begin(), rows_logits_.begin() + static_cast<long>(V), logits_host_.begin());
     sp.served = 1;
 }
 
 void Core::spec_flush() {
+    pld_shadow_.clear();
     if (!spec_.active) return;
     Spec& sp = spec_;
     // OFLM_OPEN_SPEC_REPORT=1: the stats of the decode since the last prompt (a server reply), fed

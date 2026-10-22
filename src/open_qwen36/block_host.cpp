@@ -1550,9 +1550,11 @@ __attribute__((target("avx512f,avx512bw,avx512dq,avx512bf16,fma")))
 void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, size_t pos0, float scale, const float* Q,
                                  const uint16_t* kv, size_t kvr, float* og, const float* sinks = nullptr, size_t window = 0) {
     constexpr size_t CK = 512, KB = 32, MAXQ = 64;
-    // window (Flint's sliding layers): row t sees keys [pos0 + t + 1 - window, pos0 + t]; the chunks start
-    // at the first one's 32-key block (kv may be a sliding buffer's logical pointer: rows below never read)
-    const size_t KB0 = window && pos0 + 1 > window ? (pos0 + 1 - window) / KB * KB : 0;
+    // window (Flint's sliding layers): row t sees keys [pos0 + t + 1 - window, pos0 + t]. The chunks are on
+    // a fixed grid of CK keys from key 0, so a row gets the same chunks (and the same bits) in a verify pass
+    // as alone; the reads start at the first row's 32-key block (kv may be a sliding buffer's logical
+    // pointer: rows below never read), and a row's blocks below its window leave its sums as they are
+    const size_t KS = window && pos0 + 1 > window ? (pos0 + 1 - window) / KB * KB : 0, KB0 = KS / CK * CK;
     const size_t grp = nh / kvh, qw = nh * hd, Kmax = pos0 + R, NC = (Kmax - KB0 + CK - 1) / CK, NQ = R * grp, PS = hd + 2;
     const size_t HP = hd / 2;                   // bf16 pairs a row
     if (NQ > MAXQ || hd % 64 || hd > 512) throw std::runtime_error("open_qwen36: attention_decode_flash_bf16: geometry");
@@ -1575,7 +1577,7 @@ void attention_decode_flash_bf16(size_t hd, size_t nh, size_t kvh, size_t R, siz
 #pragma omp for schedule(dynamic, 1)
         for (long long it = 0; it < static_cast<long long>(kvh * NC); ++it) {
             const size_t kh = static_cast<size_t>(it) % kvh, c = static_cast<size_t>(it) / kvh;
-            const size_t k0 = KB0 + c * CK, k1 = std::min(k0 + CK, Kmax);
+            const size_t k0 = std::max(KB0 + c * CK, KS), k1 = std::min(KB0 + (c + 1) * CK, Kmax);
             for (size_t t = 0; t < R; ++t)
                 for (size_t g2 = 0; g2 < grp; ++g2) {
                     const size_t qi = t * grp + g2;

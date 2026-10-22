@@ -743,6 +743,15 @@ private:
     std::vector<float> mtp_prompt_x_;   ///< the prompt's last rows (OFLM_OPEN_MTP_CTX) for MTP's context
     std::vector<int> mtp_prompt_ids_;
     std::vector<int> hist_ids_;
+    /// prompt lookup alone (pld_only): the chance that a lookup draft's next token holds (an average
+    /// over the last ~20 tokens drafted or shadowed), the verify ms by rows (-1: none yet), and a
+    /// candidate a pass did not draft, checked against the tokens fed after it (pld_choose's input)
+    double pld_p_ = 0.6;
+    double pld_vms_[9] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+    std::vector<int> pld_shadow_;
+    size_t pld_shadow_i_ = 0;
+    void pld_observe(size_t held, bool failed);
+    size_t pld_choose(size_t avail) const;
     struct Spec {
         bool active = false;
         int k = 3;
@@ -780,6 +789,7 @@ public:
     /// back their logits are ready, the first other token rolls the pass back and starts the next.
     /// Exact for any sampler. Needs OFLM_OPEN_MTP and OFLM_OPEN_CPU_DECODE=1 (spec_ok).
     bool spec_ok() const;
+    bool pld_only() const;
     std::string mtp_path() const;
     void spec_step(int tok);
     /// the pass settled (rows past the fed ones rolled back) and S back in state_: before a prompt,
